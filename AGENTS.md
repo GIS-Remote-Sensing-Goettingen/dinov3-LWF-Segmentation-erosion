@@ -1,37 +1,54 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
-- Core pipeline code lives in the repo root: `main.py` (orchestrator), `banks.py`, `features.py`, `knn.py`, `xdboost.py`, `crf_utils.py`, `shadow_filter.py`, `metrics_utils.py`, `io_utils.py`, `plotting.py`.
-- Configuration is centralized in `config.py`.
-- Data assets live under `data/` (tiles, labels, cached DINO features).
-- Outputs go under `output/run_XXX/` (plots, shapes, logs).
-- Experimental notes and docs: `KB.md`, `Implementation.md`.
-- Tests: `test/` contains an alternate experimental pipeline (`test/main_2.py`), not a formal test suite.
+## Introduction
+This repository is documentation + configuration (Markdown-first). Optimize for readability and minimal diffs.
 
-## Build, Test, and Development Commands
-- Run the full pipeline:
-  - `python main.py`
-  - Uses `SOURCE_TILES`, `VAL_TILES`, and `HOLDOUT_TILES` from `config.py`.
-- (Optional) SLURM/HPC run script: `silver_set.sh`.
-- No build step is required beyond installing dependencies.
+## Purpose and scope
+- Repository purpose: [one sentence describing what this repo documents/contains]
+- Allowed changes:
+  - Edit Markdown docs and configuration files.
+  - Add new docs in the appropriate folder (see “Project map”).
+- Not allowed (unless explicitly requested):
+  - Large refactors/restructures (moving many files, renaming sections globally).
+  - Reformatting entire documents “for style” unless the task requests it.
+  - Renaming files (case-sensitive) without a clear reason and updated references.
 
-## Coding Style & Naming Conventions
-- Python code uses 4-space indentation, snake_case for functions/variables, and CapWords for classes.
-- Keep changes localized and add small comments only when logic is non-obvious.
-- Logging is preferred over `print`; logs go to `output/run_XXX/run.log`.
+If requirements are ambiguous, ask before making broad changes.
 
-## Testing Guidelines
-- There is no formal test framework in this repo.
-- If you modify core logic, validate by running `python main.py` and inspecting:
-  - `output/run_XXX/plots/` for visual sanity
-  - `output/run_XXX/shapes/` for shapefiles
+## Important files (read before changing behavior/structure)
+- ARCHITECTURE.md — overall design and repo structure
+- STYLE.md — writing + formatting conventions
+- CHANGELOG.md — user-visible changes (keep it current)
 
-## Commit & Pull Request Guidelines
-- No commit message convention is documented in this repo.
-- For PRs, include a short description of changes and note any updated config defaults.
-- Every code change must be recorded in `journal.md` under a new `## Change N` entry.
+## Quick start (commands)
+- Install hooks: `pre-commit install`
+- Run all checks: `pre-commit run --all-files`
+- [If you have any other checks, list them here exactly, e.g. markdownlint, link checker, docs build]
 
-## Configuration & Runtime Notes
-- Resolution control: `RESAMPLE_FACTOR` in `config.py` (3 = 0.2m/px → 0.6m/px).
-- Validation strategy: tune on `VAL_TILES`, infer on `HOLDOUT_TILES` with fixed settings.
-- Feature cache uses metadata; stale caches are auto-recomputed if `RESAMPLE_FACTOR` or patch size changes.
+## Contributing: Definition of Done
+WARNING THE FOLLOWING IS MANDATORY YOU MUST FOLLOW THESE STEPS BEFORE COMING BACK TO THE USER:
+@@@@@@
+1. Run: `pre-commit run --all-files` (mandatory; do not respond without running it unless the user explicitly says not to). Do not ask for confirmation to run it.
+2. If you create new files, add them to git (e.g., `git add <file>`).
+3. Run 'pytest --doctest-modules ' and other tests if you have them; do not respond without running them unless the user explicitly says not to).
+4. Update CHANGELOG.md with a short entry describing what changed (and why).
+5. If design/structure changed, update ARCHITECTURE.md.
+6. In the PR/response, include:
+   - Summary of changes (1–3 bullets)
+   - Commands you ran + results
+   - Any follow-ups or risks
+@@@@@@
+
+
+
+## Project map
+- `/` — top-level docs and configs
+- `[docs/ or other folders if present]` — what belongs there
+- `[templates/ etc]` — what belongs there
+-  `[test/ etc]`  — e2e test files or others
+
+## Writing and style rules (reader-optimized)
+- Prefer declarative, intention-revealing writing.
+- Keep sections short; avoid repetition.
+- Use consistent headings and terminology (follow STYLE.md).
+- Avoid mass whitespace/format-only changes unless required.
