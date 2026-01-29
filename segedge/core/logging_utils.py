@@ -1,10 +1,21 @@
+"""Logging setup utilities."""
+
+from __future__ import annotations
+
 import logging
 import os
 
 
 def setup_logging(log_path: str | None = None, level: int = logging.INFO) -> None:
-    """
-    Configure logging to file (and console) with a consistent format.
+    """Configure logging to file (and console) with a consistent format.
+
+    Args:
+        log_path (str | None): Optional log file path.
+        level (int): Logging level.
+
+    Examples:
+        >>> callable(setup_logging)
+        True
     """
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if log_path:

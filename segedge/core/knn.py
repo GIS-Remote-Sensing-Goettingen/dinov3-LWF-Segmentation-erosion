@@ -1,24 +1,25 @@
-import os
-import time
+"""kNN scoring utilities for SegEdge."""
+
+from __future__ import annotations
+
 import logging
+import time
 
 import numpy as np
 import torch
 from skimage.transform import resize
 
-from features import (
-    tile_iterator,
+from .features import (
+    add_local_context_mean,
     crop_to_multiple_of_ps,
     extract_patch_features_single_scale,
-    tile_feature_path,
-    save_tile_features,
-    add_local_context_mean,
     load_tile_features_if_valid,
+    save_tile_features,
+    tile_iterator,
 )
-from metrics_utils import compute_metrics_batch_gpu, compute_metrics_batch_cpu
-from timing_utils import time_start, time_end, DEBUG_TIMING
+from .metrics_utils import compute_metrics, compute_metrics_batch_cpu, compute_metrics_batch_gpu
+from .timing_utils import time_end, time_start, DEBUG_TIMING
 import config as cfg
-from metrics_utils import compute_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -42,21 +43,33 @@ def zero_shot_knn_single_scale_B_with_saliency(
     use_fp16_matmul: bool = False,
     context_radius: int = 0,
 ):
-    """
-    Compute kNN transfer scores on Image B using GPU matmul.
+    """Compute kNN transfer scores on Image B using GPU matmul.
 
     Args:
-        img_b: full RGB image.
-        pos_bank/neg_bank: patch banks from Image A.
-        ps: DINO patch size.
-        tile_size/stride: tiling parameters.
-        k: neighbors to average.
-        prefetched_tiles: optional in-memory feature cache.
-        neg_alpha: weight for negative bank subtraction.
-        use_fp16_matmul: enable half precision on CUDA for speed.
+        img_b (np.ndarray): Full RGB image.
+        pos_bank (np.ndarray): Positive patch bank.
+        neg_bank (np.ndarray | None): Negative patch bank.
+        model: DINO model.
+        processor: DINO processor.
+        device: Torch device.
+        ps (int): DINO patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int | None): Tile stride.
+        k (int): Number of neighbors to average.
+        aggregate_layers (list[int] | None): Optional layer indices to average.
+        feature_dir (str | None): Optional feature cache directory.
+        image_id (str | None): Image identifier for caches.
+        neg_alpha (float): Weight for negative bank subtraction.
+        prefetched_tiles (dict | None): Optional in-memory feature cache.
+        use_fp16_matmul (bool): Enable half precision on CUDA for speed.
+        context_radius (int): Feature context radius.
+
     Returns:
-        score_full: per-pixel similarity map.
-        saliency_full: simple saliency from top-k sims.
+        tuple[np.ndarray, np.ndarray]: Score map and saliency map.
+
+    Examples:
+        >>> callable(zero_shot_knn_single_scale_B_with_saliency)
+        True
     """
     t0 = time_start()
     h_full, w_full = img_b.shape[:2]
@@ -90,15 +103,16 @@ def zero_shot_knn_single_scale_B_with_saliency(
 
     matmul_time = resize_time = 0.0
     if prefetched_tiles is not None:
-        tile_iter = sorted(prefetched_tiles.items())
-        logger.debug("zero_shot: using prefetched features for %s tiles", len(tile_iter))
+        tile_items = sorted(prefetched_tiles.items())
+        logger.debug("zero_shot: using prefetched features for %s tiles", len(tile_items))
+        tile_iter = ((y, x, info) for (y, x), info in tile_items)
     else:
-        tile_iter = tile_iterator(img_b, None, tile_size, stride)
+        tile_iter = ((y, x, img_tile) for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride))
 
     for tile_entry in tile_iter:
         t0_tile = time_start()
         if prefetched_tiles is not None:
-            (y, x), feat_info = tile_entry
+            y, x, feat_info = tile_entry
             feats_tile = feat_info["feats"]
             h_eff = feat_info["h_eff"]
             w_eff = feat_info["w_eff"]
@@ -106,7 +120,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
             wp = feat_info["wp"]
             cached_tiles += 1
         else:
-            y, x, img_tile, _ = tile_entry
+            y, x, img_tile = tile_entry
             img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
             if h_eff < ps or w_eff < ps:
                 time_end(f"zero_shot_tile_skip(y={y},x={x})", t0_tile)
@@ -145,13 +159,16 @@ def zero_shot_knn_single_scale_B_with_saliency(
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
 
+        if hp is None or wp is None:
+            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            continue
         x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
         with torch.no_grad():
             x_feats_t = torch.from_numpy(x_feats).to(device)
             if use_fp16_matmul and device.type == "cuda":
                 x_feats_t = x_feats_t.half()
-                pos_bank_local = pos_bank_t_half
-                neg_bank_local = neg_bank_t_half
+                pos_bank_local = pos_bank_t_half if pos_bank_t_half is not None else pos_bank_t
+                neg_bank_local = neg_bank_t_half if neg_bank_t_half is not None else neg_bank_t
             else:
                 pos_bank_local = pos_bank_t
                 neg_bank_local = neg_bank_t
@@ -213,8 +230,34 @@ def grid_search_k_threshold(
     use_fp16_matmul: bool = False,
     context_radius: int = 0,
 ):
-    """
-    Sweep over k values and global thresholds on Image B; return best raw config + score map.
+    """Sweep over k values and global thresholds on Image B.
+
+    Args:
+        img_b (np.ndarray): Full RGB image.
+        pos_bank (np.ndarray): Positive patch bank.
+        neg_bank (np.ndarray | None): Negative patch bank.
+        model: DINO model.
+        processor: DINO processor.
+        device: Torch device.
+        ps (int): DINO patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int | None): Tile stride.
+        k_values (list[int]): List of k values to test.
+        thresholds (list[float]): Threshold grid.
+        feature_dir (str): Feature cache directory.
+        image_id_b (str): Image identifier for B.
+        sh_buffer_mask_b (np.ndarray): SH buffer mask for B.
+        gt_mask_b (np.ndarray): Ground-truth mask for B.
+        prefetched_tiles_b (dict | None): Optional in-memory cache.
+        use_fp16_matmul (bool): Enable half precision matmul.
+        context_radius (int): Feature context radius.
+
+    Returns:
+        tuple[dict | None, np.ndarray | None, np.ndarray | None]: Best config, score map, saliency map.
+
+    Examples:
+        >>> callable(grid_search_k_threshold)
+        True
     """
     t0 = time_start()
     best_raw_config = None
@@ -304,7 +347,29 @@ def fine_tune_threshold(
     step: float = 0.01,
     window: float = 0.08,
 ):
-    """Refine a scalar threshold around a base value; keeps best IoU mask."""
+    """Refine a scalar threshold around a base value; keeps best IoU mask.
+
+    Args:
+        score_map (np.ndarray): Score map to threshold.
+        base_threshold (float): Center threshold value.
+        sh_mask (np.ndarray | None): Optional SH buffer mask.
+        gt_mask (np.ndarray): Ground-truth mask.
+        step (float): Step size for threshold sweep.
+        window (float): Window size around base threshold.
+
+    Returns:
+        tuple[float, dict, np.ndarray]: Best threshold, metrics, and mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> score = np.array([[0.2, 0.8], [0.6, 0.1]])
+        >>> gt = np.array([[0, 1], [1, 0]])
+        >>> thr, metrics, mask = fine_tune_threshold(score, 0.5, None, gt, step=0.5, window=0.0)
+        >>> float(thr)
+        0.5
+        >>> mask.astype(int).tolist()
+        [[0, 1], [1, 0]]
+    """
     t0 = time_start()
     thr_min = max(0.0, base_threshold - window)
     thr_max = min(1.0, base_threshold + window)
@@ -323,6 +388,8 @@ def fine_tune_threshold(
             best_thr = thr
             best_metrics = metrics
             best_mask = mask
+    if best_metrics is None or best_mask is None:
+        raise ValueError("no thresholds evaluated; check step/window settings")
     logger.info(
         "tune-thr base=%.3f -> best=%.3f IoU=%.3f, F1=%.3f",
         base_threshold,

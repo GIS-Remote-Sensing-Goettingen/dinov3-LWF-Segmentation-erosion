@@ -1,19 +1,23 @@
-import os
+"""Bank construction utilities for SegEdge."""
+
+from __future__ import annotations
+
 import logging
+import os
+
 import numpy as np
 from skimage.morphology import erosion, disk
 
-from features import (
-    tile_iterator,
+from .features import (
+    add_local_context_mean,
     crop_to_multiple_of_ps,
     extract_patch_features_single_scale,
     labels_to_patch_masks,
-    save_tile_features,
-    tile_feature_path,
-    add_local_context_mean,
     load_tile_features_if_valid,
+    save_tile_features,
+    tile_iterator,
 )
-from timing_utils import time_start, time_end
+from .timing_utils import time_end, time_start
 import config as cfg
 
 logger = logging.getLogger(__name__)
@@ -23,8 +27,26 @@ def cleanup_bank_cache(bank_cache_dir: str,
                        ps: int,
                        context_radius: int,
                        resample_factor: int):
-    """
-    Remove stale bank cache files for this image_id with mismatched settings.
+    """Remove stale bank cache files for this image_id with mismatched settings.
+
+    Args:
+        bank_cache_dir (str): Directory holding cached bank files.
+        image_id (str): Image identifier for cache naming.
+        ps (int): Patch size used to build banks.
+        context_radius (int): Context radius used in feature smoothing.
+        resample_factor (int): Resample factor used to build banks.
+
+    Examples:
+        >>> import os
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     keep = os.path.join(d, "img_ps16_ctx0_rs1_pos_bank.npy")
+        ...     drop = os.path.join(d, "img_ps8_ctx0_rs1_pos_bank.npy")
+        ...     _ = open(keep, "w").close()
+        ...     _ = open(drop, "w").close()
+        ...     cleanup_bank_cache(d, "img", 16, 0, 1)
+        ...     os.path.exists(keep), os.path.exists(drop)
+        (True, False)
     """
     if not os.path.isdir(bank_cache_dir):
         return
@@ -55,12 +77,33 @@ def build_banks_single_scale(img_a: np.ndarray,
                              image_id: str | None = None,
                              bank_cache_dir: str | None = None,
                              context_radius: int = 0):
-    """
-    Build positive/negative patch banks from Image A using SH_2022 labels.
+    """Build positive/negative patch banks from Image A using SH_2022 labels.
 
-    - Extract/caches DINO features per tile.
-    - Aggregates pixel labels to patch labels via pos_frac_thresh.
-    - Optionally loads/saves banks to disk to avoid recomputation.
+    Extracts (and optionally caches) DINO features per tile and aggregates
+    pixel labels into patch labels using the provided threshold.
+
+    Args:
+        img_a (np.ndarray): Image A RGB array.
+        labels_a (np.ndarray): Raster labels aligned to Image A.
+        model: DINO model.
+        processor: DINO processor.
+        device: Torch device.
+        ps (int): Patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int | None): Tile stride.
+        pos_frac_thresh (float): Fraction threshold for positives.
+        aggregate_layers (list[int] | None): Optional layer indices to average.
+        feature_dir (str | None): Optional feature cache directory.
+        image_id (str | None): Image identifier for caches.
+        bank_cache_dir (str | None): Directory for bank caches.
+        context_radius (int): Feature context radius.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray | None]: Positive and negative banks.
+
+    Examples:
+        >>> callable(build_banks_single_scale)
+        True
     """
     t0 = time_start()
 
@@ -91,6 +134,9 @@ def build_banks_single_scale(img_a: np.ndarray,
     for y, x, img_tile, lab_tile in tile_iterator(img_a, labels_eroded, tile_size, stride):
         img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
         if h_eff < ps or w_eff < ps:
+            continue
+        if lab_c is None:
+            logger.warning("missing labels for tile y=%s x=%s; skipping", y, x)
             continue
 
         feats_tile = None
@@ -128,6 +174,9 @@ def build_banks_single_scale(img_a: np.ndarray,
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
 
+        if hp is None or wp is None:
+            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            continue
         pos_mask, neg_mask = labels_to_patch_masks(lab_c, hp, wp, pos_frac_thresh=pos_frac_thresh)
         pos_feats_tile = feats_tile[pos_mask]
         neg_feats_tile = feats_tile[neg_mask]

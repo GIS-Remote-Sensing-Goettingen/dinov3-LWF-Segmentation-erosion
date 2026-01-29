@@ -1,14 +1,35 @@
-import time
+"""Metric helpers for segmentation evaluation."""
+
+from __future__ import annotations
+
 import logging
+import time
 
 import numpy as np
 import torch
-from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
+
+from .timing_utils import time_end, time_start, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
 
 logger = logging.getLogger(__name__)
 
 def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
-    """Compute precision/recall/IoU/F1 and confusion counts for binary masks."""
+    """Compute precision/recall/IoU/F1 and confusion counts for binary masks.
+
+    Args:
+        pred_mask (np.ndarray): Predicted binary mask.
+        gt_mask (np.ndarray): Ground-truth binary mask.
+
+    Returns:
+        dict: Metrics and confusion counts.
+
+    Examples:
+        >>> import numpy as np
+        >>> pred = np.array([[1, 0], [1, 0]])
+        >>> gt = np.array([[1, 0], [0, 0]])
+        >>> metrics = compute_metrics(pred, gt)
+        >>> (metrics["tp"], metrics["fp"], metrics["fn"], metrics["tn"])
+        (1, 1, 0, 2)
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     pred = pred_mask.astype(bool)
     gt = gt_mask.astype(bool)
@@ -42,7 +63,26 @@ def compute_metrics_batch_gpu(score_map: np.ndarray,
                               gt_mask: np.ndarray,
                               device: torch.device,
                               batch_size: int = 8) -> list[dict]:
-    """Evaluate many thresholds in parallel on GPU; returns list of metric dicts."""
+    """Evaluate many thresholds in parallel on GPU; returns list of metric dicts.
+
+    Args:
+        score_map (np.ndarray): Score map.
+        thresholds (list[float]): Thresholds to evaluate.
+        sh_mask (np.ndarray | None): Optional SH buffer mask.
+        gt_mask (np.ndarray): Ground-truth mask.
+        device (torch.device): Torch device.
+        batch_size (int): Threshold batch size.
+
+    Returns:
+        list[dict]: Metric dictionaries per threshold.
+
+    Examples:
+        >>> import numpy as np
+        >>> import torch
+        >>> score = np.zeros((2, 2), dtype=np.float32)
+        >>> gt = np.zeros((2, 2), dtype=np.uint8)
+        >>> _ = compute_metrics_batch_gpu(score, [0.5], None, gt, device=torch.device("cpu"))  # doctest: +SKIP
+    """
     t0 = time_start()
     score_t = torch.from_numpy(score_map.astype(np.float32)).to(device).flatten()
     gt_t = torch.from_numpy(gt_mask.astype(np.bool_)).to(device).flatten()
@@ -84,7 +124,26 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
                               sh_mask: np.ndarray | None,
                               gt_mask: np.ndarray,
                               batch_size: int = 16) -> list[dict]:
-    """CPU fallback for batched threshold evaluation."""
+    """CPU fallback for batched threshold evaluation.
+
+    Args:
+        score_map (np.ndarray): Score map.
+        thresholds (list[float]): Thresholds to evaluate.
+        sh_mask (np.ndarray | None): Optional SH buffer mask.
+        gt_mask (np.ndarray): Ground-truth mask.
+        batch_size (int): Threshold batch size.
+
+    Returns:
+        list[dict]: Metric dictionaries per threshold.
+
+    Examples:
+        >>> import numpy as np
+        >>> score = np.array([[0.2, 0.8], [0.6, 0.1]])
+        >>> gt = np.array([[0, 1], [1, 0]])
+        >>> metrics = compute_metrics_batch_cpu(score, [0.5], None, gt, batch_size=1)
+        >>> round(metrics[0]["iou"], 3)
+        1.0
+    """
     t0 = time_start()
     flat_scores = score_map.astype(np.float32).reshape(1, -1)
     flat_gt = gt_mask.astype(bool).reshape(1, -1)
@@ -122,7 +181,23 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
 
 def compute_oracle_upper_bound(gt_mask: np.ndarray,
                                sh_mask: np.ndarray) -> dict:
-    """Compute oracle IoU if predictions are clipped to SH buffer (upper bound)."""
+    """Compute oracle IoU if predictions are clipped to SH buffer.
+
+    Args:
+        gt_mask (np.ndarray): Ground-truth mask.
+        sh_mask (np.ndarray): SH buffer mask.
+
+    Returns:
+        dict: Metrics for the oracle mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> gt = np.array([[1, 0], [1, 0]])
+        >>> sh = np.array([[1, 1], [0, 0]])
+        >>> metrics = compute_oracle_upper_bound(gt, sh)
+        >>> (metrics["tp"], metrics["fn"])
+        (1, 1)
+    """
     t0 = time_start()
     oracle_mask = np.logical_and(gt_mask.astype(bool), sh_mask.astype(bool))
     metrics = compute_metrics(oracle_mask, gt_mask)

@@ -1,19 +1,37 @@
-import os
-import time
+"""Feature extraction and tiling utilities for SegEdge."""
+
+from __future__ import annotations
+
 import json
 import logging
+import os
+import time
 
 import numpy as np
 import torch
-from skimage.transform import resize
 from scipy.ndimage import uniform_filter
 
-from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
+from .timing_utils import time_end, time_start, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
 
 logger = logging.getLogger(__name__)
 
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """L2-normalize feature vectors along the last dimension."""
+    """L2-normalize feature vectors along the last dimension.
+
+    Args:
+        feats (np.ndarray): Feature array with last axis as channels.
+        eps (float): Small epsilon for numerical stability.
+
+    Returns:
+        np.ndarray: L2-normalized feature array.
+
+    Examples:
+        >>> import numpy as np
+        >>> feats = np.array([[3.0, 4.0]])
+        >>> out = l2_normalize(feats)
+        >>> np.allclose(out, np.array([[0.6, 0.8]]))
+        True
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     norms = np.linalg.norm(feats, axis=-1, keepdims=True) + eps
     out = feats / norms
@@ -23,11 +41,23 @@ def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
 
 
 def add_local_context_mean(feats_hwc: np.ndarray, radius: int) -> np.ndarray:
-    """
-    Add local spatial context to patch embeddings by averaging over a (2r+1)x(2r+1) neighborhood.
+    """Add local spatial context to patch embeddings by averaging neighbors.
 
-    - Operates on patch-grid features (Hp x Wp x C), not pixel space.
-    - Does not mix channels (filter size is (k, k, 1)).
+    Operates on patch-grid features (Hp x Wp x C) without mixing channels.
+
+    Args:
+        feats_hwc (np.ndarray): Patch-grid features.
+        radius (int): Context radius in patch units.
+
+    Returns:
+        np.ndarray: Context-smoothed, L2-normalized features.
+
+    Examples:
+        >>> import numpy as np
+        >>> feats = np.arange(12, dtype=np.float32).reshape(2, 2, 3)
+        >>> out = add_local_context_mean(feats, radius=0)
+        >>> np.array_equal(out, feats)
+        True
     """
     if radius <= 0:
         return feats_hwc
@@ -43,7 +73,23 @@ def tile_iterator(image_hw3: np.ndarray,
                   labels_hw: np.ndarray | None = None,
                   tile_size: int = 1024,
                   stride: int | None = None):
-    """Yield (y,x,img_tile,label_tile) windows over an image with overlap (stride defaults to tile_size)."""
+    """Yield (y, x, img_tile, label_tile) windows over an image.
+
+    Args:
+        image_hw3 (np.ndarray): HxWxC image array.
+        labels_hw (np.ndarray | None): Optional label mask.
+        tile_size (int): Tile size in pixels.
+        stride (int | None): Stride in pixels; defaults to tile_size.
+
+    Yields:
+        tuple: (y, x, img_tile, label_tile) for each tile.
+
+    Examples:
+        >>> import numpy as np
+        >>> tiles = list(tile_iterator(np.zeros((3, 4, 3)), tile_size=2, stride=2))
+        >>> [(y, x, t.shape[:2]) for y, x, t, _ in tiles]
+        [(0, 0, (2, 2)), (0, 2, (2, 2)), (2, 0, (1, 2)), (2, 2, (1, 2))]
+    """
     h, w = image_hw3.shape[:2]
     if stride is None:
         stride = tile_size
@@ -63,7 +109,24 @@ def tile_iterator(image_hw3: np.ndarray,
 def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
                            labels_tile_hw: np.ndarray | None,
                            ps: int):
-    """Crop a tile so height/width are multiples of patch size ps."""
+    """Crop a tile so height/width are multiples of patch size.
+
+    Args:
+        img_tile_hw3 (np.ndarray): Image tile (H, W, C).
+        labels_tile_hw (np.ndarray | None): Optional label tile.
+        ps (int): Patch size in pixels.
+
+    Returns:
+        tuple: Cropped image, cropped labels, effective height, effective width.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.zeros((5, 7, 3))
+        >>> labels = np.ones((5, 7))
+        >>> img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img, labels, 4)
+        >>> img_c.shape, lab_c.shape, (h_eff, w_eff)
+        ((4, 4, 3), (4, 4), (4, 4))
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h, w = img_tile_hw3.shape[:2]
     h_eff = (h // ps) * ps
@@ -79,7 +142,29 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
                           hp: int,
                           wp: int,
                           pos_frac_thresh: float = 0.1):
-    """Convert pixel labels to patch-level pos/neg masks using a fraction threshold."""
+    """Convert pixel labels to patch-level positive/negative masks.
+
+    Args:
+        labels_tile (np.ndarray): Label mask at pixel resolution.
+        hp (int): Patch grid height.
+        wp (int): Patch grid width.
+        pos_frac_thresh (float): Fraction of positive pixels to mark a patch as positive.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Boolean positive mask, boolean negative mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> labels = np.array([
+        ...     [1, 1, 0, 0],
+        ...     [1, 0, 0, 0],
+        ...     [0, 0, 0, 0],
+        ...     [0, 0, 0, 0],
+        ... ])
+        >>> pos, neg = labels_to_patch_masks(labels, hp=2, wp=2, pos_frac_thresh=0.5)
+        >>> pos.tolist(), neg.tolist()
+        ([[True, False], [False, False]], [[False, True], [True, True]])
+    """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h_eff, w_eff = labels_tile.shape
     patch_h = h_eff // hp
@@ -99,7 +184,21 @@ def tile_feature_path(feature_dir: str,
                       image_id: str,
                       y: int,
                       x: int) -> str:
-    """Canonical path for storing a tile's feature .npy."""
+    """Return the canonical path for a tile's feature array.
+
+    Args:
+        feature_dir (str): Directory for cached features.
+        image_id (str): Image identifier.
+        y (int): Tile y offset.
+        x (int): Tile x offset.
+
+    Returns:
+        str: Absolute or relative path for the feature file.
+
+    Examples:
+        >>> tile_feature_path("feat", "img", 1, 2)
+        'feat/img_y1_x2_features.npy'
+    """
     fname = f"{image_id}_y{y}_x{x}_features.npy"
     return os.path.join(feature_dir, fname)
 
@@ -108,7 +207,21 @@ def tile_feature_meta_path(feature_dir: str,
                            image_id: str,
                            y: int,
                            x: int) -> str:
-    """Sidecar JSON path for feature metadata."""
+    """Return the sidecar JSON path for feature metadata.
+
+    Args:
+        feature_dir (str): Directory for cached features.
+        image_id (str): Image identifier.
+        y (int): Tile y offset.
+        x (int): Tile x offset.
+
+    Returns:
+        str: Absolute or relative path for the metadata JSON.
+
+    Examples:
+        >>> tile_feature_meta_path("feat", "img", 1, 2)
+        'feat/img_y1_x2_features.json'
+    """
     fname = f"{image_id}_y{y}_x{x}_features.json"
     return os.path.join(feature_dir, fname)
 
@@ -119,7 +232,26 @@ def save_tile_features(feats_tile: np.ndarray,
                        y: int,
                        x: int,
                        meta: dict | None = None):
-    """Persist a tile's features to disk (and optional metadata)."""
+    """Persist a tile's features to disk (and optional metadata).
+
+    Args:
+        feats_tile (np.ndarray): Feature tile array.
+        feature_dir (str): Directory for cached features.
+        image_id (str): Image identifier.
+        y (int): Tile y offset.
+        x (int): Tile x offset.
+        meta (dict | None): Optional metadata to serialize as JSON.
+
+    Examples:
+        >>> import numpy as np
+        >>> import os
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     feats = np.zeros((2, 2, 3), dtype=np.float32)
+        ...     save_tile_features(feats, d, "img", 0, 0, meta={"ps": 16, "resample_factor": 1})
+        ...     os.path.exists(tile_feature_path(d, "img", 0, 0))
+        True
+    """
     os.makedirs(feature_dir, exist_ok=True)
     fpath = tile_feature_path(feature_dir, image_id, y, x)
     np.save(fpath, feats_tile.astype(np.float32))
@@ -137,8 +269,32 @@ def load_tile_features_if_valid(feature_dir: str,
                                 expected_wp: int,
                                 ps: int,
                                 resample_factor: int) -> np.ndarray | None:
-    """
-    Load cached features if valid. If metadata is missing or mismatched, delete cache and return None.
+    """Load cached features if valid, otherwise return None.
+
+    If metadata is missing or mismatched, the cache is removed.
+
+    Args:
+        feature_dir (str): Directory for cached features.
+        image_id (str): Image identifier.
+        y (int): Tile y offset.
+        x (int): Tile x offset.
+        expected_hp (int): Expected patch grid height.
+        expected_wp (int): Expected patch grid width.
+        ps (int): Patch size in pixels.
+        resample_factor (int): Resample factor used for cached data.
+
+    Returns:
+        np.ndarray | None: Cached feature tile if valid, else None.
+
+    Examples:
+        >>> import numpy as np
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     feats = np.zeros((2, 2, 3), dtype=np.float32)
+        ...     save_tile_features(feats, d, "img", 0, 0, meta={"ps": 16, "resample_factor": 1})
+        ...     out = load_tile_features_if_valid(d, "img", 0, 0, 2, 2, ps=16, resample_factor=1)
+        ...     out.shape
+        (2, 2, 3)
     """
     fpath = tile_feature_path(feature_dir, image_id, y, x)
     if not os.path.exists(fpath):
@@ -185,7 +341,23 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
                                         device,
                                         ps: int = 16,
                                         aggregate_layers=None):
-    """Extract single-scale DINO patch features (Hp×Wp×C) from an RGB image."""
+    """Extract single-scale DINO patch features (Hp×Wp×C) from an RGB image.
+
+    Args:
+        image_hw3 (np.ndarray): RGB image array.
+        model: DINO model.
+        processor: DINO processor.
+        device: Torch device.
+        ps (int): Patch size.
+        aggregate_layers (list[int] | None): Optional layer indices to average.
+
+    Returns:
+        tuple[np.ndarray, int, int]: Feature grid, patch height, patch width.
+
+    Examples:
+        >>> callable(extract_patch_features_single_scale)
+        True
+    """
     t0 = time_start()
     inputs = processor(
         images=image_hw3,
@@ -228,7 +400,27 @@ def prefetch_features_single_scale_image(
     feature_dir: str | None = None,
     image_id: str | None = None,
 ):
-    """Precompute and cache all tile features for an image; returns dict keyed by (y,x) with feats/shape."""
+    """Precompute and cache all tile features for an image.
+
+    Args:
+        img_hw3 (np.ndarray): RGB image array.
+        model: DINO model.
+        processor: DINO processor.
+        device: Torch device.
+        ps (int): Patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int | None): Tile stride.
+        aggregate_layers (list[int] | None): Optional layer indices to average.
+        feature_dir (str | None): Optional cache directory.
+        image_id (str | None): Optional image id for cache naming.
+
+    Returns:
+        dict: Cache keyed by (y, x) with feature arrays and tile shapes.
+
+    Examples:
+        >>> callable(prefetch_features_single_scale_image)
+        True
+    """
     t0 = time_start()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0

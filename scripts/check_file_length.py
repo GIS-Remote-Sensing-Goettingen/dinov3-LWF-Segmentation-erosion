@@ -76,7 +76,7 @@ def count_lines(path: Path) -> int:
     """
     try:
         return path.read_text(encoding="utf-8").count("\n") + 1
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return 0
 
 

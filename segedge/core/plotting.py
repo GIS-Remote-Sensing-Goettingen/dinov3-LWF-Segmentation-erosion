@@ -1,12 +1,35 @@
-import os
+"""Plotting helpers for SegEdge outputs."""
+
+from __future__ import annotations
+
 import logging
-import numpy as np
+import os
+
 import matplotlib.pyplot as plt
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, plot_dir, image_id_b, best_shadow=None, labels_sh=None):
-    """Save comparison figure (RGB, GT, raw, CRF, optional shadow/labels) to plot_dir."""
+    """Save comparison figure (RGB, GT, raw, CRF, optional shadow/labels).
+
+    Args:
+        img_b (np.ndarray): Image B RGB array.
+        gt_mask_B (np.ndarray): Ground-truth mask for B.
+        mask_raw_best (np.ndarray): Best raw mask.
+        best_raw_config (dict): Best raw configuration metrics.
+        best_crf_mask (np.ndarray): Best CRF mask.
+        best_crf_config (dict): Best CRF configuration metrics.
+        thr_center_for_crf (float): Threshold center for CRF.
+        plot_dir (str): Output directory for plots.
+        image_id_b (str): Image identifier.
+        best_shadow (dict | None): Optional shadow filter result.
+        labels_sh (np.ndarray | None): Optional SH labels.
+
+    Examples:
+        >>> callable(save_plot)
+        True
+    """
     show_labels = labels_sh is not None
     show_shadow = best_shadow is not None
     cols = 3 if (show_labels or show_shadow) else 2
@@ -67,7 +90,21 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
 
 
 def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b, filename_suffix="champion.png"):
-    """Save a simple overlay plot of the champion mask vs GT."""
+    """Save a simple overlay plot of the champion mask vs GT.
+
+    Args:
+        img_b (np.ndarray): Image B RGB array.
+        gt_mask (np.ndarray): Ground-truth mask.
+        pred_mask (np.ndarray): Predicted mask.
+        title (str): Plot title.
+        plot_dir (str): Output directory.
+        image_id_b (str): Image identifier.
+        filename_suffix (str): Filename suffix.
+
+    Examples:
+        >>> callable(save_best_model_plot)
+        True
+    """
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
     axs[0].imshow(img_b)
     axs[0].set_title("Image B (RGB)")
@@ -100,7 +137,23 @@ def save_knn_xgb_gt_plot(img_b,
                          title_knn="kNN",
                          title_xgb="XGBoost",
                          filename_suffix="knn_xgb_gt.png"):
-    """Save three panels: RGB+GT overlay, RGB+kNN overlay, RGB+XGB overlay."""
+    """Save three panels: RGB+GT overlay, RGB+kNN overlay, RGB+XGB overlay.
+
+    Args:
+        img_b (np.ndarray): Image B RGB array.
+        gt_mask (np.ndarray): Ground-truth mask.
+        mask_knn (np.ndarray): kNN mask.
+        mask_xgb (np.ndarray): XGB mask.
+        plot_dir (str): Output directory.
+        image_id_b (str): Image identifier.
+        title_knn (str): kNN panel title.
+        title_xgb (str): XGB panel title.
+        filename_suffix (str): Filename suffix.
+
+    Examples:
+        >>> callable(save_knn_xgb_gt_plot)
+        True
+    """
     fig, axs = plt.subplots(1, 3, figsize=(24, 8))
 
     # GT overlay

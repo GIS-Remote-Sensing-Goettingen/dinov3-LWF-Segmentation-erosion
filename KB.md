@@ -7,7 +7,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 ## 1) Scope & Audience
 - Audience: a new LLM/engineer with zero context.
 - Goal: explain what the pipeline does, how it’s structured, how to run/evaluate it, and what has failed or been fixed.
-- Source tree: `/home/mak/PycharmProjects/SegEdge/experiments/silver_set_erosion`.
+- Source tree: `/home/mak/PycharmProjects/dinov3-LWF-Segmentation-erosion`.
 - Style: practical “how it works + how to run + what to avoid”, not marketing.
 - Environment: see Section 12 for dependencies/versions and run recipes.
 
@@ -94,18 +94,22 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 ---
 
 ## 7) Code Architecture (modules)
-- `main.py`: Orchestrator—loads data, builds banks, runs kNN + XGB, selects champion, plots, CRF, shadow filter, exports shapefiles/YAML.
+- `main.py`: CLI wrapper for the full pipeline (delegates to `segedge/pipeline/run.py`).
+- `split_eval.py`: CLI wrapper for split evaluation (delegates to `segedge/pipeline/split_eval.py`).
 - `config.py`: All tunable paths/hyperparams.
-- `timing_utils.py`: Timing helpers + debug flags.
-- `features.py`: Tiling, cropping, DINO feature extraction, prefetch, normalization.
-- `banks.py`: Build/load/save positive/negative banks; subsample negatives.
-- `knn.py`: kNN scoring, threshold sweep, fine-tune threshold.
-- `metrics_utils.py`: Metrics (IoU/F1/P/R) and batched GPU/CPU threshold eval; oracle upper bound.
-- `crf_utils.py`: DenseCRF refine and grid search.
-- `io_utils.py`: I/O (load images, reproject, rasterize, buffer, shapefile export, feature consolidation, best-settings YAML).
-- `plotting.py`: Plots for raw/CRF/shadow and GT/kNN/XGB overlays.
-- `shadow_filter.py`: Weighted-sum dark-pixel filtering under mask.
-- `xdboost.py`: Build XGB dataset, train, hyperparam search by IoU on B, score image B.
+- `segedge/pipeline/run.py`: Orchestrator—loads data, builds banks, runs kNN + XGB, selects champion, plots, CRF, shadow filter, exports shapefiles/YAML.
+- `segedge/pipeline/split_eval.py`: Validation/holdout split evaluation flow.
+- `segedge/pipeline/common.py`: Shared helpers for entrypoints.
+- `segedge/core/timing_utils.py`: Timing helpers + debug flags.
+- `segedge/core/features.py`: Tiling, cropping, DINO feature extraction, prefetch, normalization.
+- `segedge/core/banks.py`: Build/load/save positive/negative banks; subsample negatives.
+- `segedge/core/knn.py`: kNN scoring, threshold sweep, fine-tune threshold.
+- `segedge/core/metrics_utils.py`: Metrics (IoU/F1/P/R) and batched GPU/CPU threshold eval; oracle upper bound.
+- `segedge/core/crf_utils.py`: DenseCRF refine and grid search.
+- `segedge/core/io_utils.py`: I/O (load images, reproject, rasterize, buffer, shapefile export, feature consolidation, best-settings YAML).
+- `segedge/core/plotting.py`: Plots for raw/CRF/shadow and GT/kNN/XGB overlays.
+- `segedge/core/shadow_filter.py`: Weighted-sum dark-pixel filtering under mask.
+- `segedge/core/xdboost.py`: Build XGB dataset, train, hyperparam search by IoU on B, score image B.
 - `KB.md`: This document.
 
 ---
@@ -149,9 +153,9 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 2. Set paths/hyperparams in `config.py` as needed.
 3. Run `python main.py` from the repo root.
 4. Outputs:
-   - Plots in `data/plots/` (raw vs CRF vs shadow; GT vs kNN vs XGB; champion pre-CRF).
-   - Shapefiles: `*_pred_mask_best_raw.shp`, `*_pred_mask_best_crf.shp`, `*_pred_mask_best_shadow.shp`.
-   - Best settings YAML: `BEST_SETTINGS_PATH`.
+   - Plots in `output/run_*/plots/` (raw vs CRF vs shadow; GT vs kNN vs XGB; champion pre-CRF).
+   - Shapefiles in `output/run_*/shapes/`: `*_pred_mask_best_raw.shp`, `*_pred_mask_best_crf.shp`, `*_pred_mask_best_shadow.shp`.
+   - Best settings YAML in `output/run_*/best_settings.yml` (or `BEST_SETTINGS_PATH`).
    - Consolidated features: `FEATURE_DIR/{image_id}_features_full.npy`.
 5. Evaluation metric: IoU (primary), plus F1/P/R—computed on B; if `CLIP_GT_TO_BUFFER=True`, GT is masked to SH buffer so max IoU can reach 1.0.
 6. Champion selection: compare best IoU from kNN vs XGB (after median filter); champion feeds CRF; shadow filter runs after CRF.

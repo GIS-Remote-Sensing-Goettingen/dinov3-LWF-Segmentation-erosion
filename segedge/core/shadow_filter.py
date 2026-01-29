@@ -1,9 +1,14 @@
-from concurrent.futures import ProcessPoolExecutor
-import numpy as np
-import logging
+"""Shadow filtering utilities for post-CRF cleanup."""
 
-from metrics_utils import compute_metrics
-from timing_utils import time_start, time_end
+from __future__ import annotations
+
+import logging
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
+
+from .metrics_utils import compute_metrics
+from .timing_utils import time_end, time_start
 
 logger = logging.getLogger(__name__)
 
@@ -12,29 +17,26 @@ def _shadow_filter_single_weights(img_float: np.ndarray,
                                   gt_mask: np.ndarray,
                                   weights,
                                   thresholds):
-    """
-    Evaluate all thresholds for a single weight triplet in a vectorized way.
+    """Evaluate all thresholds for a single weight triplet.
 
-    Args
-    ----
-    img_float : HxWx3 float32 image
-        Preconverted image (no re-cast inside).
-    base_mask : HxW bool
-        Mask from CRF / raw prediction; only pixels under this mask may become FG.
-    gt_mask   : HxW bool or {0,1}
-        Ground-truth mask.
-    weights   : (3,) iterable
-        RGB weights for shadow detection.
-    thresholds : list[float]
-        Weighted-sum thresholds to test.
+    Args:
+        img_float (np.ndarray): HxWx3 float32 image.
+        base_mask (np.ndarray): HxW bool mask limiting valid pixels.
+        gt_mask (np.ndarray): HxW ground-truth mask.
+        weights (Iterable[float]): RGB weights for shadow detection.
+        thresholds (list[float]): Weighted-sum thresholds to test.
 
-    Returns
-    -------
-    best_cfg  : dict or None
-        The best config (for this weights only) with keys:
-        {"weights", "threshold", "tp", "fp", "fn", "tn", "precision", "recall", "iou", "f1"}.
-    best_mask : HxW bool
-        Filtered mask for the best threshold for this weights.
+    Returns:
+        tuple[dict | None, np.ndarray]: Best config and filtered mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.zeros((2, 2, 3), dtype=np.float32)
+        >>> base = np.array([[1, 0], [1, 1]], dtype=bool)
+        >>> gt = np.array([[1, 0], [0, 1]], dtype=bool)
+        >>> cfg, mask = _shadow_filter_single_weights(img, base, gt, (1.0, 1.0, 1.0), [0.0])
+        >>> cfg["iou"] >= 0.0 and mask.shape == (2, 2)
+        True
     """
     # justification:
     # - This function is self-contained, so it's picklable for ProcessPoolExecutor.
@@ -117,11 +119,27 @@ def shadow_filter_grid(img_rgb: np.ndarray,
                        weight_sets,
                        thresholds,
                        num_workers: int = 1):
-    """
-    Filter out dark pixels under the mask using weighted RGB sums.
+    """Filter out dark pixels under the mask using weighted RGB sums.
 
-    Vectorizes all thresholds for each weight-set and optionally parallelizes
-    across weight sets. Returns the best (weights, threshold) and mask.
+    Args:
+        img_rgb (np.ndarray): RGB image array.
+        base_mask (np.ndarray): Mask from CRF or raw predictions.
+        gt_mask (np.ndarray): Ground-truth mask.
+        weight_sets (Iterable[tuple[float, float, float]]): Weight sets to try.
+        thresholds (list[float]): Weighted-sum thresholds to test.
+        num_workers (int): Parallel worker count.
+
+    Returns:
+        tuple[dict | None, np.ndarray]: Best config and filtered mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.zeros((2, 2, 3), dtype=np.uint8)
+        >>> base = np.ones((2, 2), dtype=bool)
+        >>> gt = np.ones((2, 2), dtype=bool)
+        >>> cfg, mask = shadow_filter_grid(img, base, gt, [(1.0, 1.0, 1.0)], [0.0], num_workers=1)
+        >>> mask.shape
+        (2, 2)
     """
     t0 = time_start()
 

@@ -1,18 +1,23 @@
-import os
+"""XGBoost training and scoring utilities for SegEdge."""
+
+from __future__ import annotations
+
 import logging
+import os
+
 import numpy as np
 import xgboost as xgb
 from skimage.transform import resize
 
-from features import (
-    tile_iterator,
+from .features import (
+    add_local_context_mean,
     crop_to_multiple_of_ps,
     labels_to_patch_masks,
-    tile_feature_path,
-    add_local_context_mean,
     load_tile_features_if_valid,
+    tile_feature_path,
+    tile_iterator,
 )
-from metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
+from .metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -28,24 +33,26 @@ def build_xgb_dataset(
     max_neg=8000,
     context_radius: int = 0,
 ):
-    """
-    Builds a dataset for XGBoost by iterating over image tiles, extracting features,
-    and creating positive/negative samples based on labels.
+    """Build an XGBoost dataset from tiled features and labels.
 
-    Parameters:
-    - img (numpy.ndarray): The input image.
-    - labels (numpy.ndarray): The label image.
-    - ps (int): Patch size for cropping.
-    - tile_size (int): Size of each tile.
-    - stride (int): Stride for tiling.
-    - feature_dir (str): Directory containing precomputed features.
-    - image_id (str): Identifier for the image.
-    - pos_frac (float): Fraction threshold for positive patches.
-    - max_neg (int, optional): Maximum number of negative samples (default: 8000).
+    Args:
+        img (np.ndarray): Input image.
+        labels (np.ndarray): Label image aligned to img.
+        ps (int): Patch size for cropping.
+        tile_size (int): Size of each tile.
+        stride (int): Stride for tiling.
+        feature_dir (str): Directory containing precomputed features.
+        image_id (str): Identifier for the image.
+        pos_frac (float): Fraction threshold for positive patches.
+        max_neg (int): Maximum number of negative samples.
+        context_radius (int): Feature context radius.
 
     Returns:
-    - X (numpy.ndarray): Feature matrix.
-    - y (numpy.ndarray): Label array (1 for positive, 0 for negative).
+        tuple[np.ndarray, np.ndarray]: Feature matrix X and labels y.
+
+    Examples:
+        >>> callable(build_xgb_dataset)
+        True
     """
     X_pos, X_neg = [], []
     missing_feature_tiles = 0
@@ -53,6 +60,9 @@ def build_xgb_dataset(
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
         img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
         if h_eff < ps or w_eff < ps:
+            continue
+        if lab_c is None:
+            logger.warning("missing labels for tile y=%s x=%s; skipping", y, x)
             continue
         fpath = tile_feature_path(feature_dir, image_id, y, x)
         if not os.path.exists(fpath):
@@ -75,6 +85,9 @@ def build_xgb_dataset(
             continue
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
+        if hp is None or wp is None:
+            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            continue
         pos_mask, neg_mask = labels_to_patch_masks(lab_c, hp, wp, pos_frac_thresh=pos_frac)
         if pos_mask.any():
             X_pos.append(feats_tile[pos_mask])
@@ -107,12 +120,22 @@ def build_xgb_dataset(
     return X, y
 
 
-import xgboost as xgb
-
-
 def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=50):
-    """
-    Train a binary XGBoost classifier; defaults tuned for high-dimensional embeddings.
+    """Train a binary XGBoost classifier for patch embeddings.
+
+    Args:
+        X (np.ndarray): Feature matrix.
+        y (np.ndarray): Binary labels.
+        use_gpu (bool): Use GPU histogram algorithm when available.
+        num_boost_round (int): Number of boosting rounds.
+        verbose_eval (int): Verbosity interval.
+
+    Returns:
+        xgb.Booster: Trained XGBoost booster.
+
+    Examples:
+        >>> callable(train_xgb_classifier)
+        True
     """
     dtrain = xgb.DMatrix(X, label=y)
     params = {
@@ -147,8 +170,25 @@ def hyperparam_search_xgb(X,
                           early_stopping_rounds=40,
                           verbose_eval=50,
                           seed: int = 42):
-    """
-    Hyperparameter search over a list of parameter overrides; picks best by val logloss.
+    """Run hyperparameter search, selecting by validation logloss.
+
+    Args:
+        X (np.ndarray): Feature matrix.
+        y (np.ndarray): Binary labels.
+        use_gpu (bool): Use GPU histogram algorithm when available.
+        param_grid (list[dict] | None): Parameter overrides.
+        num_boost_round (int): Number of boosting rounds.
+        val_fraction (float): Validation fraction for early stopping.
+        early_stopping_rounds (int): Early stopping patience.
+        verbose_eval (int): Verbosity interval.
+        seed (int): RNG seed.
+
+    Returns:
+        tuple[xgb.Booster | None, dict | None, float]: Best model, params, logloss.
+
+    Examples:
+        >>> callable(hyperparam_search_xgb)
+        True
     """
     n = len(X)
     if n == 0:
@@ -242,9 +282,38 @@ def hyperparam_search_xgb_iou(X,
                               verbose_eval=50,
                               seed: int = 42,
                               context_radius: int = 0):
-    """
-    Hyperparameter search where the selection metric is IoU on Image B:
-    train on Image A patches, score on B, sweep thresholds, pick max IoU.
+    """Search hyperparameters using IoU on Image B as the selection metric.
+
+    Args:
+        X (np.ndarray): Feature matrix from Image A.
+        y (np.ndarray): Binary labels from Image A.
+        thresholds (list[float]): Thresholds to sweep on Image B scores.
+        sh_buffer_mask_b (np.ndarray): SH buffer mask for Image B.
+        gt_mask_b (np.ndarray): Ground-truth mask for Image B.
+        img_b (np.ndarray): Image B array.
+        ps (int): Patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int): Tile stride.
+        feature_dir (str): Feature cache directory.
+        image_id_b (str): Image B identifier.
+        prefetched_tiles (dict | None): Optional in-memory cache.
+        device: Torch device for metrics (optional).
+        use_gpu (bool): Use GPU histogram algorithm when available.
+        param_grid (list[dict] | None): Parameter overrides.
+        num_boost_round (int): Number of boosting rounds.
+        val_fraction (float): Validation fraction for early stopping.
+        early_stopping_rounds (int): Early stopping patience.
+        verbose_eval (int): Verbosity interval.
+        seed (int): RNG seed.
+        context_radius (int): Feature context radius.
+
+    Returns:
+        tuple[xgb.Booster | None, dict | None, float, float | None, dict | None]:
+            Best model, params, IoU, threshold, metrics.
+
+    Examples:
+        >>> callable(hyperparam_search_xgb_iou)
+        True
     """
     best_model = None
     best_params = None
@@ -318,15 +387,23 @@ def hyperparam_search_xgb_iou(X,
             prefetched_tiles=prefetched_tiles,
             context_radius=context_radius,
         )
-        try:
-            metrics_list = compute_metrics_batch_gpu(
-                score_full_xgb,
-                thresholds,
-                sh_buffer_mask_b,
-                gt_mask_b,
-                device=device,
-            )
-        except Exception:
+        if device is not None:
+            try:
+                metrics_list = compute_metrics_batch_gpu(
+                    score_full_xgb,
+                    thresholds,
+                    sh_buffer_mask_b,
+                    gt_mask_b,
+                    device=device,
+                )
+            except Exception:
+                metrics_list = compute_metrics_batch_cpu(
+                    score_full_xgb,
+                    thresholds,
+                    sh_buffer_mask_b,
+                    gt_mask_b,
+                )
+        else:
             metrics_list = compute_metrics_batch_cpu(
                 score_full_xgb,
                 thresholds,
@@ -364,28 +441,46 @@ def xgb_score_image_b(
     prefetched_tiles=None,
     context_radius: int = 0,
 ):
-    """
-    Apply a trained XGBoost model to Image B using cached or prefetched features; returns score map.
+    """Apply a trained XGBoost model to Image B and return a score map.
+
+    Args:
+        img_b (np.ndarray): Image B array.
+        bst (xgb.Booster): Trained booster.
+        ps (int): Patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int): Tile stride.
+        feature_dir (str): Feature cache directory.
+        image_id_b (str): Image B identifier.
+        prefetched_tiles (dict | None): Optional in-memory cache.
+        context_radius (int): Feature context radius.
+
+    Returns:
+        np.ndarray: Score map at pixel resolution.
+
+    Examples:
+        >>> callable(xgb_score_image_b)
+        True
     """
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
 
-    tile_iter = (
-        sorted(prefetched_tiles.items()) if prefetched_tiles is not None
-        else tile_iterator(img_b, None, tile_size, stride)
-    )
+    if prefetched_tiles is not None:
+        tile_items = sorted(prefetched_tiles.items())
+        tile_iter = ((y, x, info) for (y, x), info in tile_items)
+    else:
+        tile_iter = ((y, x, img_tile) for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride))
 
     for tile_entry in tile_iter:
         if prefetched_tiles is not None:
-            (y, x), feat_info = tile_entry
+            y, x, feat_info = tile_entry
             feats_tile = feat_info["feats"]
             h_eff = feat_info["h_eff"]
             w_eff = feat_info["w_eff"]
             hp = feat_info["hp"]
             wp = feat_info["wp"]
         else:
-            y, x, img_tile, _ = tile_entry
+            y, x, img_tile = tile_entry
             img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
             if h_eff < ps or w_eff < ps:
                 continue
@@ -398,6 +493,9 @@ def xgb_score_image_b(
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
 
+        if hp is None or wp is None:
+            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            continue
         dtest = xgb.DMatrix(feats_tile.reshape(-1, feats_tile.shape[-1]))
         scores_patch = bst.predict(dtest).reshape(hp, wp)
         scores_tile = resize(scores_patch, (h_eff, w_eff), order=1, preserve_range=True, anti_aliasing=True).astype(np.float32)

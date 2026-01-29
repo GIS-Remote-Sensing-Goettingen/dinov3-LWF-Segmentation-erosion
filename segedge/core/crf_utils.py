@@ -1,12 +1,23 @@
-import numpy as np
+"""DenseCRF refinement utilities for SegEdge."""
+
+from __future__ import annotations
+
 from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
 from skimage.transform import resize
 
-from pydensecrf import densecrf as dcrf
-from pydensecrf.utils import unary_from_softmax
+try:
+    from pydensecrf import densecrf as dcrf
+    from pydensecrf.utils import unary_from_softmax
+    _HAS_DCRF = True
+except ImportError:  # pragma: no cover - optional dependency
+    dcrf = None
+    unary_from_softmax = None
+    _HAS_DCRF = False
 
-from metrics_utils import compute_metrics
-from timing_utils import time_start, time_end
+from .metrics_utils import compute_metrics
+from .timing_utils import time_end, time_start
 
 
 def refine_with_densecrf(
@@ -22,7 +33,30 @@ def refine_with_densecrf(
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
 ) -> np.ndarray:
-    """Run DenseCRF with a logistic unary centered at threshold_center; returns refined mask."""
+    """Run DenseCRF with a logistic unary centered at threshold_center.
+
+    Args:
+        img_rgb (np.ndarray): RGB image array.
+        score_map (np.ndarray): Score map at pixel resolution.
+        threshold_center (float): Center threshold for unary logits.
+        sh_mask (np.ndarray | None): Optional SH buffer mask.
+        prob_softness (float): Softness for logistic unary.
+        n_iters (int): Number of CRF iterations.
+        pos_w (float): Gaussian pairwise weight.
+        pos_xy_std (float): Gaussian spatial std.
+        bilateral_w (float): Bilateral pairwise weight.
+        bilateral_xy_std (float): Bilateral spatial std.
+        bilateral_rgb_std (float): Bilateral color std.
+
+    Returns:
+        np.ndarray: Refined boolean mask.
+
+    Examples:
+        >>> callable(refine_with_densecrf)
+        True
+    """
+    if not _HAS_DCRF:
+        raise ImportError("pydensecrf is required for CRF refinement")
     t0 = time_start()
     h, w, _ = img_rgb.shape
     assert score_map.shape == (h, w), "score_map must have shape (H, W)"
@@ -68,7 +102,18 @@ def refine_with_densecrf(
 
 
 def _crf_eval_worker(args):
-    """Process-pool helper to evaluate one CRF config; returns metrics and config dict."""
+    """Process-pool helper to evaluate one CRF config.
+
+    Args:
+        args (tuple): Packed arguments for CRF evaluation.
+
+    Returns:
+        tuple[dict, dict]: Metrics and config dict.
+
+    Examples:
+        >>> callable(_crf_eval_worker)
+        True
+    """
     (img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg) = args
     prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
     mask_crf_local = refine_with_densecrf(
@@ -114,7 +159,33 @@ def crf_grid_search(
     num_workers: int = 1,
     backend: str = "process",
 ):
-    """Small grid search over CRF hyperparameters; optional downsampling + multiprocessing."""
+    """Run a small grid search over CRF hyperparameters.
+
+    Args:
+        img_rgb (np.ndarray): RGB image array.
+        score_map (np.ndarray): Score map at pixel resolution.
+        threshold_center (float): Center threshold for unary logits.
+        sh_mask (np.ndarray): SH buffer mask.
+        gt_mask (np.ndarray): Ground-truth mask.
+        prob_softness_vals (Iterable[float]): Softness values to sweep.
+        pos_w_vals (Iterable[float]): Gaussian weights to sweep.
+        pos_xy_std_vals (Iterable[float]): Gaussian std values to sweep.
+        bilateral_w_vals (Iterable[float]): Bilateral weights to sweep.
+        bilateral_xy_std_vals (Iterable[float]): Bilateral spatial std values.
+        bilateral_rgb_std_vals (Iterable[float]): Bilateral RGB std values.
+        n_iters (int): CRF iterations per config.
+        max_configs (int | None): Optional limit on configs.
+        downsample_factor (int): Optional downsample factor for search.
+        num_workers (int): Worker count for multiprocessing.
+        backend (str): Execution backend ("process" or "serial").
+
+    Returns:
+        tuple[dict | None, np.ndarray | None]: Best config and mask.
+
+    Examples:
+        >>> callable(crf_grid_search)
+        True
+    """
     t0 = time_start()
     best_cfg = None
     best_mask = None

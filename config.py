@@ -74,7 +74,7 @@ BANK_EROSION_RADIUS = 0
 # -----------------------------------------------------------------------------
 
 # kNN grid search
-#K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100, 150, 200, 300, 500]
+# K_VALUES = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 50, 75, 100, 150, 200, 300, 500]
 K_VALUES = [175, 200, 250]
 THRESHOLDS = [float(x) for x in __import__("numpy").linspace(0.01, 0.9, 100)]
 
@@ -96,7 +96,24 @@ SHADOW_WEIGHT_SETS = [
     (0.5, 0.5, 1.0),
     (0.1, 0.5, 0.5),
 ]
-SHADOW_THRESHOLDS = [20, 40, 60, 80, 100, 120, 160, 180, 210, 240, 270, 300, 330, 360, 450, 500]
+SHADOW_THRESHOLDS = [
+    20,
+    40,
+    60,
+    80,
+    100,
+    120,
+    160,
+    180,
+    210,
+    240,
+    270,
+    300,
+    330,
+    360,
+    450,
+    500,
+]
 
 # XGBoost (patch classifier)
 XGB_USE_GPU = True
@@ -106,11 +123,32 @@ XGB_EARLY_STOP = 40
 XGB_VERBOSE_EVAL = 20
 XGB_PARAM_GRID = [
     # 1) Baseline
-    {"max_depth": 6, "eta": 0.05, "colsample_bytree": 0.3, "subsample": 0.9, "reg_alpha": 0.05, "min_child_weight": 1},
+    {
+        "max_depth": 6,
+        "eta": 0.05,
+        "colsample_bytree": 0.3,
+        "subsample": 0.9,
+        "reg_alpha": 0.05,
+        "min_child_weight": 1,
+    },
     # 2) Deep & slow (needs more rounds)
-    {"max_depth": 7, "eta": 0.03, "colsample_bytree": 0.3, "subsample": 0.9, "reg_alpha": 0.05, "min_child_weight": 1},
+    {
+        "max_depth": 7,
+        "eta": 0.03,
+        "colsample_bytree": 0.3,
+        "subsample": 0.9,
+        "reg_alpha": 0.05,
+        "min_child_weight": 1,
+    },
     # 3) More regularized
-    {"max_depth": 6, "eta": 0.05, "colsample_bytree": 0.3, "subsample": 0.9, "reg_alpha": 0.1,  "min_child_weight": 1},
+    {
+        "max_depth": 6,
+        "eta": 0.05,
+        "colsample_bytree": 0.3,
+        "subsample": 0.9,
+        "reg_alpha": 0.1,
+        "min_child_weight": 1,
+    },
 ]
 
 # -----------------------------------------------------------------------------

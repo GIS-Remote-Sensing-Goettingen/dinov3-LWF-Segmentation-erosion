@@ -1,6 +1,11 @@
-import os
+"""I/O helpers for raster/vector data and artifacts."""
+
+from __future__ import annotations
+
 import logging
+import os
 import rasterio
+from rasterio.io import MemoryFile
 import fiona
 import numpy as np
 import rasterio.features as rfeatures
@@ -13,7 +18,7 @@ from pyproj import Transformer
 from skimage.morphology import dilation, disk
 from skimage.transform import resize
 
-from timing_utils import time_start, time_end, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
+from .timing_utils import time_end, time_start
 import config as cfg
 
 logger = logging.getLogger(__name__)
@@ -21,13 +26,23 @@ try:
     import cv2
     _HAS_CV2 = True
 except ImportError:
+    cv2 = None
     _HAS_CV2 = False
 
 
 def load_dop20_image(path: str, downsample_factor: int = 1) -> np.ndarray:
-    """
-    Load a GeoTIFF orthophoto and return an HxWx3 RGB array (clips to first 3 bands).
-    Optionally downsample by an integer factor (nearest for labels, bilinear for imagery).
+    """Load a GeoTIFF orthophoto into an RGB array.
+
+    Args:
+        path (str): Path to a GeoTIFF image.
+        downsample_factor (int): Integer downsample factor.
+
+    Returns:
+        np.ndarray: HxWx3 RGB array.
+
+    Examples:
+        >>> callable(load_dop20_image)
+        True
     """
     t0 = time_start()
     with rasterio.open(path) as src:
@@ -48,7 +63,20 @@ def load_dop20_image(path: str, downsample_factor: int = 1) -> np.ndarray:
 
 
 def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_factor: int = 1) -> np.ndarray:
-    """Reproject a raster label map onto the grid/CRS of a reference image using nearest neighbor."""
+    """Reproject a raster label map onto a reference image grid.
+
+    Args:
+        ref_img_path (str): Reference image path.
+        labels_path (str): Label raster path.
+        downsample_factor (int): Integer downsample factor.
+
+    Returns:
+        np.ndarray: Reprojected label array.
+
+    Examples:
+        >>> callable(reproject_labels_to_image)
+        True
+    """
     t0 = time_start()
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
         if downsample_factor > 1:
@@ -70,7 +98,7 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_fa
             height=dst_height,
             transform=dst_transform,
         )
-        memfile = rasterio.io.MemoryFile()
+        memfile = MemoryFile()
         with memfile.open(**dst_meta) as dst:
             for i in range(1, src.count + 1):
                 reproject(
@@ -109,11 +137,22 @@ def rasterize_vector_labels(vector_path: str | list[str],
                             ref_raster_path: str,
                             burn_value: int = 1,
                             downsample_factor: int = 1) -> np.ndarray:
-    """
-    Rasterize one or more vector layers onto the reference raster grid and union them.
+    """Rasterize one or more vector layers onto the reference raster grid.
 
-    - If vector_path is a list, each file is rasterized and combined with logical OR.
-    - Auto-reprojects geometries if CRS differs from the reference raster CRS.
+    If vector_path is a list, each file is rasterized and combined with logical OR.
+
+    Args:
+        vector_path (str | list[str]): Vector path or list of paths.
+        ref_raster_path (str): Reference raster path.
+        burn_value (int): Burn value for rasterization.
+        downsample_factor (int): Integer downsample factor.
+
+    Returns:
+        np.ndarray: Rasterized mask array.
+
+    Examples:
+        >>> callable(rasterize_vector_labels)
+        True
     """
     t0 = time_start()
     vector_paths = vector_path if isinstance(vector_path, list) else [vector_path]
@@ -167,13 +206,28 @@ def rasterize_vector_labels(vector_path: str | list[str],
 
 
 def build_sh_buffer_mask(labels_sh: np.ndarray, buffer_pixels: int) -> np.ndarray:
-    """Dilate SH_2022 raster by buffer_pixels using cv2 (fast) or skimage fallback."""
+    """Dilate SH_2022 raster by buffer_pixels using cv2 or skimage.
+
+    Args:
+        labels_sh (np.ndarray): SH label raster.
+        buffer_pixels (int): Buffer radius in pixels.
+
+    Returns:
+        np.ndarray: Buffered mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> labels = np.array([[0, 1], [0, 0]], dtype=np.uint8)
+        >>> mask = build_sh_buffer_mask(labels, buffer_pixels=0)
+        >>> mask.astype(int).tolist()
+        [[0, 1], [0, 0]]
+    """
     t0 = time_start()
     base = labels_sh > 0
     if buffer_pixels <= 0:
         time_end("build_sh_buffer_mask", t0)
         return base
-    if _HAS_CV2:
+    if _HAS_CV2 and cv2 is not None:
         ksize = 2 * buffer_pixels + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         buf = cv2.dilate(base.astype(np.uint8), kernel).astype(bool)
@@ -184,7 +238,17 @@ def build_sh_buffer_mask(labels_sh: np.ndarray, buffer_pixels: int) -> np.ndarra
 
 
 def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: str):
-    """Vectorize a binary mask and save polygons to a shapefile aligned to ref_raster_path CRS."""
+    """Vectorize a binary mask and save polygons to a shapefile.
+
+    Args:
+        mask (np.ndarray): Binary mask.
+        ref_raster_path (str): Reference raster path for CRS/transform.
+        out_path (str): Output shapefile path.
+
+    Examples:
+        >>> callable(export_mask_to_shapefile)
+        True
+    """
     t0 = time_start()
     mask_uint8 = mask.astype("uint8")
     with rasterio.open(ref_raster_path) as src:
@@ -205,10 +269,15 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
 
 
 def export_masks_to_shapefile_union(masks_with_refs: list[tuple[np.ndarray, str]], out_path: str):
-    """
-    Write multiple masks (each tied to its own reference raster) into a single shapefile.
+    """Write multiple masks into a single shapefile without dissolving overlaps.
 
-    This does not dissolve overlaps; it simply appends all polygons into one layer.
+    Args:
+        masks_with_refs (list[tuple[np.ndarray, str]]): Mask and reference raster pairs.
+        out_path (str): Output shapefile path.
+
+    Examples:
+        >>> callable(export_masks_to_shapefile_union)
+        True
     """
     t0 = time_start()
     if not masks_with_refs:
@@ -236,7 +305,27 @@ def export_masks_to_shapefile_union(masks_with_refs: list[tuple[np.ndarray, str]
 
 
 def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"):
-    """Concatenate all tile feature .npy files for an image into a single array; return path."""
+    """Concatenate all tile feature .npy files for an image into a single array.
+
+    Args:
+        feature_dir (str): Directory containing feature tiles.
+        image_id (str): Image identifier.
+        output_suffix (str): Output filename suffix.
+
+    Returns:
+        str | None: Path to consolidated feature array, or None if missing.
+
+    Examples:
+        >>> import numpy as np
+        >>> import os
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     np.save(os.path.join(d, "img_y0_x0_features.npy"), np.zeros((1, 1, 2), dtype=np.float32))
+        ...     np.save(os.path.join(d, "img_y0_x1_features.npy"), np.ones((1, 1, 2), dtype=np.float32))
+        ...     out_path = consolidate_features_for_image(d, "img")
+        ...     np.load(out_path).shape
+        (2, 2)
+    """
     t0 = time_start()
     if not os.path.isdir(feature_dir):
         logger.warning("feature_dir does not exist: %s", feature_dir)
@@ -271,8 +360,28 @@ def export_best_settings(best_raw_config,
                          shadow_cfg=None,
                          extra_settings: dict | None = None,
                          best_settings_path: str | None = None):
-    """
-    Write a minimal YAML with the champion configurations and context (paths, buffer, pixel size).
+    """Write a minimal YAML with the champion configurations and context.
+
+    Args:
+        best_raw_config (dict): Best raw configuration.
+        best_crf_config (dict): Best CRF configuration.
+        model_name (str): Model name.
+        img_path (str): Image A path.
+        img2_path (str): Image B path.
+        buffer_m (float): Buffer in meters.
+        pixel_size_m (float): Pixel size in meters.
+        shadow_cfg (dict | None): Shadow filter configuration.
+        extra_settings (dict | None): Extra settings to write.
+        best_settings_path (str | None): Output path override.
+
+    Examples:
+        >>> import os
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     path = os.path.join(d, "best.yml")
+        ...     export_best_settings({"k": 1}, {"prob_softness": 0.1}, "model", "a.tif", "b.tif", 8.0, 0.2, best_settings_path=path)
+        ...     os.path.exists(path)
+        True
     """
     best_settings = {
         "best_raw_config": best_raw_config,
@@ -290,6 +399,11 @@ def export_best_settings(best_raw_config,
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         def _write_yaml(d, indent=0):
+            """Write a minimal YAML mapping.
+
+            Examples:
+                >>> _write_yaml({"a": 1})  # doctest: +SKIP
+            """
             for k, v in d.items():
                 if isinstance(v, dict):
                     f.write("  " * indent + f"{k}:\n")
