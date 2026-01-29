@@ -77,6 +77,25 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     labels_sh = reproject_labels_to_image(img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds)
     gt_mask = rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds) if gt_vector_paths else None
     time_end("data_loading_and_reprojection", t0_data)
+    target_shape = img_b.shape[:2]
+    if labels_sh.shape != target_shape:
+        logger.warning("labels_sh shape %s != image shape %s; resizing to match", labels_sh.shape, target_shape)
+        labels_sh = resize(
+            labels_sh,
+            target_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(labels_sh.dtype)
+    if gt_mask is not None and gt_mask.shape != target_shape:
+        logger.warning("gt_mask shape %s != image shape %s; resizing to match", gt_mask.shape, target_shape)
+        gt_mask = resize(
+            gt_mask,
+            target_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(gt_mask.dtype)
 
     if gt_mask is not None:
         logger.debug("GT positives on B: %s", gt_mask.sum())
@@ -711,10 +730,13 @@ def main():
             cfg.BANK_CACHE_DIR,
             context_radius=context_radius,
         )
-        pos_banks.append(pos_bank_i)
+        if pos_bank_i.size > 0:
+            pos_banks.append(pos_bank_i)
         if neg_bank_i is not None and len(neg_bank_i) > 0:
             neg_banks.append(neg_bank_i)
 
+    if not pos_banks:
+        raise ValueError("no positive banks were built; check SOURCE_TILES and labels")
     pos_bank = np.concatenate(pos_banks, axis=0)
     neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
     logger.info("combined banks: pos=%s, neg=%s", len(pos_bank), 0 if neg_bank is None else len(neg_bank))
@@ -740,10 +762,13 @@ def main():
             max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
             context_radius=context_radius,
         )
-        X_list.append(X_i)
-        y_list.append(y_i)
+        if X_i.size > 0 and y_i.size > 0:
+            X_list.append(X_i)
+            y_list.append(y_i)
     X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
+    if X.size == 0 or y.size == 0:
+        raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
 
     # ------------------------------------------------------------
     # Tune on validation tile, then infer on holdout tiles
