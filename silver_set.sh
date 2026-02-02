@@ -24,4 +24,5 @@ python --version
 python -m torch.utils.collect_env
 
 # Run the SR job within the per-patch workspace
+ cd /user/davide.mattioli/u20330/dinov3-LWF-Segmentation-erosion
 python -u ./main.py
