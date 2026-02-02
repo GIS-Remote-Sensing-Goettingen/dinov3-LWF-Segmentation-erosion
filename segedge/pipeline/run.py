@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import torch
@@ -49,6 +50,36 @@ USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
 CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
 
 logger = logging.getLogger(__name__)
+
+_CRF_PARALLEL_CONTEXTS: list[dict] | None = None
+
+
+def _init_crf_parallel(contexts: list[dict]) -> None:
+    global _CRF_PARALLEL_CONTEXTS
+    _CRF_PARALLEL_CONTEXTS = contexts
+
+
+def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
+    if _CRF_PARALLEL_CONTEXTS is None:
+        raise RuntimeError("CRF contexts not initialized")
+    prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+    ious = []
+    for ctx in _CRF_PARALLEL_CONTEXTS:
+        mask_crf_local = refine_with_densecrf(
+            ctx["img_b"],
+            ctx["score_full"],
+            ctx["thr_center"],
+            ctx["sh_buffer_mask"],
+            prob_softness=prob_soft,
+            n_iters=n_iters,
+            pos_w=pos_w,
+            pos_xy_std=pos_xy,
+            bilateral_w=bi_w,
+            bilateral_xy_std=bi_xy,
+            bilateral_rgb_std=bi_rgb,
+        )
+        ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
+    return float(np.median(ious)), cfg
 
 
 def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
@@ -386,6 +417,47 @@ def tune_on_validation_multi(
         "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
     )
 
+    thr_center = (
+        best_raw_config["threshold"]
+        if champion_source == "raw"
+        else best_xgb_config["threshold"]
+    )
+    for ctx in val_contexts:
+        if champion_source == "raw":
+            score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
+                img_b=ctx["img_b"],
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
+                model=model,
+                processor=processor,
+                device=device,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                k=best_raw_config["k"],
+                aggregate_layers=None,
+                feature_dir=feature_dir,
+                image_id=ctx["image_id"],
+                neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                prefetched_tiles=ctx["prefetched_b"],
+                use_fp16_matmul=USE_FP16_KNN,
+                context_radius=context_radius,
+            )
+        else:
+            score_full = xgb_score_image_b(
+                ctx["img_b"],
+                best_bst,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                ctx["image_id"],
+                prefetched_tiles=ctx["prefetched_b"],
+                context_radius=context_radius,
+            )
+        ctx["score_full"] = score_full
+        ctx["thr_center"] = thr_center
+
     # CRF tuning across val tiles
     crf_candidates = [
         (psf, pw, pxy, bw, bxy, brgb)
@@ -398,71 +470,40 @@ def tune_on_validation_multi(
     ]
     best_crf_cfg = None
     best_crf_iou = None
-    for cand in crf_candidates[:CRF_MAX_CONFIGS]:
-        ious = []
-        for ctx in val_contexts:
-            logger.info("tune: CRF scoring on %s", ctx["path"])
-            if champion_source == "raw":
-                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
-                    img_b=ctx["img_b"],
-                    pos_bank=pos_bank,
-                    neg_bank=neg_bank,
-                    model=model,
-                    processor=processor,
-                    device=device,
-                    ps=ps,
-                    tile_size=tile_size,
-                    stride=stride,
-                    k=best_raw_config["k"],
-                    aggregate_layers=None,
-                    feature_dir=feature_dir,
-                    image_id=ctx["image_id"],
-                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
-                    prefetched_tiles=ctx["prefetched_b"],
-                    use_fp16_matmul=USE_FP16_KNN,
-                    context_radius=context_radius,
-                )
-                thr_center = best_raw_config["threshold"]
-            else:
-                score_full = xgb_score_image_b(
-                    ctx["img_b"],
-                    best_bst,
-                    ps,
-                    tile_size,
-                    stride,
-                    feature_dir,
-                    ctx["image_id"],
-                    prefetched_tiles=ctx["prefetched_b"],
-                    context_radius=context_radius,
-                )
-                thr_center = best_xgb_config["threshold"]
-
-            mask_crf = refine_with_densecrf(
-                ctx["img_b"],
-                score_full,
-                thr_center,
-                ctx["sh_buffer_mask"],
-                prob_softness=cand[0],
-                n_iters=5,
-                pos_w=cand[1],
-                pos_xy_std=cand[2],
-                bilateral_w=cand[3],
-                bilateral_xy_std=cand[4],
-                bilateral_rgb_std=cand[5],
-            )
-            ious.append(compute_metrics(mask_crf, ctx["gt_mask_eval"])["iou"])
-
-        med_iou = float(np.median(ious))
-        if best_crf_iou is None or med_iou > best_crf_iou:
-            best_crf_iou = med_iou
-            best_crf_cfg = {
-                "prob_softness": cand[0],
-                "pos_w": cand[1],
-                "pos_xy_std": cand[2],
-                "bilateral_w": cand[3],
-                "bilateral_xy_std": cand[4],
-                "bilateral_rgb_std": cand[5],
-            }
+    crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
+    num_workers = int(getattr(cfg, "CRF_NUM_WORKERS", 1) or 1)
+    logger.info(
+        "tune: CRF grid search configs=%s, workers=%s",
+        len(crf_candidates),
+        num_workers,
+    )
+    _init_crf_parallel(val_contexts)
+    if num_workers > 1:
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
+                if best_crf_iou is None or med_iou > best_crf_iou:
+                    best_crf_iou = med_iou
+                    best_crf_cfg = {
+                        "prob_softness": cand[0],
+                        "pos_w": cand[1],
+                        "pos_xy_std": cand[2],
+                        "bilateral_w": cand[3],
+                        "bilateral_xy_std": cand[4],
+                        "bilateral_rgb_std": cand[5],
+                    }
+    else:
+        for cand in crf_candidates:
+            med_iou, _ = _eval_crf_config(cand)
+            if best_crf_iou is None or med_iou > best_crf_iou:
+                best_crf_iou = med_iou
+                best_crf_cfg = {
+                    "prob_softness": cand[0],
+                    "pos_w": cand[1],
+                    "pos_xy_std": cand[2],
+                    "bilateral_w": cand[3],
+                    "bilateral_xy_std": cand[4],
+                    "bilateral_rgb_std": cand[5],
+                }
     if best_crf_cfg is None:
         raise ValueError("CRF tuning returned no results")
 
@@ -473,40 +514,8 @@ def tune_on_validation_multi(
         iou_by_thr = {thr: [] for thr in cfg.SHADOW_THRESHOLDS}
         for ctx in val_contexts:
             logger.info("tune: shadow scoring on %s", ctx["path"])
-            if champion_source == "raw":
-                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
-                    img_b=ctx["img_b"],
-                    pos_bank=pos_bank,
-                    neg_bank=neg_bank,
-                    model=model,
-                    processor=processor,
-                    device=device,
-                    ps=ps,
-                    tile_size=tile_size,
-                    stride=stride,
-                    k=best_raw_config["k"],
-                    aggregate_layers=None,
-                    feature_dir=feature_dir,
-                    image_id=ctx["image_id"],
-                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
-                    prefetched_tiles=ctx["prefetched_b"],
-                    use_fp16_matmul=USE_FP16_KNN,
-                    context_radius=context_radius,
-                )
-                thr_center = best_raw_config["threshold"]
-            else:
-                score_full = xgb_score_image_b(
-                    ctx["img_b"],
-                    best_bst,
-                    ps,
-                    tile_size,
-                    stride,
-                    feature_dir,
-                    ctx["image_id"],
-                    prefetched_tiles=ctx["prefetched_b"],
-                    context_radius=context_radius,
-                )
-                thr_center = best_xgb_config["threshold"]
+            score_full = ctx["score_full"]
+            thr_center = ctx["thr_center"]
 
             mask_crf = refine_with_densecrf(
                 ctx["img_b"],
