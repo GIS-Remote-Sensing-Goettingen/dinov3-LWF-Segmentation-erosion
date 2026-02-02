@@ -7,12 +7,18 @@ import os
 
 import numpy as np
 import torch
+from transformers import AutoImageProcessor, AutoModel
 
 import config as cfg
+
 from ..core.banks import build_banks_single_scale
-from ..core.io_utils import build_sh_buffer_mask, load_dop20_image, rasterize_vector_labels, reproject_labels_to_image
+from ..core.io_utils import (
+    build_sh_buffer_mask,
+    load_dop20_image,
+    rasterize_vector_labels,
+    reproject_labels_to_image,
+)
 from ..core.timing_utils import time_end, time_start
-from transformers import AutoImageProcessor, AutoModel
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +56,9 @@ def init_model(model_name: str):
     return model, processor, device
 
 
-def build_banks_for_sources(model, processor, device, ps, tile_size, stride, feature_dir):
+def build_banks_for_sources(
+    model, processor, device, ps, tile_size, stride, feature_dir
+):
     """Build positive/negative banks from configured source tiles.
 
     Args:
@@ -80,7 +88,9 @@ def build_banks_for_sources(model, processor, device, ps, tile_size, stride, fea
         image_id_a = os.path.splitext(os.path.basename(img_a_path))[0]
         logger.info("bank source A: %s (labels: %s)", img_a_path, lab_a_path)
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
-        labels_a = reproject_labels_to_image(img_a_path, lab_a_path, downsample_factor=ds)
+        labels_a = reproject_labels_to_image(
+            img_a_path, lab_a_path, downsample_factor=ds
+        )
         pos_i, neg_i = build_banks_single_scale(
             img_a,
             labels_a,
@@ -104,7 +114,11 @@ def build_banks_for_sources(model, processor, device, ps, tile_size, stride, fea
 
     pos_bank = np.concatenate(pos_banks, axis=0)
     neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
-    logger.info("combined banks: pos=%s, neg=%s", len(pos_bank), 0 if neg_bank is None else len(neg_bank))
+    logger.info(
+        "combined banks: pos=%s, neg=%s",
+        len(pos_bank),
+        0 if neg_bank is None else len(neg_bank),
+    )
     return pos_bank, neg_bank
 
 
@@ -136,7 +150,9 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
     for img_a_path, lab_a_path in zip(img_a_paths, lab_a_paths, strict=True):
         image_id_a = os.path.splitext(os.path.basename(img_a_path))[0]
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
-        labels_a = reproject_labels_to_image(img_a_path, lab_a_path, downsample_factor=ds)
+        labels_a = reproject_labels_to_image(
+            img_a_path, lab_a_path, downsample_factor=ds
+        )
         X_i, y_i = build_xgb_dataset(
             img_a,
             labels_a,
@@ -174,7 +190,9 @@ def prep_b_tile(img_path, gt_paths):
     """
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
     img_b = load_dop20_image(img_path, downsample_factor=ds)
-    labels_sh = reproject_labels_to_image(img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds)
+    labels_sh = reproject_labels_to_image(
+        img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds
+    )
     gt_mask_b = rasterize_vector_labels(gt_paths, img_path, downsample_factor=ds)
 
     with __import__("rasterio").open(img_path) as src:

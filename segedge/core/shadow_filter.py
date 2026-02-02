@@ -7,16 +7,18 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from .metrics_utils import compute_metrics
 from .timing_utils import time_end, time_start
 
 logger = logging.getLogger(__name__)
 
-def _shadow_filter_single_weights(img_float: np.ndarray,
-                                  base_mask: np.ndarray,
-                                  gt_mask: np.ndarray,
-                                  weights,
-                                  thresholds):
+
+def _shadow_filter_single_weights(
+    img_float: np.ndarray,
+    base_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    weights,
+    thresholds,
+):
     """Evaluate all thresholds for a single weight triplet.
 
     Args:
@@ -51,17 +53,17 @@ def _shadow_filter_single_weights(img_float: np.ndarray,
     wsum = (img_float * w).sum(axis=2)  # (H, W)
 
     # Flatten everything and restrict to pixels under base_mask
-    flat_base = base_mask_bool.reshape(-1)              # (N_total,)
-    flat_gt = gt_mask_bool.reshape(-1)                  # (N_total,)
-    flat_wsum = wsum.reshape(-1)                        # (N_total,)
+    flat_base = base_mask_bool.reshape(-1)  # (N_total,)
+    flat_gt = gt_mask_bool.reshape(-1)  # (N_total,)
+    flat_wsum = wsum.reshape(-1)  # (N_total,)
 
     valid_idx = flat_base  # only where base_mask is True can we keep FG
     if not np.any(valid_idx):
         # No predicted positives at all; nothing to optimize
         return None, base_mask_bool
 
-    vals = flat_wsum[valid_idx]         # (N_valid,)
-    gt_vals = flat_gt[valid_idx]        # (N_valid,)
+    vals = flat_wsum[valid_idx]  # (N_valid,)
+    gt_vals = flat_gt[valid_idx]  # (N_valid,)
 
     thr_arr = np.array(thresholds, dtype=np.float32).reshape(-1, 1)  # (T, 1)
 
@@ -112,13 +114,14 @@ def _shadow_filter_single_weights(img_float: np.ndarray,
     return best_cfg, best_mask
 
 
-
-def shadow_filter_grid(img_rgb: np.ndarray,
-                       base_mask: np.ndarray,
-                       gt_mask: np.ndarray,
-                       weight_sets,
-                       thresholds,
-                       num_workers: int = 1):
+def shadow_filter_grid(
+    img_rgb: np.ndarray,
+    base_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    weight_sets,
+    thresholds,
+    num_workers: int = 1,
+):
     """Filter out dark pixels under the mask using weighted RGB sums.
 
     Args:
@@ -202,7 +205,7 @@ def shadow_filter_grid(img_rgb: np.ndarray,
                     best_cfg_global = cfg
                     best_mask_global = mask
 
-    #print stats
+    # print stats
     logger.info("shadow_filter_grid best config: %s", best_cfg_global)
 
     time_end("shadow_filter_grid", t0)

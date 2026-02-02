@@ -11,9 +11,10 @@ import numpy as np
 import torch
 from scipy.ndimage import uniform_filter
 
-from .timing_utils import time_end, time_start, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
+from .timing_utils import DEBUG_TIMING, DEBUG_TIMING_VERBOSE, time_end, time_start
 
 logger = logging.getLogger(__name__)
+
 
 def l2_normalize(feats: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """L2-normalize feature vectors along the last dimension.
@@ -62,17 +63,21 @@ def add_local_context_mean(feats_hwc: np.ndarray, radius: int) -> np.ndarray:
     if radius <= 0:
         return feats_hwc
     if feats_hwc.ndim != 3:
-        raise ValueError(f"expected feats with shape (Hp, Wp, C), got {feats_hwc.shape}")
+        raise ValueError(
+            f"expected feats with shape (Hp, Wp, C), got {feats_hwc.shape}"
+        )
     k = 2 * int(radius) + 1
     feats = feats_hwc.astype(np.float32, copy=False)
     feats_ctx = uniform_filter(feats, size=(k, k, 1), mode="reflect")
     return l2_normalize(feats_ctx)
 
 
-def tile_iterator(image_hw3: np.ndarray,
-                  labels_hw: np.ndarray | None = None,
-                  tile_size: int = 1024,
-                  stride: int | None = None):
+def tile_iterator(
+    image_hw3: np.ndarray,
+    labels_hw: np.ndarray | None = None,
+    tile_size: int = 1024,
+    stride: int | None = None,
+):
     """Yield (y, x, img_tile, label_tile) windows over an image.
 
     Args:
@@ -106,9 +111,9 @@ def tile_iterator(image_hw3: np.ndarray,
         y += stride
 
 
-def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
-                           labels_tile_hw: np.ndarray | None,
-                           ps: int):
+def crop_to_multiple_of_ps(
+    img_tile_hw3: np.ndarray, labels_tile_hw: np.ndarray | None, ps: int
+):
     """Crop a tile so height/width are multiples of patch size.
 
     Args:
@@ -138,10 +143,9 @@ def crop_to_multiple_of_ps(img_tile_hw3: np.ndarray,
     return img_c, lab_c, h_eff, w_eff
 
 
-def labels_to_patch_masks(labels_tile: np.ndarray,
-                          hp: int,
-                          wp: int,
-                          pos_frac_thresh: float = 0.1):
+def labels_to_patch_masks(
+    labels_tile: np.ndarray, hp: int, wp: int, pos_frac_thresh: float = 0.1
+):
     """Convert pixel labels to patch-level positive/negative masks.
 
     Args:
@@ -169,7 +173,7 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
     h_eff, w_eff = labels_tile.shape
     patch_h = h_eff // hp
     patch_w = w_eff // wp
-    labels_c = labels_tile[:hp * patch_h, :wp * patch_w]
+    labels_c = labels_tile[: hp * patch_h, : wp * patch_w]
     labels_bin = (labels_c > 0).astype(np.float32)
     blocks = labels_bin.reshape(hp, patch_h, wp, patch_w)
     frac_pos = blocks.mean(axis=(1, 3))
@@ -180,10 +184,7 @@ def labels_to_patch_masks(labels_tile: np.ndarray,
     return pos_mask, neg_mask
 
 
-def tile_feature_path(feature_dir: str,
-                      image_id: str,
-                      y: int,
-                      x: int) -> str:
+def tile_feature_path(feature_dir: str, image_id: str, y: int, x: int) -> str:
     """Return the canonical path for a tile's feature array.
 
     Args:
@@ -203,10 +204,7 @@ def tile_feature_path(feature_dir: str,
     return os.path.join(feature_dir, fname)
 
 
-def tile_feature_meta_path(feature_dir: str,
-                           image_id: str,
-                           y: int,
-                           x: int) -> str:
+def tile_feature_meta_path(feature_dir: str, image_id: str, y: int, x: int) -> str:
     """Return the sidecar JSON path for feature metadata.
 
     Args:
@@ -226,12 +224,14 @@ def tile_feature_meta_path(feature_dir: str,
     return os.path.join(feature_dir, fname)
 
 
-def save_tile_features(feats_tile: np.ndarray,
-                       feature_dir: str,
-                       image_id: str,
-                       y: int,
-                       x: int,
-                       meta: dict | None = None):
+def save_tile_features(
+    feats_tile: np.ndarray,
+    feature_dir: str,
+    image_id: str,
+    y: int,
+    x: int,
+    meta: dict | None = None,
+):
     """Persist a tile's features to disk (and optional metadata).
 
     Args:
@@ -261,14 +261,16 @@ def save_tile_features(feats_tile: np.ndarray,
             json.dump(meta, f)
 
 
-def load_tile_features_if_valid(feature_dir: str,
-                                image_id: str,
-                                y: int,
-                                x: int,
-                                expected_hp: int,
-                                expected_wp: int,
-                                ps: int,
-                                resample_factor: int) -> np.ndarray | None:
+def load_tile_features_if_valid(
+    feature_dir: str,
+    image_id: str,
+    y: int,
+    x: int,
+    expected_hp: int,
+    expected_wp: int,
+    ps: int,
+    resample_factor: int,
+) -> np.ndarray | None:
     """Load cached features if valid, otherwise return None.
 
     If metadata is missing or mismatched, the cache is removed.
@@ -335,12 +337,9 @@ def load_tile_features_if_valid(feature_dir: str,
     return feats
 
 
-def extract_patch_features_single_scale(image_hw3: np.ndarray,
-                                        model,
-                                        processor,
-                                        device,
-                                        ps: int = 16,
-                                        aggregate_layers=None):
+def extract_patch_features_single_scale(
+    image_hw3: np.ndarray, model, processor, device, ps: int = 16, aggregate_layers=None
+):
     """Extract single-scale DINO patch features (Hp×Wp×C) from an RGB image.
 
     Args:
@@ -377,7 +376,7 @@ def extract_patch_features_single_scale(image_hw3: np.ndarray,
             layers = [hidden_states[i] for i in aggregate_layers]
             tokens = torch.stack(layers, dim=0).mean(0)
     reg_tokens = getattr(model.config, "num_register_tokens", 0)
-    patch_tokens = tokens[:, 1 + reg_tokens:, :]
+    patch_tokens = tokens[:, 1 + reg_tokens :, :]
     num_tokens, dim = patch_tokens.shape[1], patch_tokens.shape[2]
     hp = h_proc // ps
     wp = w_proc // ps
@@ -449,7 +448,12 @@ def prefetch_features_single_scale_image(
                 cached_tiles += 1
         if feats_tile is None:
             feats_tile, hp, wp = extract_patch_features_single_scale(
-                img_c, model, processor, device, ps=ps, aggregate_layers=aggregate_layers
+                img_c,
+                model,
+                processor,
+                device,
+                ps=ps,
+                aggregate_layers=aggregate_layers,
             )
             computed_tiles += 1
             if feature_dir is not None and image_id is not None:
@@ -460,7 +464,19 @@ def prefetch_features_single_scale_image(
                     "w_eff": w_eff,
                 }
                 save_tile_features(feats_tile, feature_dir, image_id, y, x, meta=meta)
-        cache[(y, x)] = {"feats": feats_tile, "h_eff": h_eff, "w_eff": w_eff, "hp": hp, "wp": wp}
+        cache[(y, x)] = {
+            "feats": feats_tile,
+            "h_eff": h_eff,
+            "w_eff": w_eff,
+            "hp": hp,
+            "wp": wp,
+        }
     time_end("prefetch_features_single_scale_image", t0)
-    logger.info("prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)", len(cache), cached_tiles, computed_tiles, skipped_tiles)
+    logger.info(
+        "prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)",
+        len(cache),
+        cached_tiles,
+        computed_tiles,
+        skipped_tiles,
+    )
     return cache

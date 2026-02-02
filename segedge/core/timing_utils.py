@@ -7,12 +7,12 @@ import time
 
 import config as cfg
 
-
 # Defaults with config overrides
 DEBUG_TIMING = getattr(cfg, "DEBUG_TIMING", True)
 DEBUG_TIMING_VERBOSE = getattr(cfg, "DEBUG_TIMING_VERBOSE", False)
 
 logger = logging.getLogger(__name__)
+
 
 def time_start():
     """Return a perf counter start if timing is enabled.

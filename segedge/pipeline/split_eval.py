@@ -10,14 +10,30 @@ import torch
 from scipy.ndimage import median_filter
 
 import config as cfg
+
+from ..core.banks import build_banks_single_scale
 from ..core.crf_utils import crf_grid_search, refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
-from ..core.knn import grid_search_k_threshold, fine_tune_threshold, zero_shot_knn_single_scale_B_with_saliency
+from ..core.io_utils import load_dop20_image, reproject_labels_to_image
+from ..core.knn import (
+    fine_tune_threshold,
+    grid_search_k_threshold,
+    zero_shot_knn_single_scale_B_with_saliency,
+)
 from ..core.logging_utils import setup_logging
-from ..core.metrics_utils import compute_metrics, compute_metrics_batch_cpu, compute_metrics_batch_gpu
+from ..core.metrics_utils import (
+    compute_metrics,
+    compute_metrics_batch_cpu,
+    compute_metrics_batch_gpu,
+)
 from ..core.shadow_filter import shadow_filter_grid
-from ..core.xdboost import hyperparam_search_xgb_iou, train_xgb_classifier, xgb_score_image_b
-from .common import build_banks_for_sources, build_xgb_training_data, init_model, log_metrics, prep_b_tile
+from ..core.xdboost import (
+    build_xgb_dataset,
+    hyperparam_search_xgb_iou,
+    train_xgb_classifier,
+    xgb_score_image_b,
+)
+from .common import build_xgb_training_data, init_model, log_metrics, prep_b_tile
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +44,12 @@ def tune_on_validation(
     device,
     pos_bank,
     neg_bank,
+    X,
+    y,
     ps,
     tile_size,
     stride,
-    feature_dir,
+    feature_dir: str | None,
     img_b_path,
     gt_paths,
 ):
@@ -43,10 +61,12 @@ def tune_on_validation(
         device: Torch device.
         pos_bank (np.ndarray): Positive bank.
         neg_bank (np.ndarray | None): Negative bank.
+        X (np.ndarray | None): Feature matrix from Image A.
+        y (np.ndarray | None): Binary labels from Image A.
         ps (int): Patch size.
         tile_size (int): Tile size in pixels.
         stride (int): Tile stride.
-        feature_dir (str): Feature cache directory.
+        feature_dir (str | None): Feature cache directory.
         img_b_path (str): Validation tile path.
         gt_paths (list[str]): Vector GT paths.
 
@@ -58,7 +78,9 @@ def tune_on_validation(
         True
     """
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-    img_b, _labels_sh_b, gt_mask_eval, sh_buffer_mask = prep_b_tile(img_b_path, gt_paths)
+    img_b, _labels_sh_b, gt_mask_eval, sh_buffer_mask = prep_b_tile(
+        img_b_path, gt_paths
+    )
     image_id_b = os.path.splitext(os.path.basename(img_b_path))[0]
 
     prefetched_b = prefetch_features_single_scale_image(
@@ -103,15 +125,24 @@ def tune_on_validation(
         gt_mask_eval,
     )
     if metrics_refined["iou"] >= best_raw_config["iou"]:
-        best_raw_config = {**best_raw_config, "threshold": thr_refined, **metrics_refined}
+        best_raw_config = {
+            **best_raw_config,
+            "threshold": thr_refined,
+            **metrics_refined,
+        }
     else:
-        mask_raw_best = (best_raw_score_full >= best_raw_config["threshold"]) & sh_buffer_mask
+        mask_raw_best = (
+            best_raw_score_full >= best_raw_config["threshold"]
+        ) & sh_buffer_mask
     mask_raw_best = median_filter(mask_raw_best.astype(np.uint8), size=3) > 0
     metrics_raw_filtered = compute_metrics(mask_raw_best, gt_mask_eval)
     best_raw_config = {**best_raw_config, **metrics_raw_filtered}
     log_metrics("val kNN", best_raw_config)
 
-    X, y = build_xgb_training_data(ps, tile_size, stride, feature_dir)
+    if X is None or y is None:
+        if feature_dir is None:
+            raise ValueError("feature_dir must be set when X/y are not provided")
+        X, y = build_xgb_training_data(ps, tile_size, stride, feature_dir)
     use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
     param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
     num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
@@ -120,60 +151,106 @@ def tune_on_validation(
     val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
 
     if param_grid:
-        bst, best_params_xgb, _, best_thr_xgb, best_metrics_xgb = hyperparam_search_xgb_iou(
+        bst, best_params_xgb, _, best_thr_xgb, best_metrics_xgb = (
+            hyperparam_search_xgb_iou(
+                X,
+                y,
+                cfg.THRESHOLDS,
+                sh_buffer_mask,
+                gt_mask_eval,
+                img_b,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                image_id_b,
+                prefetched_tiles=prefetched_b,
+                device=device,
+                use_gpu=use_gpu_xgb,
+                param_grid=param_grid,
+                num_boost_round=num_boost_round,
+                val_fraction=val_fraction,
+                early_stopping_rounds=early_stop,
+                verbose_eval=verbose_eval,
+                seed=42,
+                context_radius=context_radius,
+            )
+        )
+        if best_thr_xgb is None or best_metrics_xgb is None:
+            raise ValueError("XGB search returned no results")
+        best_xgb_config = {
+            "k": -1,
+            "threshold": best_thr_xgb,
+            "source": "xgb",
+            **best_metrics_xgb,
+            "params": best_params_xgb,
+        }
+    else:
+        bst = train_xgb_classifier(
             X,
             y,
-            cfg.THRESHOLDS,
-            sh_buffer_mask,
-            gt_mask_eval,
+            use_gpu=use_gpu_xgb,
+            num_boost_round=num_boost_round,
+            verbose_eval=verbose_eval,
+        )
+        score_full_xgb = xgb_score_image_b(
             img_b,
+            bst,
             ps,
             tile_size,
             stride,
             feature_dir,
             image_id_b,
             prefetched_tiles=prefetched_b,
-            device=device,
-            use_gpu=use_gpu_xgb,
-            param_grid=param_grid,
-            num_boost_round=num_boost_round,
-            val_fraction=val_fraction,
-            early_stopping_rounds=early_stop,
-            verbose_eval=verbose_eval,
-            seed=42,
             context_radius=context_radius,
         )
-        if best_thr_xgb is None or best_metrics_xgb is None:
-            raise ValueError("XGB search returned no results")
-        best_xgb_config = {"k": -1, "threshold": best_thr_xgb, "source": "xgb", **best_metrics_xgb, "params": best_params_xgb}
-    else:
-        bst = train_xgb_classifier(X, y, use_gpu=use_gpu_xgb, num_boost_round=num_boost_round, verbose_eval=verbose_eval)
-        score_full_xgb = xgb_score_image_b(img_b, bst, ps, tile_size, stride, feature_dir, image_id_b, prefetched_tiles=prefetched_b, context_radius=context_radius)
         try:
-            metrics_list = compute_metrics_batch_gpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask, gt_mask_eval, device=device)
+            metrics_list = compute_metrics_batch_gpu(
+                score_full_xgb,
+                cfg.THRESHOLDS,
+                sh_buffer_mask,
+                gt_mask_eval,
+                device=device,
+            )
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            metrics_list = compute_metrics_batch_cpu(score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask, gt_mask_eval)
+            metrics_list = compute_metrics_batch_cpu(
+                score_full_xgb, cfg.THRESHOLDS, sh_buffer_mask, gt_mask_eval
+            )
         best_xgb = max(metrics_list, key=lambda m: m["iou"])
         mask_xgb = (score_full_xgb >= best_xgb["threshold"]) & sh_buffer_mask
         mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
         metrics_xgb_filtered = compute_metrics(mask_xgb, gt_mask_eval)
-        best_xgb_config = {"k": -1, "threshold": best_xgb["threshold"], "source": "xgb", **metrics_xgb_filtered, "params": None}
+        best_xgb_config = {
+            "k": -1,
+            "threshold": best_xgb["threshold"],
+            "source": "xgb",
+            **metrics_xgb_filtered,
+            "params": None,
+        }
 
     log_metrics("val XGB", best_xgb_config)
 
-    champion_config = best_raw_config if best_raw_config["iou"] >= best_xgb_config["iou"] else best_xgb_config
+    champion_config = (
+        best_raw_config
+        if best_raw_config["iou"] >= best_xgb_config["iou"]
+        else best_xgb_config
+    )
     champion_source = champion_config["source"]
-    champion_score = best_raw_score_full if champion_source == "raw" else xgb_score_image_b(
-        img_b,
-        bst,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        image_id_b,
-        prefetched_tiles=prefetched_b,
-        context_radius=context_radius,
+    champion_score = (
+        best_raw_score_full
+        if champion_source == "raw"
+        else xgb_score_image_b(
+            img_b,
+            bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_b,
+            prefetched_tiles=prefetched_b,
+            context_radius=context_radius,
+        )
     )
     thr_center = champion_config["threshold"]
 
@@ -229,7 +306,7 @@ def eval_holdout_tile(
     ps,
     tile_size,
     stride,
-    feature_dir,
+    feature_dir: str | None,
     img_b_path,
     gt_paths,
     tuned,
@@ -245,7 +322,7 @@ def eval_holdout_tile(
         ps (int): Patch size.
         tile_size (int): Tile size in pixels.
         stride (int): Tile stride.
-        feature_dir (str): Feature cache directory.
+        feature_dir (str | None): Feature cache directory.
         img_b_path (str): Holdout tile path.
         gt_paths (list[str]): Vector GT paths.
         tuned (dict): Tuned configuration bundle.
@@ -258,10 +335,21 @@ def eval_holdout_tile(
         True
     """
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-    img_b, _labels_sh_b, gt_mask_eval, sh_buffer_mask = prep_b_tile(img_b_path, gt_paths)
+    img_b, _labels_sh_b, gt_mask_eval, sh_buffer_mask = prep_b_tile(
+        img_b_path, gt_paths
+    )
     image_id_b = os.path.splitext(os.path.basename(img_b_path))[0]
     prefetched_b = prefetch_features_single_scale_image(
-        img_b, model, processor, device, ps, tile_size, stride, None, feature_dir, image_id_b
+        img_b,
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        None,
+        feature_dir,
+        image_id_b,
     )
 
     k = tuned["best_raw_config"]["k"]
@@ -357,8 +445,15 @@ def main():
     ps = getattr(cfg, "PATCH_SIZE", model.config.patch_size)
     tile_size = getattr(cfg, "TILE_SIZE", 1024)
     stride = getattr(cfg, "STRIDE", tile_size)
-    feature_dir = cfg.FEATURE_DIR
-    os.makedirs(feature_dir, exist_ok=True)
+    feature_cache_mode = getattr(cfg, "FEATURE_CACHE_MODE", "disk")
+    if feature_cache_mode not in {"disk", "memory"}:
+        raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
+    if feature_cache_mode == "disk":
+        feature_dir = cfg.FEATURE_DIR
+        os.makedirs(feature_dir, exist_ok=True)
+    else:
+        feature_dir = None
+    logger.info("feature cache mode: %s", feature_cache_mode)
 
     val_b_path = getattr(cfg, "VAL_TILE", None) or cfg.TARGET_TILE
     gt_paths = cfg.EVAL_GT_VECTORS
@@ -367,13 +462,101 @@ def main():
     if not holdout_b_paths:
         raise ValueError("HOLDOUT_TILES must be set for split evaluation.")
 
-    pos_bank, neg_bank = build_banks_for_sources(model, processor, device, ps, tile_size, stride, feature_dir)
+    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
+    lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
+    image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
+    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
+
+    pos_banks = []
+    neg_banks = []
+    X_list = []
+    y_list = []
+    for img_a_path, lab_a_path, image_id_a in zip(
+        img_a_paths, lab_a_paths, image_id_a_list, strict=True
+    ):
+        logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
+        ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        img_a = load_dop20_image(img_a_path, downsample_factor=ds)
+        labels_a = reproject_labels_to_image(
+            img_a_path, lab_a_path, downsample_factor=ds
+        )
+        prefetched_a = None
+        if feature_cache_mode == "memory":
+            logger.info("prefetch: Image A %s", image_id_a)
+            prefetched_a = prefetch_features_single_scale_image(
+                img_a,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                None,
+                None,
+                image_id_a,
+            )
+
+        pos_bank_i, neg_bank_i = build_banks_single_scale(
+            img_a,
+            labels_a,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            None,
+            feature_dir,
+            image_id_a,
+            cfg.BANK_CACHE_DIR,
+            context_radius=context_radius,
+            prefetched_tiles=prefetched_a,
+        )
+        if pos_bank_i.size > 0:
+            pos_banks.append(pos_bank_i)
+        if neg_bank_i is not None and len(neg_bank_i) > 0:
+            neg_banks.append(neg_bank_i)
+
+        X_i, y_i = build_xgb_dataset(
+            img_a,
+            labels_a,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_a,
+            pos_frac=cfg.POS_FRAC_THRESH,
+            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
+            context_radius=context_radius,
+            prefetched_tiles=prefetched_a,
+        )
+        if X_i.size > 0 and y_i.size > 0:
+            X_list.append(X_i)
+            y_list.append(y_i)
+
+    if not pos_banks:
+        raise ValueError("no positive banks were built; check SOURCE_TILES and labels")
+    pos_bank = np.concatenate(pos_banks, axis=0)
+    neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
+    logger.info(
+        "combined banks: pos=%s, neg=%s",
+        len(pos_bank),
+        0 if neg_bank is None else len(neg_bank),
+    )
+
+    X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
+    y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
+    if X.size == 0 or y.size == 0:
+        raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
     tuned = tune_on_validation(
         model,
         processor,
         device,
         pos_bank,
         neg_bank,
+        X,
+        y,
         ps,
         tile_size,
         stride,

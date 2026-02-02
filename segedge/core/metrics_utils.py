@@ -8,9 +8,10 @@ import time
 import numpy as np
 import torch
 
-from .timing_utils import time_end, time_start, DEBUG_TIMING, DEBUG_TIMING_VERBOSE
+from .timing_utils import DEBUG_TIMING, DEBUG_TIMING_VERBOSE, time_end, time_start
 
 logger = logging.getLogger(__name__)
+
 
 def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
     """Compute precision/recall/IoU/F1 and confusion counts for binary masks.
@@ -57,12 +58,14 @@ def compute_metrics(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
     return metrics
 
 
-def compute_metrics_batch_gpu(score_map: np.ndarray,
-                              thresholds: list[float],
-                              sh_mask: np.ndarray | None,
-                              gt_mask: np.ndarray,
-                              device: torch.device,
-                              batch_size: int = 8) -> list[dict]:
+def compute_metrics_batch_gpu(
+    score_map: np.ndarray,
+    thresholds: list[float],
+    sh_mask: np.ndarray | None,
+    gt_mask: np.ndarray,
+    device: torch.device,
+    batch_size: int = 8,
+) -> list[dict]:
     """Evaluate many thresholds in parallel on GPU; returns list of metric dicts.
 
     Args:
@@ -81,16 +84,22 @@ def compute_metrics_batch_gpu(score_map: np.ndarray,
         >>> import torch
         >>> score = np.zeros((2, 2), dtype=np.float32)
         >>> gt = np.zeros((2, 2), dtype=np.uint8)
-        >>> _ = compute_metrics_batch_gpu(score, [0.5], None, gt, device=torch.device("cpu"))  # doctest: +SKIP
+        >>> _ = compute_metrics_batch_gpu(
+        ...     score, [0.5], None, gt, device=torch.device("cpu")
+        ... )  # doctest: +SKIP
     """
     t0 = time_start()
     score_t = torch.from_numpy(score_map.astype(np.float32)).to(device).flatten()
     gt_t = torch.from_numpy(gt_mask.astype(np.bool_)).to(device).flatten()
-    sh_t = torch.from_numpy(sh_mask.astype(np.bool_)).to(device).flatten() if sh_mask is not None else None
+    sh_t = (
+        torch.from_numpy(sh_mask.astype(np.bool_)).to(device).flatten()
+        if sh_mask is not None
+        else None
+    )
     metrics = []
     eps = 1e-8
     for start in range(0, len(thresholds), batch_size):
-        thr_chunk = thresholds[start:start + batch_size]
+        thr_chunk = thresholds[start : start + batch_size]
         thr_t = torch.tensor(thr_chunk, device=device, dtype=torch.float32).view(-1, 1)
         mask_thr = score_t.unsqueeze(0) >= thr_t
         if sh_t is not None:
@@ -104,26 +113,30 @@ def compute_metrics_batch_gpu(score_map: np.ndarray,
         iou = tp / (tp + fp + fn + eps)
         f1 = 2.0 * precision * recall / (precision + recall + eps)
         for i, thr in enumerate(thr_chunk):
-            metrics.append({
-                "threshold": float(thr),
-                "tp": int(tp[i].item()),
-                "fp": int(fp[i].item()),
-                "fn": int(fn[i].item()),
-                "tn": int(tn[i].item()),
-                "precision": float(precision[i].item()),
-                "recall": float(recall[i].item()),
-                "iou": float(iou[i].item()),
-                "f1": float(f1[i].item()),
-            })
+            metrics.append(
+                {
+                    "threshold": float(thr),
+                    "tp": int(tp[i].item()),
+                    "fp": int(fp[i].item()),
+                    "fn": int(fn[i].item()),
+                    "tn": int(tn[i].item()),
+                    "precision": float(precision[i].item()),
+                    "recall": float(recall[i].item()),
+                    "iou": float(iou[i].item()),
+                    "f1": float(f1[i].item()),
+                }
+            )
     time_end("compute_metrics_batch_gpu", t0)
     return metrics
 
 
-def compute_metrics_batch_cpu(score_map: np.ndarray,
-                              thresholds: list[float],
-                              sh_mask: np.ndarray | None,
-                              gt_mask: np.ndarray,
-                              batch_size: int = 16) -> list[dict]:
+def compute_metrics_batch_cpu(
+    score_map: np.ndarray,
+    thresholds: list[float],
+    sh_mask: np.ndarray | None,
+    gt_mask: np.ndarray,
+    batch_size: int = 16,
+) -> list[dict]:
     """CPU fallback for batched threshold evaluation.
 
     Args:
@@ -151,7 +164,9 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
     metrics = []
     eps = 1e-8
     for start in range(0, len(thresholds), batch_size):
-        thr_chunk = np.array(thresholds[start:start + batch_size], dtype=np.float32).reshape(-1, 1)
+        thr_chunk = np.array(
+            thresholds[start : start + batch_size], dtype=np.float32
+        ).reshape(-1, 1)
         mask = flat_scores >= thr_chunk
         if flat_sh is not None:
             mask = np.logical_and(mask, flat_sh)
@@ -164,23 +179,24 @@ def compute_metrics_batch_cpu(score_map: np.ndarray,
         iou = tp / (tp + fp + fn + eps)
         f1 = 2.0 * precision * recall / (precision + recall + eps)
         for i, thr in enumerate(thr_chunk[:, 0]):
-            metrics.append({
-                "threshold": float(thr),
-                "tp": int(tp[i]),
-                "fp": int(fp[i]),
-                "fn": int(fn[i]),
-                "tn": int(tn[i]),
-                "precision": float(precision[i]),
-                "recall": float(recall[i]),
-                "iou": float(iou[i]),
-                "f1": float(f1[i]),
-            })
+            metrics.append(
+                {
+                    "threshold": float(thr),
+                    "tp": int(tp[i]),
+                    "fp": int(fp[i]),
+                    "fn": int(fn[i]),
+                    "tn": int(tn[i]),
+                    "precision": float(precision[i]),
+                    "recall": float(recall[i]),
+                    "iou": float(iou[i]),
+                    "f1": float(f1[i]),
+                }
+            )
     time_end("compute_metrics_batch_cpu", t0)
     return metrics
 
 
-def compute_oracle_upper_bound(gt_mask: np.ndarray,
-                               sh_mask: np.ndarray) -> dict:
+def compute_oracle_upper_bound(gt_mask: np.ndarray, sh_mask: np.ndarray) -> dict:
     """Compute oracle IoU if predictions are clipped to SH buffer.
 
     Args:

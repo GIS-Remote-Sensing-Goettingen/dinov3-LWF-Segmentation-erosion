@@ -10,7 +10,20 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, best_crf_config, thr_center_for_crf, plot_dir, image_id_b, best_shadow=None, labels_sh=None):
+
+def save_plot(
+    img_b,
+    gt_mask_B,
+    mask_raw_best,
+    best_raw_config,
+    best_crf_mask,
+    best_crf_config,
+    thr_center_for_crf,
+    plot_dir,
+    image_id_b,
+    best_shadow=None,
+    labels_sh=None,
+):
     """Save comparison figure (RGB, GT, raw, CRF, optional shadow/labels).
 
     Args:
@@ -50,7 +63,9 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
         axs[0, 2].axis("off")
 
     overlay_raw = img_b.copy()
-    overlay_raw[mask_raw_best] = (0.5 * overlay_raw[mask_raw_best] + 0.5 * np.array([0, 255, 0])).astype(overlay_raw.dtype)
+    overlay_raw[mask_raw_best] = (
+        0.5 * overlay_raw[mask_raw_best] + 0.5 * np.array([0, 255, 0])
+    ).astype(overlay_raw.dtype)
     axs[1, 0].imshow(overlay_raw)
     axs[1, 0].set_title(
         f"Raw kNN (k={best_raw_config['k']}, thr={best_raw_config['threshold']:.3f})\n"
@@ -59,7 +74,9 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     axs[1, 0].axis("off")
 
     overlay_crf = img_b.copy()
-    overlay_crf[best_crf_mask] = (0.5 * overlay_crf[best_crf_mask] + 0.5 * np.array([255, 0, 0])).astype(overlay_crf.dtype)
+    overlay_crf[best_crf_mask] = (
+        0.5 * overlay_crf[best_crf_mask] + 0.5 * np.array([255, 0, 0])
+    ).astype(overlay_crf.dtype)
     axs[1, 1].imshow(overlay_crf)
     axs[1, 1].set_title(
         f"CRF (k={best_crf_config['k']}, center_thr={thr_center_for_crf:.3f})\n"
@@ -89,7 +106,15 @@ def save_plot(img_b, gt_mask_B, mask_raw_best, best_raw_config, best_crf_mask, b
     logger.info("plot saved to %s", plot_path)
 
 
-def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b, filename_suffix="champion.png"):
+def save_best_model_plot(
+    img_b,
+    gt_mask,
+    pred_mask,
+    title,
+    plot_dir,
+    image_id_b,
+    filename_suffix="champion.png",
+):
     """Save a simple overlay plot of the champion mask vs GT.
 
     Args:
@@ -115,7 +140,9 @@ def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b,
     axs[1].axis("off")
 
     overlay = img_b.copy()
-    overlay[pred_mask] = (0.5 * overlay[pred_mask] + 0.5 * np.array([255, 0, 0])).astype(overlay.dtype)
+    overlay[pred_mask] = (
+        0.5 * overlay[pred_mask] + 0.5 * np.array([255, 0, 0])
+    ).astype(overlay.dtype)
     axs[2].imshow(overlay)
     axs[2].set_title(title)
     axs[2].axis("off")
@@ -128,15 +155,17 @@ def save_best_model_plot(img_b, gt_mask, pred_mask, title, plot_dir, image_id_b,
     logger.info("plot saved champion overlay to %s", plot_path)
 
 
-def save_knn_xgb_gt_plot(img_b,
-                         gt_mask,
-                         mask_knn,
-                         mask_xgb,
-                         plot_dir,
-                         image_id_b,
-                         title_knn="kNN",
-                         title_xgb="XGBoost",
-                         filename_suffix="knn_xgb_gt.png"):
+def save_knn_xgb_gt_plot(
+    img_b,
+    gt_mask,
+    mask_knn,
+    mask_xgb,
+    plot_dir,
+    image_id_b,
+    title_knn="kNN",
+    title_xgb="XGBoost",
+    filename_suffix="knn_xgb_gt.png",
+):
     """Save three panels: RGB+GT overlay, RGB+kNN overlay, RGB+XGB overlay.
 
     Args:

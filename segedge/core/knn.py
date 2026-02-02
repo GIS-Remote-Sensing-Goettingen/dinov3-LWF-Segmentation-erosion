@@ -7,7 +7,10 @@ import time
 
 import numpy as np
 import torch
+from numpy import ndarray
 from skimage.transform import resize
+
+import config as cfg
 
 from .features import (
     add_local_context_mean,
@@ -17,9 +20,12 @@ from .features import (
     save_tile_features,
     tile_iterator,
 )
-from .metrics_utils import compute_metrics, compute_metrics_batch_cpu, compute_metrics_batch_gpu
-from .timing_utils import time_end, time_start, DEBUG_TIMING
-import config as cfg
+from .metrics_utils import (
+    compute_metrics,
+    compute_metrics_batch_cpu,
+    compute_metrics_batch_gpu,
+)
+from .timing_utils import DEBUG_TIMING, time_end, time_start
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +34,21 @@ def zero_shot_knn_single_scale_B_with_saliency(
     img_b: np.ndarray,
     pos_bank: np.ndarray,
     neg_bank: np.ndarray | None,
-    model,
-    processor,
-    device,
+    model: object,
+    processor: object,
+    device: object,
     ps: int = 16,
     tile_size: int = 1024,
     stride: int | None = None,
     k: int = 5,
-    aggregate_layers=None,
+    aggregate_layers: object = None,
     feature_dir: str | None = None,
     image_id: str | None = None,
     neg_alpha: float = 1.0,
     prefetched_tiles: dict | None = None,
     use_fp16_matmul: bool = False,
     context_radius: int = 0,
-):
+) -> tuple[ndarray, ndarray]:
     """Compute kNN transfer scores on Image B using GPU matmul.
 
     Args:
@@ -80,12 +86,16 @@ def zero_shot_knn_single_scale_B_with_saliency(
     resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
     pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
-    pos_bank_t_half = pos_bank_t.half() if use_fp16_matmul and device.type == "cuda" else None
+    pos_bank_t_half = (
+        pos_bank_t.half() if use_fp16_matmul and device.type == "cuda" else None
+    )
     k_pos_eff = min(k, pos_bank_t.shape[0])
 
     if neg_bank is not None:
         neg_bank_t = torch.from_numpy(neg_bank.astype(np.float32)).to(device)
-        neg_bank_t_half = neg_bank_t.half() if use_fp16_matmul and device.type == "cuda" else None
+        neg_bank_t_half = (
+            neg_bank_t.half() if use_fp16_matmul and device.type == "cuda" else None
+        )
         k_neg_eff = min(k, neg_bank_t.shape[0])
         use_neg = True
         logger.info(
@@ -104,10 +114,15 @@ def zero_shot_knn_single_scale_B_with_saliency(
     matmul_time = resize_time = 0.0
     if prefetched_tiles is not None:
         tile_items = sorted(prefetched_tiles.items())
-        logger.debug("zero_shot: using prefetched features for %s tiles", len(tile_items))
+        logger.debug(
+            "zero_shot: using prefetched features for %s tiles", len(tile_items)
+        )
         tile_iter = ((y, x, info) for (y, x), info in tile_items)
     else:
-        tile_iter = ((y, x, img_tile) for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride))
+        tile_iter = (
+            (y, x, img_tile)
+            for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride)
+        )
 
     for tile_entry in tile_iter:
         t0_tile = time_start()
@@ -144,7 +159,12 @@ def zero_shot_knn_single_scale_B_with_saliency(
                     cached_tiles += 1
             if feats_tile is None:
                 feats_tile, hp, wp = extract_patch_features_single_scale(
-                    img_c, model, processor, device, ps=ps, aggregate_layers=aggregate_layers
+                    img_c,
+                    model,
+                    processor,
+                    device,
+                    ps=ps,
+                    aggregate_layers=aggregate_layers,
                 )
                 computed_tiles += 1
                 if feature_dir is not None and image_id is not None:
@@ -154,21 +174,29 @@ def zero_shot_knn_single_scale_B_with_saliency(
                         "h_eff": h_eff,
                         "w_eff": w_eff,
                     }
-                    save_tile_features(feats_tile, feature_dir, image_id, y, x, meta=meta)
+                    save_tile_features(
+                        feats_tile, feature_dir, image_id, y, x, meta=meta
+                    )
 
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
 
         if hp is None or wp is None:
-            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            logger.warning(
+                "missing patch dimensions for tile y=%s x=%s; skipping", y, x
+            )
             continue
         x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
         with torch.no_grad():
             x_feats_t = torch.from_numpy(x_feats).to(device)
             if use_fp16_matmul and device.type == "cuda":
                 x_feats_t = x_feats_t.half()
-                pos_bank_local = pos_bank_t_half if pos_bank_t_half is not None else pos_bank_t
-                neg_bank_local = neg_bank_t_half if neg_bank_t_half is not None else neg_bank_t
+                pos_bank_local = (
+                    pos_bank_t_half if pos_bank_t_half is not None else pos_bank_t
+                )
+                neg_bank_local = (
+                    neg_bank_t_half if neg_bank_t_half is not None else neg_bank_t
+                )
             else:
                 pos_bank_local = pos_bank_t
                 neg_bank_local = neg_bank_t
@@ -191,11 +219,23 @@ def zero_shot_knn_single_scale_B_with_saliency(
         saliency_vals = (weights * sims_pos).sum(axis=1)
         saliency_patch = saliency_vals.reshape(hp, wp)
         t_resize0 = time.perf_counter() if DEBUG_TIMING else None
-        score_tile = resize(score_patch, (h_eff, w_eff), order=1, preserve_range=True, anti_aliasing=True).astype(np.float32)
-        saliency_tile = resize(saliency_patch, (h_eff, w_eff), order=1, preserve_range=True, anti_aliasing=True).astype(np.float32)
-        score_full[y:y + h_eff, x:x + w_eff] += score_tile
-        saliency_full[y:y + h_eff, x:x + w_eff] += saliency_tile
-        weight_full[y:y + h_eff, x:x + w_eff] += 1.0
+        score_tile = resize(
+            score_patch,
+            (h_eff, w_eff),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
+        saliency_tile = resize(
+            saliency_patch,
+            (h_eff, w_eff),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
+        score_full[y : y + h_eff, x : x + w_eff] += score_tile
+        saliency_full[y : y + h_eff, x : x + w_eff] += saliency_tile
+        weight_full[y : y + h_eff, x : x + w_eff] += 1.0
         if DEBUG_TIMING and t_resize0 is not None:
             resize_time += time.perf_counter() - t_resize0
         time_end(f"zero_shot_tile(y={y},x={x},k={k})", t0_tile)
@@ -206,7 +246,9 @@ def zero_shot_knn_single_scale_B_with_saliency(
     time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
     logger.info("B: cached tiles=%s, computed tiles=%s", cached_tiles, computed_tiles)
     if DEBUG_TIMING:
-        logger.debug("k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time)
+        logger.debug(
+            "k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time
+        )
     return score_full, saliency_full
 
 
@@ -222,7 +264,7 @@ def grid_search_k_threshold(
     stride: int | None,
     k_values: list[int],
     thresholds: list[float],
-    feature_dir: str,
+    feature_dir: str | None,
     image_id_b: str,
     sh_buffer_mask_b: np.ndarray,
     gt_mask_b: np.ndarray,
@@ -244,7 +286,7 @@ def grid_search_k_threshold(
         stride (int | None): Tile stride.
         k_values (list[int]): List of k values to test.
         thresholds (list[float]): Threshold grid.
-        feature_dir (str): Feature cache directory.
+        feature_dir (str | None): Feature cache directory.
         image_id_b (str): Image identifier for B.
         sh_buffer_mask_b (np.ndarray): SH buffer mask for B.
         gt_mask_b (np.ndarray): Ground-truth mask for B.
@@ -328,7 +370,12 @@ def grid_search_k_threshold(
             )
             if iou_raw > best_raw_iou:
                 best_raw_iou = iou_raw
-                best_raw_config = {"k": k, "threshold": thr, "source": "raw", **metrics_raw}
+                best_raw_config = {
+                    "k": k,
+                    "threshold": thr,
+                    "source": "raw",
+                    **metrics_raw,
+                }
                 best_raw_score_full = score_full.copy()
                 best_raw_saliency_full = saliency_full.copy()
 

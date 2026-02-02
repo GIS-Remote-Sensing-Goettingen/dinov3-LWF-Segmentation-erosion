@@ -21,6 +21,7 @@ from .metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
 
 logger = logging.getLogger(__name__)
 
+
 def build_xgb_dataset(
     img,
     labels,
@@ -32,6 +33,7 @@ def build_xgb_dataset(
     pos_frac,
     max_neg=8000,
     context_radius: int = 0,
+    prefetched_tiles: dict | None = None,
 ):
     """Build an XGBoost dataset from tiled features and labels.
 
@@ -41,11 +43,12 @@ def build_xgb_dataset(
         ps (int): Patch size for cropping.
         tile_size (int): Size of each tile.
         stride (int): Stride for tiling.
-        feature_dir (str): Directory containing precomputed features.
+        feature_dir (str | None): Directory containing precomputed features.
         image_id (str): Identifier for the image.
         pos_frac (float): Fraction threshold for positive patches.
         max_neg (int): Maximum number of negative samples.
         context_radius (int): Feature context radius.
+        prefetched_tiles (dict | None): Optional in-memory tile feature cache.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: Feature matrix X and labels y.
@@ -54,41 +57,63 @@ def build_xgb_dataset(
         >>> callable(build_xgb_dataset)
         True
     """
+    if feature_dir is None and prefetched_tiles is None:
+        raise ValueError("feature_dir or prefetched_tiles must be provided")
+
     X_pos, X_neg = [], []
     missing_feature_tiles = 0
     resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
-        img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
-        if h_eff < ps or w_eff < ps:
-            continue
+        prefetched = prefetched_tiles.get((y, x)) if prefetched_tiles else None
+        if prefetched is not None:
+            h_eff = prefetched["h_eff"]
+            w_eff = prefetched["w_eff"]
+            if h_eff < ps or w_eff < ps:
+                continue
+            lab_c = lab_tile[:h_eff, :w_eff] if lab_tile is not None else None
+            feats_tile = prefetched["feats"]
+            hp = prefetched["hp"]
+            wp = prefetched["wp"]
+        else:
+            if prefetched_tiles is not None and feature_dir is None:
+                missing_feature_tiles += 1
+                continue
+            img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
+            if h_eff < ps or w_eff < ps:
+                continue
+            fpath = tile_feature_path(feature_dir, image_id, y, x)
+            if not os.path.exists(fpath):
+                missing_feature_tiles += 1
+                continue
+            hp = h_eff // ps
+            wp = w_eff // ps
+            feats_tile = load_tile_features_if_valid(
+                feature_dir,
+                image_id,
+                y,
+                x,
+                expected_hp=hp,
+                expected_wp=wp,
+                ps=ps,
+                resample_factor=resample_factor,
+            )
+            if feats_tile is None:
+                missing_feature_tiles += 1
+                continue
+
         if lab_c is None:
             logger.warning("missing labels for tile y=%s x=%s; skipping", y, x)
-            continue
-        fpath = tile_feature_path(feature_dir, image_id, y, x)
-        if not os.path.exists(fpath):
-            missing_feature_tiles += 1
-            continue
-        hp = h_eff // ps
-        wp = w_eff // ps
-        feats_tile = load_tile_features_if_valid(
-            feature_dir,
-            image_id,
-            y,
-            x,
-            expected_hp=hp,
-            expected_wp=wp,
-            ps=ps,
-            resample_factor=resample_factor,
-        )
-        if feats_tile is None:
-            missing_feature_tiles += 1
             continue
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
         if hp is None or wp is None:
-            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            logger.warning(
+                "missing patch dimensions for tile y=%s x=%s; skipping", y, x
+            )
             continue
-        pos_mask, neg_mask = labels_to_patch_masks(lab_c, hp, wp, pos_frac_thresh=pos_frac)
+        pos_mask, neg_mask = labels_to_patch_masks(
+            lab_c, hp, wp, pos_frac_thresh=pos_frac
+        )
         if pos_mask.any():
             X_pos.append(feats_tile[pos_mask])
         if neg_mask.any():
@@ -150,26 +175,42 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         "tree_method": "gpu_hist" if use_gpu else "hist",
     }
     try:
-        bst = xgb.train(params, dtrain, num_boost_round=num_boost_round, evals=[(dtrain, "train")], verbose_eval=verbose_eval)
+        bst = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            evals=[(dtrain, "train")],
+            verbose_eval=verbose_eval,
+        )
     except xgb.core.XGBoostError as e:
         if use_gpu and "gpu_hist" in str(e):
-            logger.warning("xgboost build does not support GPU; falling back to CPU hist.")
+            logger.warning(
+                "xgboost build does not support GPU; falling back to CPU hist."
+            )
             params["tree_method"] = "hist"
-            bst = xgb.train(params, dtrain, num_boost_round=num_boost_round, evals=[(dtrain, "train")], verbose_eval=verbose_eval)
+            bst = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=num_boost_round,
+                evals=[(dtrain, "train")],
+                verbose_eval=verbose_eval,
+            )
         else:
             raise
     return bst
 
 
-def hyperparam_search_xgb(X,
-                          y,
-                          use_gpu=False,
-                          param_grid=None,
-                          num_boost_round=300,
-                          val_fraction=0.2,
-                          early_stopping_rounds=40,
-                          verbose_eval=50,
-                          seed: int = 42):
+def hyperparam_search_xgb(
+    X,
+    y,
+    use_gpu=False,
+    param_grid=None,
+    num_boost_round=300,
+    val_fraction=0.2,
+    early_stopping_rounds=40,
+    verbose_eval=50,
+    seed: int = 42,
+):
     """Run hyperparameter search, selecting by validation logloss.
 
     Args:
@@ -249,9 +290,20 @@ def hyperparam_search_xgb(X,
             else:
                 raise
 
-        score = float(model.best_score) if hasattr(model, "best_score") else model.evals_result()["val"]["logloss"][-1]
-        best_ntree = getattr(model, "best_ntree_limit", getattr(model, "best_iteration", None))
-        logger.info("xgb-search cfg %s: val_logloss=%.4f (best_ntree=%s)", i + 1, score, best_ntree)
+        score = (
+            float(model.best_score)
+            if hasattr(model, "best_score")
+            else model.evals_result()["val"]["logloss"][-1]
+        )
+        best_ntree = getattr(
+            model, "best_ntree_limit", getattr(model, "best_iteration", None)
+        )
+        logger.info(
+            "xgb-search cfg %s: val_logloss=%.4f (best_ntree=%s)",
+            i + 1,
+            score,
+            best_ntree,
+        )
 
         if score < best_score:
             best_score = score
@@ -261,27 +313,29 @@ def hyperparam_search_xgb(X,
     return best_model, best_params, best_score
 
 
-def hyperparam_search_xgb_iou(X,
-                              y,
-                              thresholds,
-                              sh_buffer_mask_b,
-                              gt_mask_b,
-                              img_b,
-                              ps,
-                              tile_size,
-                              stride,
-                              feature_dir,
-                              image_id_b,
-                              prefetched_tiles=None,
-                              device=None,
-                              use_gpu=False,
-                              param_grid=None,
-                              num_boost_round=300,
-                              val_fraction=0.2,
-                              early_stopping_rounds=40,
-                              verbose_eval=50,
-                              seed: int = 42,
-                              context_radius: int = 0):
+def hyperparam_search_xgb_iou(
+    X,
+    y,
+    thresholds,
+    sh_buffer_mask_b,
+    gt_mask_b,
+    img_b,
+    ps,
+    tile_size,
+    stride,
+    feature_dir,
+    image_id_b,
+    prefetched_tiles=None,
+    device=None,
+    use_gpu=False,
+    param_grid=None,
+    num_boost_round=300,
+    val_fraction=0.2,
+    early_stopping_rounds=40,
+    verbose_eval=50,
+    seed: int = 42,
+    context_radius: int = 0,
+):
     """Search hyperparameters using IoU on Image B as the selection metric.
 
     Args:
@@ -461,6 +515,8 @@ def xgb_score_image_b(
         >>> callable(xgb_score_image_b)
         True
     """
+    if feature_dir is None and prefetched_tiles is None:
+        raise ValueError("feature_dir or prefetched_tiles must be provided")
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
@@ -469,7 +525,10 @@ def xgb_score_image_b(
         tile_items = sorted(prefetched_tiles.items())
         tile_iter = ((y, x, info) for (y, x), info in tile_items)
     else:
-        tile_iter = ((y, x, img_tile) for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride))
+        tile_iter = (
+            (y, x, img_tile)
+            for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride)
+        )
 
     for tile_entry in tile_iter:
         if prefetched_tiles is not None:
@@ -494,13 +553,21 @@ def xgb_score_image_b(
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
 
         if hp is None or wp is None:
-            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            logger.warning(
+                "missing patch dimensions for tile y=%s x=%s; skipping", y, x
+            )
             continue
         dtest = xgb.DMatrix(feats_tile.reshape(-1, feats_tile.shape[-1]))
         scores_patch = bst.predict(dtest).reshape(hp, wp)
-        scores_tile = resize(scores_patch, (h_eff, w_eff), order=1, preserve_range=True, anti_aliasing=True).astype(np.float32)
-        score_full[y:y + h_eff, x:x + w_eff] += scores_tile
-        weight_full[y:y + h_eff, x:x + w_eff] += 1.0
+        scores_tile = resize(
+            scores_patch,
+            (h_eff, w_eff),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
+        score_full[y : y + h_eff, x : x + w_eff] += scores_tile
+        weight_full[y : y + h_eff, x : x + w_eff] += 1.0
 
     mask_nonzero = weight_full > 0
     score_full[mask_nonzero] /= weight_full[mask_nonzero]

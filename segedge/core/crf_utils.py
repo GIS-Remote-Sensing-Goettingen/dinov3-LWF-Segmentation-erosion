@@ -10,6 +10,7 @@ from skimage.transform import resize
 try:
     from pydensecrf import densecrf as dcrf
     from pydensecrf.utils import unary_from_softmax
+
     _HAS_DCRF = True
 except ImportError:  # pragma: no cover - optional dependency
     dcrf = None
@@ -114,7 +115,9 @@ def _crf_eval_worker(args):
         >>> callable(_crf_eval_worker)
         True
     """
-    (img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg) = args
+    img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg = (
+        args
+    )
     prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
     mask_crf_local = refine_with_densecrf(
         img_rgb_ds,
@@ -192,16 +195,52 @@ def crf_grid_search(
     best_iou = -1.0
 
     if downsample_factor > 1:
-        img_rgb_ds = resize(img_rgb, (img_rgb.shape[0] // downsample_factor, img_rgb.shape[1] // downsample_factor),
-                            order=1, preserve_range=True, anti_aliasing=True).astype(img_rgb.dtype)
-        score_map_ds = resize(score_map, (score_map.shape[0] // downsample_factor, score_map.shape[1] // downsample_factor),
-                              order=1, preserve_range=True, anti_aliasing=True).astype(np.float32)
-        sh_mask_ds = resize(sh_mask.astype(np.float32),
-                            (sh_mask.shape[0] // downsample_factor, sh_mask.shape[1] // downsample_factor),
-                            order=0, preserve_range=True, anti_aliasing=False) > 0.5
-        gt_mask_ds = resize(gt_mask.astype(np.float32),
-                            (gt_mask.shape[0] // downsample_factor, gt_mask.shape[1] // downsample_factor),
-                            order=0, preserve_range=True, anti_aliasing=False) > 0.5
+        img_rgb_ds = resize(
+            img_rgb,
+            (
+                img_rgb.shape[0] // downsample_factor,
+                img_rgb.shape[1] // downsample_factor,
+            ),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(img_rgb.dtype)
+        score_map_ds = resize(
+            score_map,
+            (
+                score_map.shape[0] // downsample_factor,
+                score_map.shape[1] // downsample_factor,
+            ),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
+        sh_mask_ds = (
+            resize(
+                sh_mask.astype(np.float32),
+                (
+                    sh_mask.shape[0] // downsample_factor,
+                    sh_mask.shape[1] // downsample_factor,
+                ),
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            )
+            > 0.5
+        )
+        gt_mask_ds = (
+            resize(
+                gt_mask.astype(np.float32),
+                (
+                    gt_mask.shape[0] // downsample_factor,
+                    gt_mask.shape[1] // downsample_factor,
+                ),
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            )
+            > 0.5
+        )
     else:
         img_rgb_ds = img_rgb
         score_map_ds = score_map
@@ -215,14 +254,26 @@ def crf_grid_search(
                 for bi_w in bilateral_w_vals:
                     for bi_xy in bilateral_xy_std_vals:
                         for bi_rgb in bilateral_rgb_std_vals:
-                            cfg_list.append((prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb))
+                            cfg_list.append(
+                                (prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb)
+                            )
     if max_configs is not None:
         cfg_list = cfg_list[:max_configs]
 
     if num_workers > 1 and backend == "process":
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
-            args_iter = [(img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg)
-                         for cfg in cfg_list]
+            args_iter = [
+                (
+                    img_rgb_ds,
+                    score_map_ds,
+                    sh_mask_ds,
+                    gt_mask_ds,
+                    threshold_center,
+                    n_iters,
+                    cfg,
+                )
+                for cfg in cfg_list
+            ]
             for metrics, cfg_full in ex.map(_crf_eval_worker, args_iter):
                 if metrics["iou"] > best_iou:
                     best_iou = metrics["iou"]

@@ -4,26 +4,29 @@ from __future__ import annotations
 
 import logging
 import os
-import rasterio
-from rasterio.io import MemoryFile
+
 import fiona
 import numpy as np
+import rasterio
 import rasterio.features as rfeatures
-from rasterio.plot import reshape_as_image
-from rasterio.warp import reproject, Resampling
-from rasterio.crs import CRS
-from shapely.geometry import shape, mapping
-from shapely.ops import transform as shp_transform
 from pyproj import Transformer
+from rasterio.crs import CRS
+from rasterio.io import MemoryFile
+from rasterio.plot import reshape_as_image
+from rasterio.warp import Resampling, reproject
+from shapely.geometry import mapping, shape
+from shapely.ops import transform as shp_transform
 from skimage.morphology import dilation, disk
 from skimage.transform import resize
 
-from .timing_utils import time_end, time_start
 import config as cfg
+
+from .timing_utils import time_end, time_start
 
 logger = logging.getLogger(__name__)
 try:
     import cv2
+
     _HAS_CV2 = True
 except ImportError:
     cv2 = None
@@ -62,7 +65,9 @@ def load_dop20_image(path: str, downsample_factor: int = 1) -> np.ndarray:
     return img
 
 
-def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_factor: int = 1) -> np.ndarray:
+def reproject_labels_to_image(
+    ref_img_path: str, labels_path: str, downsample_factor: int = 1
+) -> np.ndarray:
     """Reproject a raster label map onto a reference image grid.
 
     Args:
@@ -129,14 +134,19 @@ def reproject_labels_to_image(ref_img_path: str, labels_path: str, downsample_fa
             preserve_range=True,
             anti_aliasing=False,
         ).astype(labels_2d.dtype)
-    time_end(f"reproject_labels_to_image[{os.path.basename(labels_path)} -> {os.path.basename(ref_img_path)}]", t0)
+    time_end(
+        f"reproject_labels_to_image[{os.path.basename(labels_path)} -> {os.path.basename(ref_img_path)}]",
+        t0,
+    )
     return labels_2d
 
 
-def rasterize_vector_labels(vector_path: str | list[str],
-                            ref_raster_path: str,
-                            burn_value: int = 1,
-                            downsample_factor: int = 1) -> np.ndarray:
+def rasterize_vector_labels(
+    vector_path: str | list[str],
+    ref_raster_path: str,
+    burn_value: int = 1,
+    downsample_factor: int = 1,
+) -> np.ndarray:
     """Rasterize one or more vector layers onto the reference raster grid.
 
     If vector_path is a list, each file is rasterized and combined with logical OR.
@@ -158,7 +168,10 @@ def rasterize_vector_labels(vector_path: str | list[str],
     vector_paths = vector_path if isinstance(vector_path, list) else [vector_path]
     with rasterio.open(ref_raster_path) as src:
         if downsample_factor > 1:
-            out_shape = (src.height // downsample_factor, src.width // downsample_factor)
+            out_shape = (
+                src.height // downsample_factor,
+                src.width // downsample_factor,
+            )
             transform = src.transform * src.transform.scale(
                 src.width / out_shape[1],
                 src.height / out_shape[0],
@@ -173,12 +186,21 @@ def rasterize_vector_labels(vector_path: str | list[str],
         with fiona.open(vp, "r") as shp:
             vec_crs = shp.crs
             if not vec_crs:
-                logger.warning("vector CRS missing for %s; assuming EPSG:4326 (WGS84)", vp)
+                logger.warning(
+                    "vector CRS missing for %s; assuming EPSG:4326 (WGS84)", vp
+                )
                 vec_crs = CRS.from_epsg(4326).to_dict()
             transformer = None
             if raster_crs and vec_crs and vec_crs != raster_crs.to_dict():
-                logger.info("reprojecting vector geometries from %s -> %s for %s", vec_crs, raster_crs.to_dict(), vp)
-                transformer = Transformer.from_crs(vec_crs, raster_crs.to_dict(), always_xy=True)
+                logger.info(
+                    "reprojecting vector geometries from %s -> %s for %s",
+                    vec_crs,
+                    raster_crs.to_dict(),
+                    vp,
+                )
+                transformer = Transformer.from_crs(
+                    vec_crs, raster_crs.to_dict(), always_xy=True
+                )
             shapes = []
             for feat in shp:
                 geom = feat["geometry"]
@@ -254,10 +276,18 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
     with rasterio.open(ref_raster_path) as src:
         transform = src.transform
         crs = src.crs
-    shape_generator = rfeatures.shapes(mask_uint8, mask=mask_uint8 == 1, transform=transform)
+    shape_generator = rfeatures.shapes(
+        mask_uint8, mask=mask_uint8 == 1, transform=transform
+    )
     schema = {"geometry": "Polygon", "properties": {"id": "int"}}
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with fiona.open(out_path, mode="w", driver="ESRI Shapefile", crs=crs.to_dict() if crs is not None else None, schema=schema) as shp:
+    with fiona.open(
+        out_path,
+        mode="w",
+        driver="ESRI Shapefile",
+        crs=crs.to_dict() if crs is not None else None,
+        schema=schema,
+    ) as shp:
         idx = 0
         for geom, value in shape_generator:
             if value != 1:
@@ -268,7 +298,9 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
     logger.info("shapefile written to: %s", out_path)
 
 
-def export_masks_to_shapefile_union(masks_with_refs: list[tuple[np.ndarray, str]], out_path: str):
+def export_masks_to_shapefile_union(
+    masks_with_refs: list[tuple[np.ndarray, str]], out_path: str
+):
     """Write multiple masks into a single shapefile without dissolving overlaps.
 
     Args:
@@ -289,12 +321,20 @@ def export_masks_to_shapefile_union(masks_with_refs: list[tuple[np.ndarray, str]
     schema = {"geometry": "Polygon", "properties": {"id": "int"}}
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     idx = 0
-    with fiona.open(out_path, mode="w", driver="ESRI Shapefile", crs=crs.to_dict() if crs is not None else None, schema=schema) as shp:
+    with fiona.open(
+        out_path,
+        mode="w",
+        driver="ESRI Shapefile",
+        crs=crs.to_dict() if crs is not None else None,
+        schema=schema,
+    ) as shp:
         for mask, ref_raster_path in masks_with_refs:
             mask_uint8 = mask.astype("uint8")
             with rasterio.open(ref_raster_path) as src:
                 transform = src.transform
-            shape_generator = rfeatures.shapes(mask_uint8, mask=mask_uint8 == 1, transform=transform)
+            shape_generator = rfeatures.shapes(
+                mask_uint8, mask=mask_uint8 == 1, transform=transform
+            )
             for geom, value in shape_generator:
                 if value != 1:
                     continue
@@ -304,7 +344,9 @@ def export_masks_to_shapefile_union(masks_with_refs: list[tuple[np.ndarray, str]
     logger.info("union shapefile written to: %s (features=%s)", out_path, idx)
 
 
-def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"):
+def consolidate_features_for_image(
+    feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"
+):
     """Concatenate all tile feature .npy files for an image into a single array.
 
     Args:
@@ -332,9 +374,15 @@ def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffi
         return None
     prefix = f"{image_id}_y"
     suffix = "_features.npy"
-    files = [f for f in os.listdir(feature_dir) if f.startswith(prefix) and f.endswith(suffix)]
+    files = [
+        f
+        for f in os.listdir(feature_dir)
+        if f.startswith(prefix) and f.endswith(suffix)
+    ]
     if not files:
-        logger.warning("no feature tiles found for image_id=%s in %s", image_id, feature_dir)
+        logger.warning(
+            "no feature tiles found for image_id=%s in %s", image_id, feature_dir
+        )
         return None
     files = sorted(files)
     feats_list = []
@@ -346,20 +394,28 @@ def consolidate_features_for_image(feature_dir: str, image_id: str, output_suffi
     out_path = os.path.join(feature_dir, f"{image_id}{output_suffix}")
     np.save(out_path, feats_full)
     time_end(f"consolidate_features_for_image[{image_id}]", t0)
-    logger.info("consolidated %s tiles for %s -> %s, shape=%s", len(files), image_id, out_path, feats_full.shape)
+    logger.info(
+        "consolidated %s tiles for %s -> %s, shape=%s",
+        len(files),
+        image_id,
+        out_path,
+        feats_full.shape,
+    )
     return out_path
 
 
-def export_best_settings(best_raw_config,
-                         best_crf_config,
-                         model_name,
-                         img_path,
-                         img2_path,
-                         buffer_m,
-                         pixel_size_m,
-                         shadow_cfg=None,
-                         extra_settings: dict | None = None,
-                         best_settings_path: str | None = None):
+def export_best_settings(
+    best_raw_config,
+    best_crf_config,
+    model_name,
+    img_path,
+    img2_path,
+    buffer_m,
+    pixel_size_m,
+    shadow_cfg=None,
+    extra_settings: dict | None = None,
+    best_settings_path: str | None = None,
+):
     """Write a minimal YAML with the champion configurations and context.
 
     Args:
@@ -379,7 +435,16 @@ def export_best_settings(best_raw_config,
         >>> import tempfile
         >>> with tempfile.TemporaryDirectory() as d:
         ...     path = os.path.join(d, "best.yml")
-        ...     export_best_settings({"k": 1}, {"prob_softness": 0.1}, "model", "a.tif", "b.tif", 8.0, 0.2, best_settings_path=path)
+        ...     export_best_settings(
+        ...         {"k": 1},
+        ...         {"prob_softness": 0.1},
+        ...         "model",
+        ...         "a.tif",
+        ...         "b.tif",
+        ...         8.0,
+        ...         0.2,
+        ...         best_settings_path=path,
+        ...     )
         ...     os.path.exists(path)
         True
     """
@@ -398,6 +463,7 @@ def export_best_settings(best_raw_config,
     out_path = best_settings_path or cfg.BEST_SETTINGS_PATH
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
+
         def _write_yaml(d, indent=0):
             """Write a minimal YAML mapping.
 
@@ -410,5 +476,6 @@ def export_best_settings(best_raw_config,
                     _write_yaml(v, indent + 1)
                 else:
                     f.write("  " * indent + f"{k}: {v}\n")
+
         _write_yaml(best_settings)
     logger.info("best settings written to %s", out_path)

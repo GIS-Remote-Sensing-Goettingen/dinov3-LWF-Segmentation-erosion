@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 import config as cfg
-from segedge.core.io_utils import build_sh_buffer_mask, load_dop20_image, rasterize_vector_labels, reproject_labels_to_image
+from segedge.core.io_utils import (
+    build_sh_buffer_mask,
+    load_dop20_image,
+    rasterize_vector_labels,
+    reproject_labels_to_image,
+)
 from segedge.core.metrics_utils import compute_metrics
 
 

@@ -49,6 +49,9 @@ PLOT_DIR = "output/plots"
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
 
+# Feature cache mode: "disk" caches tiles to FEATURE_DIR, "memory" reuses per-image in RAM.
+FEATURE_CACHE_MODE = "disk"
+
 # -----------------------------------------------------------------------------
 # 2) Model + tiling
 # -----------------------------------------------------------------------------

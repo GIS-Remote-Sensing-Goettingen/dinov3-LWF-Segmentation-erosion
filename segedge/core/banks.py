@@ -6,7 +6,9 @@ import logging
 import os
 
 import numpy as np
-from skimage.morphology import erosion, disk
+from skimage.morphology import disk, erosion
+
+import config as cfg
 
 from .features import (
     add_local_context_mean,
@@ -18,15 +20,17 @@ from .features import (
     tile_iterator,
 )
 from .timing_utils import time_end, time_start
-import config as cfg
 
 logger = logging.getLogger(__name__)
 
-def cleanup_bank_cache(bank_cache_dir: str,
-                       image_id: str,
-                       ps: int,
-                       context_radius: int,
-                       resample_factor: int):
+
+def cleanup_bank_cache(
+    bank_cache_dir: str,
+    image_id: str,
+    ps: int,
+    context_radius: int,
+    resample_factor: int,
+):
     """Remove stale bank cache files for this image_id with mismatched settings.
 
     Args:
@@ -63,20 +67,24 @@ def cleanup_bank_cache(bank_cache_dir: str,
             except OSError:
                 pass
 
-def build_banks_single_scale(img_a: np.ndarray,
-                             labels_a: np.ndarray,
-                             model,
-                             processor,
-                             device,
-                             ps: int = 16,
-                             tile_size: int = 1024,
-                             stride: int | None = None,
-                             pos_frac_thresh: float = 0.1,
-                             aggregate_layers=None,
-                             feature_dir: str | None = None,
-                             image_id: str | None = None,
-                             bank_cache_dir: str | None = None,
-                             context_radius: int = 0):
+
+def build_banks_single_scale(
+    img_a: np.ndarray,
+    labels_a: np.ndarray,
+    model,
+    processor,
+    device,
+    ps: int = 16,
+    tile_size: int = 1024,
+    stride: int | None = None,
+    pos_frac_thresh: float = 0.1,
+    aggregate_layers=None,
+    feature_dir: str | None = None,
+    image_id: str | None = None,
+    bank_cache_dir: str | None = None,
+    context_radius: int = 0,
+    prefetched_tiles: dict | None = None,
+):
     """Build positive/negative patch banks from Image A using SH_2022 labels.
 
     Extracts (and optionally caches) DINO features per tile and aggregates
@@ -97,6 +105,7 @@ def build_banks_single_scale(img_a: np.ndarray,
         image_id (str | None): Image identifier for caches.
         bank_cache_dir (str | None): Directory for bank caches.
         context_radius (int): Feature context radius.
+        prefetched_tiles (dict | None): Optional in-memory tile feature cache.
 
     Returns:
         tuple[np.ndarray, np.ndarray | None]: Positive and negative banks.
@@ -110,13 +119,17 @@ def build_banks_single_scale(img_a: np.ndarray,
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
         resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
-        cleanup_bank_cache(bank_cache_dir, image_id, ps, context_radius, resample_factor)
+        cleanup_bank_cache(
+            bank_cache_dir, image_id, ps, context_radius, resample_factor
+        )
         cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
         pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
         neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         if os.path.exists(pos_cache_path):
             pos_bank = np.load(pos_cache_path)
-            neg_bank = np.load(neg_cache_path) if os.path.exists(neg_cache_path) else None
+            neg_bank = (
+                np.load(neg_cache_path) if os.path.exists(neg_cache_path) else None
+            )
             time_end("build_banks_single_scale(load_cache)", t0)
             logger.info("loaded banks from %s", bank_cache_dir)
             return pos_bank, neg_bank
@@ -131,53 +144,79 @@ def build_banks_single_scale(img_a: np.ndarray,
         labels_eroded = (labels_a > 0).astype(bool)
     resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
-    for y, x, img_tile, lab_tile in tile_iterator(img_a, labels_eroded, tile_size, stride):
-        img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
-        if h_eff < ps or w_eff < ps:
-            continue
+    for y, x, img_tile, lab_tile in tile_iterator(
+        img_a, labels_eroded, tile_size, stride
+    ):
+        prefetched = prefetched_tiles.get((y, x)) if prefetched_tiles else None
+        if prefetched is not None:
+            h_eff = prefetched["h_eff"]
+            w_eff = prefetched["w_eff"]
+            if h_eff < ps or w_eff < ps:
+                continue
+            lab_c = lab_tile[:h_eff, :w_eff] if lab_tile is not None else None
+            feats_tile = prefetched["feats"]
+            hp = prefetched["hp"]
+            wp = prefetched["wp"]
+            cached_tiles += 1
+        else:
+            img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
+            if h_eff < ps or w_eff < ps:
+                continue
+
+            feats_tile = None
+            hp = wp = None
+
+            if feature_dir is not None and image_id is not None:
+                hp = h_eff // ps
+                wp = w_eff // ps
+                feats_tile = load_tile_features_if_valid(
+                    feature_dir,
+                    image_id,
+                    y,
+                    x,
+                    expected_hp=hp,
+                    expected_wp=wp,
+                    ps=ps,
+                    resample_factor=resample_factor,
+                )
+                if feats_tile is not None:
+                    cached_tiles += 1
+
+            if feats_tile is None:
+                feats_tile, hp, wp = extract_patch_features_single_scale(
+                    img_c,
+                    model,
+                    processor,
+                    device,
+                    ps=ps,
+                    aggregate_layers=aggregate_layers,
+                )
+                computed_tiles += 1
+                if feature_dir is not None and image_id is not None:
+                    meta = {
+                        "ps": ps,
+                        "resample_factor": resample_factor,
+                        "h_eff": h_eff,
+                        "w_eff": w_eff,
+                    }
+                    save_tile_features(
+                        feats_tile, feature_dir, image_id, y, x, meta=meta
+                    )
+
         if lab_c is None:
             logger.warning("missing labels for tile y=%s x=%s; skipping", y, x)
             continue
-
-        feats_tile = None
-        hp = wp = None
-
-        if feature_dir is not None and image_id is not None:
-            hp = h_eff // ps
-            wp = w_eff // ps
-            feats_tile = load_tile_features_if_valid(
-                feature_dir,
-                image_id,
-                y,
-                x,
-                expected_hp=hp,
-                expected_wp=wp,
-                ps=ps,
-                resample_factor=resample_factor,
-            )
-            if feats_tile is not None:
-                cached_tiles += 1
-
-        if feats_tile is None:
-            feats_tile, hp, wp = extract_patch_features_single_scale(
-                img_c, model, processor, device, ps=ps, aggregate_layers=aggregate_layers
-            )
-            computed_tiles += 1
-            if feature_dir is not None and image_id is not None:
-                meta = {
-                    "ps": ps,
-                    "resample_factor": resample_factor,
-                    "h_eff": h_eff,
-                    "w_eff": w_eff,
-                }
-                save_tile_features(feats_tile, feature_dir, image_id, y, x, meta=meta)
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
 
         if hp is None or wp is None:
-            logger.warning("missing patch dimensions for tile y=%s x=%s; skipping", y, x)
+            logger.warning(
+                "missing patch dimensions for tile y=%s x=%s; skipping", y, x
+            )
             continue
-        pos_mask, neg_mask = labels_to_patch_masks(lab_c, hp, wp, pos_frac_thresh=pos_frac_thresh)
+        pos_mask, neg_mask = labels_to_patch_masks(
+            lab_c, hp, wp, pos_frac_thresh=pos_frac_thresh
+        )
         pos_feats_tile = feats_tile[pos_mask]
         neg_feats_tile = feats_tile[neg_mask]
         if pos_feats_tile.size > 0:
@@ -186,7 +225,10 @@ def build_banks_single_scale(img_a: np.ndarray,
             neg_list.append(neg_feats_tile)
 
     if not pos_list:
-        logger.warning("no positive patches found for image_id=%s; skipping this source tile", image_id)
+        logger.warning(
+            "no positive patches found for image_id=%s; skipping this source tile",
+            image_id,
+        )
         return np.empty((0, 0), dtype=np.float32), None
 
     pos_bank = np.concatenate(pos_list, axis=0)
@@ -200,7 +242,11 @@ def build_banks_single_scale(img_a: np.ndarray,
             rng = np.random.default_rng(42)
             idx = rng.choice(len(neg_bank), size=max_neg, replace=False)
             neg_bank = neg_bank[idx]
-            logger.info("subsampled negative bank to %s (MAX_NEG_BANK=%s)", len(neg_bank), max_neg)
+            logger.info(
+                "subsampled negative bank to %s (MAX_NEG_BANK=%s)",
+                len(neg_bank),
+                max_neg,
+            )
 
     time_end("build_banks_single_scale", t0)
     logger.info("A: cached tiles=%s, computed tiles=%s", cached_tiles, computed_tiles)
