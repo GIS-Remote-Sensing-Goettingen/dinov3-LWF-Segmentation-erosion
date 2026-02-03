@@ -26,7 +26,6 @@ from ..core.metrics_utils import (
     compute_metrics_batch_cpu,
     compute_metrics_batch_gpu,
 )
-from ..core.shadow_filter import shadow_filter_grid
 from ..core.xdboost import (
     build_xgb_dataset,
     hyperparam_search_xgb_iou,
@@ -36,6 +35,62 @@ from ..core.xdboost import (
 from .common import build_xgb_training_data, init_model, log_metrics, prep_b_tile
 
 logger = logging.getLogger(__name__)
+
+
+def _shadow_weighted_sum(
+    img_rgb: np.ndarray,
+    weights,
+) -> np.ndarray:
+    """Compute weighted RGB sum for shadow filtering.
+
+    Args:
+        img_rgb (np.ndarray): RGB image array.
+        weights (Iterable[float]): RGB weights.
+
+    Returns:
+        np.ndarray: Weighted sum image (H, W) float32.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.ones((1, 1, 3), dtype=np.uint8) * 10
+        >>> _shadow_weighted_sum(img, (1.0, 2.0, 3.0)).item()
+        60.0
+    """
+    img_float = img_rgb.astype(np.float32)
+    w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
+    return (img_float * w).sum(axis=2)
+
+
+def _apply_shadow_filter(
+    base_mask: np.ndarray,
+    shadow_pass: np.ndarray,
+    score_full: np.ndarray,
+    protect_score: float | None,
+) -> np.ndarray:
+    """Apply shadow filtering with optional protect score override.
+
+    Args:
+        base_mask (np.ndarray): Base prediction mask.
+        shadow_pass (np.ndarray): Shadow-pass mask from weighted sum threshold.
+        score_full (np.ndarray): Full-resolution score map.
+        protect_score (float | None): Score threshold to override shadows.
+
+    Returns:
+        np.ndarray: Filtered mask.
+
+    Examples:
+        >>> import numpy as np
+        >>> base = np.array([[1, 0]], dtype=bool)
+        >>> shadow = np.array([[0, 1]], dtype=bool)
+        >>> score = np.array([[0.6, 0.2]], dtype=np.float32)
+        >>> _apply_shadow_filter(base, shadow, score, 0.5).tolist()
+        [[True, False]]
+    """
+    base_mask_bool = base_mask.astype(bool)
+    shadow_pass_bool = shadow_pass.astype(bool)
+    if protect_score is None:
+        return base_mask_bool & shadow_pass_bool
+    return base_mask_bool & (shadow_pass_bool | (score_full >= protect_score))
 
 
 def tune_on_validation(
@@ -276,13 +331,29 @@ def tune_on_validation(
         raise ValueError("CRF grid search returned no results")
     log_metrics("val CRF", best_crf_cfg)
 
-    best_shadow_cfg, _ = shadow_filter_grid(
-        img_b,
-        best_crf_mask,
-        gt_mask_eval,
-        cfg.SHADOW_WEIGHT_SETS,
-        cfg.SHADOW_THRESHOLDS,
-    )
+    protect_scores = getattr(cfg, "SHADOW_PROTECT_SCORES", [0.5])
+    best_shadow_cfg = None
+    best_shadow_iou = -1.0
+    for weights in cfg.SHADOW_WEIGHT_SETS:
+        wsum = _shadow_weighted_sum(img_b, weights)
+        for thr in cfg.SHADOW_THRESHOLDS:
+            shadow_pass = wsum >= thr
+            for protect_score in protect_scores:
+                mask_shadow = _apply_shadow_filter(
+                    best_crf_mask,
+                    shadow_pass,
+                    champion_score,
+                    protect_score,
+                )
+                metrics_shadow = compute_metrics(mask_shadow, gt_mask_eval)
+                if metrics_shadow["iou"] > best_shadow_iou:
+                    best_shadow_iou = metrics_shadow["iou"]
+                    best_shadow_cfg = {
+                        "weights": tuple(float(x) for x in weights),
+                        "threshold": float(thr),
+                        "protect_score": float(protect_score),
+                        **metrics_shadow,
+                    }
     if best_shadow_cfg is None:
         raise ValueError("shadow filter search returned no results")
     logger.info("val shadow best: %s", best_shadow_cfg)
@@ -422,12 +493,15 @@ def eval_holdout_tile(
     log_metrics(f"holdout {image_id_b} CRF", metrics_crf)
 
     shadow_cfg = tuned["best_shadow_cfg"]
-    _, mask_shadow = shadow_filter_grid(
-        img_b,
+    shadow_pass = (
+        _shadow_weighted_sum(img_b, shadow_cfg["weights"]) >= shadow_cfg["threshold"]
+    )
+    protect_score = shadow_cfg.get("protect_score")
+    mask_shadow = _apply_shadow_filter(
         mask_crf,
-        gt_mask_eval,
-        [shadow_cfg["weights"]],
-        [shadow_cfg["threshold"]],
+        shadow_pass,
+        champion_score,
+        protect_score,
     )
     metrics_shadow = compute_metrics(mask_shadow, gt_mask_eval)
     log_metrics(f"holdout {image_id_b} shadow", metrics_shadow)

@@ -35,7 +35,6 @@ from ..core.metrics_utils import (
     compute_oracle_upper_bound,
 )
 from ..core.plotting import save_best_model_plot, save_knn_xgb_gt_plot, save_plot
-from ..core.shadow_filter import shadow_filter_grid
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import (
     build_xgb_dataset,
@@ -80,6 +79,23 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
         )
         ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
     return float(np.median(ious)), cfg
+
+
+def _apply_shadow_filter(
+    img_b: np.ndarray,
+    base_mask: np.ndarray,
+    weights,
+    threshold: float,
+    score_full: np.ndarray,
+    protect_score: float | None,
+) -> np.ndarray:
+    img_float = img_b.astype(np.float32)
+    w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
+    wsum = (img_float * w).sum(axis=2)
+    shadow_pass = wsum >= threshold
+    if protect_score is None:
+        return np.logical_and(base_mask, shadow_pass)
+    return np.logical_and(base_mask, shadow_pass | (score_full >= protect_score))
 
 
 def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
@@ -510,8 +526,13 @@ def tune_on_validation_multi(
     # Shadow tuning across val tiles
     best_shadow_cfg = None
     best_shadow_iou = None
+    protect_scores = getattr(cfg, "SHADOW_PROTECT_SCORES", [0.5])
     for weights in cfg.SHADOW_WEIGHT_SETS:
-        iou_by_thr = {thr: [] for thr in cfg.SHADOW_THRESHOLDS}
+        iou_by_key = {
+            (thr, protect_score): []
+            for thr in cfg.SHADOW_THRESHOLDS
+            for protect_score in protect_scores
+        }
         for ctx in val_contexts:
             logger.info("tune: shadow scoring on %s", ctx["path"])
             score_full = ctx["score_full"]
@@ -542,32 +563,40 @@ def tune_on_validation_multi(
             thr_arr = np.array(cfg.SHADOW_THRESHOLDS, dtype=np.float32).reshape(-1, 1)
             mask_thr = vals[None, :] >= thr_arr
             gt_bool = gt_vals.astype(bool)
-            tp = (
-                np.logical_and(mask_thr, gt_bool[None, :])
-                .sum(axis=1)
-                .astype(np.float64)
-            )
-            fp = (
-                np.logical_and(mask_thr, ~gt_bool[None, :])
-                .sum(axis=1)
-                .astype(np.float64)
-            )
-            fn = (
-                np.logical_and(~mask_thr, gt_bool[None, :])
-                .sum(axis=1)
-                .astype(np.float64)
-            )
-            iou = tp / (tp + fp + fn + 1e-8)
-            for i, thr in enumerate(cfg.SHADOW_THRESHOLDS):
-                iou_by_thr[thr].append(float(iou[i]))
+            score_vals = score_full.reshape(-1)[flat_base]
+            for protect_score in protect_scores:
+                protect_mask = score_vals >= protect_score
+                mask_keep = mask_thr | protect_mask[None, :]
+                tp = (
+                    np.logical_and(mask_keep, gt_bool[None, :])
+                    .sum(axis=1)
+                    .astype(np.float64)
+                )
+                fp = (
+                    np.logical_and(mask_keep, ~gt_bool[None, :])
+                    .sum(axis=1)
+                    .astype(np.float64)
+                )
+                fn = (
+                    np.logical_and(~mask_keep, gt_bool[None, :])
+                    .sum(axis=1)
+                    .astype(np.float64)
+                )
+                iou = tp / (tp + fp + fn + 1e-8)
+                for i, thr in enumerate(cfg.SHADOW_THRESHOLDS):
+                    iou_by_key[(thr, protect_score)].append(float(iou[i]))
 
-        for thr, ious in iou_by_thr.items():
+        for (thr, protect_score), ious in iou_by_key.items():
             if not ious:
                 continue
             med_iou = float(np.median(ious))
             if best_shadow_iou is None or med_iou > best_shadow_iou:
                 best_shadow_iou = med_iou
-                best_shadow_cfg = {"weights": weights, "threshold": thr}
+                best_shadow_cfg = {
+                    "weights": weights,
+                    "threshold": thr,
+                    "protect_score": protect_score,
+                }
     if best_shadow_cfg is None:
         raise ValueError("shadow tuning returned no results")
 
@@ -719,12 +748,13 @@ def infer_on_holdout(
     best_crf_config = {**crf_cfg, **compute_metrics(best_crf_mask, gt_mask_eval)}
 
     shadow_cfg = tuned["shadow_cfg"]
-    _, shadow_mask = shadow_filter_grid(
+    shadow_mask = _apply_shadow_filter(
         img_b,
         best_crf_mask,
-        gt_mask_eval,
-        [shadow_cfg["weights"]],
-        [shadow_cfg["threshold"]],
+        shadow_cfg["weights"],
+        shadow_cfg["threshold"],
+        champion_score,
+        shadow_cfg.get("protect_score"),
     )
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
     shadow_cfg_full = {**shadow_cfg, **shadow_metrics}

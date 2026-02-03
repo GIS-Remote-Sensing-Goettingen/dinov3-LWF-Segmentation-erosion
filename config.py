@@ -117,6 +117,7 @@ SHADOW_THRESHOLDS = [
     450,
     500,
 ]
+SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
 
 # XGBoost (patch classifier)
 XGB_USE_GPU = True
