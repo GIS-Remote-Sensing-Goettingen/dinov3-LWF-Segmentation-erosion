@@ -1,6 +1,17 @@
 # Changelog
 
 
+## [Unreleased]
+- Description: Parallelized GT presence checks for auto tile splitting.
+- file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
+- reason: Speed up auto split when scanning large tile directories.
+- problems fixed: Reduces wall time for GT overlap detection with many tiles.
+
+- Description: Removed split-eval entrypoints and per-tile shapefile exports; union shapefile only.
+- file touched: `segedge/pipeline/run.py`, `split_eval.py`, `segedge/pipeline/split_eval.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Focus on main pipeline only and reduce shapefile clutter.
+- problems fixed: Avoids per-tile shapefiles when only union outputs are needed.
+
 ## [0.2.0]
 - Description: Added phase logging, diskless feature-cache mode, parallel CRF tuning in the main pipeline, shadow protect score tuning for split evaluation, and GT-driven auto split of tiles.
 - file touched: `config.py`, `segedge/core/banks.py`, `segedge/core/knn.py`, `segedge/core/xdboost.py`, `segedge/pipeline/run.py`, `segedge/pipeline/split_eval.py`, `segedge/pipeline/common.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

@@ -20,7 +20,6 @@ from ..core.io_utils import (
     build_sh_buffer_mask,
     consolidate_features_for_image,
     export_best_settings,
-    export_mask_to_shapefile,
     export_masks_to_shapefile_union,
     load_dop20_image,
     rasterize_vector_labels,
@@ -793,22 +792,6 @@ def infer_on_holdout(
         labels_sh=labels_sh,
     )
 
-    export_mask_to_shapefile(
-        mask_knn if champion_source == "raw" else mask_xgb,
-        holdout_path,
-        os.path.join(shape_dir, f"{image_id_b}_pred_mask_best_raw.shp"),
-    )
-    export_mask_to_shapefile(
-        best_crf_mask,
-        holdout_path,
-        os.path.join(shape_dir, f"{image_id_b}_pred_mask_best_crf.shp"),
-    )
-    export_mask_to_shapefile(
-        shadow_mask,
-        holdout_path,
-        os.path.join(shape_dir, f"{image_id_b}_pred_mask_best_shadow.shp"),
-    )
-
     export_best_settings(
         best_raw_config,
         best_crf_config,
@@ -897,6 +880,7 @@ def main():
         val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
         seed = int(getattr(cfg, "SPLIT_SEED", 42))
         downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
+        num_workers = getattr(cfg, "GT_PRESENCE_WORKERS", None)
         img_a_paths, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
             tiles_dir,
             tile_glob,
@@ -904,6 +888,7 @@ def main():
             val_fraction,
             seed,
             downsample_factor=downsample_factor,
+            num_workers=num_workers,
         )
         logger.info(
             "auto split tiles: source=%s val=%s holdout=%s",

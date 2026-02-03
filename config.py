@@ -10,13 +10,15 @@ SOURCE_TILE = "data/tiles/dop20_596000_5974000_1km_20cm.tif"
 TARGET_TILE = "data/dop20_592000_5982000_1km_20cm.tif"
 
 # Tile discovery + auto split (optional)
-TILES_DIR = "data/tiles"
+TILES_DIR = "danota/tiles"
 TILE_GLOB = "*.tif"
 AUTO_SPLIT_TILES = True
-VAL_SPLIT_FRACTION = 0.2
+VAL_SPLIT_FRACTION = 0.5
 SPLIT_SEED = 42
 # Downsample factor for GT presence checks (None uses RESAMPLE_FACTOR).
 GT_PRESENCE_DOWNSAMPLE = None
+# Worker count for GT presence checks (None uses SLURM_CPUS_PER_TASK or os.cpu_count()).
+GT_PRESENCE_WORKERS = None
 
 # Label raster used to build banks on SOURCE_* tiles.
 SOURCE_LABEL_RASTER = "data/lables/planet_labels_2022.tif"
@@ -174,4 +176,4 @@ XGB_PARAM_GRID = [
 # If True, evaluation ignores GT outside the SH buffer (upper bound can reach 1.0).
 CLIP_GT_TO_BUFFER = True
 
-# Split evaluation (used by split_eval.py).
+# Split evaluation settings (legacy).

@@ -5,6 +5,8 @@ from __future__ import annotations
 import glob
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
 
 import numpy as np
 import torch
@@ -47,6 +49,79 @@ def _tile_has_gt(
     return bool(np.any(gt_mask))
 
 
+def _resolve_gt_workers(num_workers: int | None) -> int:
+    """Resolve worker count for GT presence checks.
+
+    Args:
+        num_workers (int | None): Requested workers.
+
+    Returns:
+        int: Resolved worker count (>=1).
+
+    Examples:
+        >>> _resolve_gt_workers(2) >= 1
+        True
+    """
+    if num_workers is None:
+        slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        if slurm_cpus:
+            try:
+                num_workers = int(slurm_cpus)
+            except ValueError:
+                num_workers = None
+        if num_workers is None:
+            num_workers = os.cpu_count() or 1
+    return max(1, int(num_workers))
+
+
+def _chunk_tiles(tile_paths: list[str], chunk_size: int) -> list[list[str]]:
+    """Chunk a list of tile paths into smaller lists.
+
+    Args:
+        tile_paths (list[str]): Tile paths.
+        chunk_size (int): Chunk size.
+
+    Returns:
+        list[list[str]]: Chunked tiles.
+
+    Examples:
+        >>> _chunk_tiles(["a", "b", "c"], 2)
+        [['a', 'b'], ['c']]
+    """
+    return [
+        tile_paths[i : i + chunk_size] for i in range(0, len(tile_paths), chunk_size)
+    ]
+
+
+def _tiles_with_gt_chunk(
+    tile_paths: list[str],
+    gt_vector_paths: list[str],
+    downsample_factor: int,
+) -> tuple[list[str], list[str]]:
+    """Split a chunk of tiles into GT vs holdout lists.
+
+    Args:
+        tile_paths (list[str]): Tile paths for the chunk.
+        gt_vector_paths (list[str]): GT vector paths.
+        downsample_factor (int): Downsample factor for rasterization.
+
+    Returns:
+        tuple[list[str], list[str]]: GT tiles and holdout tiles.
+
+    Examples:
+        >>> callable(_tiles_with_gt_chunk)
+        True
+    """
+    gt_tiles = []
+    holdout_tiles = []
+    for tile_path in tile_paths:
+        if _tile_has_gt(tile_path, gt_vector_paths, downsample_factor):
+            gt_tiles.append(tile_path)
+        else:
+            holdout_tiles.append(tile_path)
+    return gt_tiles, holdout_tiles
+
+
 def resolve_tile_splits_from_gt(
     tiles_dir: str,
     tile_glob: str,
@@ -54,6 +129,7 @@ def resolve_tile_splits_from_gt(
     val_fraction: float,
     seed: int,
     downsample_factor: int | None = None,
+    num_workers: int | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Resolve source/val/holdout tiles using GT presence.
 
@@ -67,6 +143,7 @@ def resolve_tile_splits_from_gt(
         val_fraction (float): Fraction of GT tiles for validation.
         seed (int): RNG seed for split.
         downsample_factor (int | None): Downsample factor for GT presence checks.
+        num_workers (int | None): Worker count for GT presence checks.
 
     Returns:
         tuple[list[str], list[str], list[str]]: Source, validation, holdout tiles.
@@ -85,14 +162,39 @@ def resolve_tile_splits_from_gt(
     if downsample_factor is None:
         downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
+    num_workers = _resolve_gt_workers(num_workers)
+    logger.info(
+        "auto split: scanning %s tiles for GT using %s workers",
+        len(tile_paths),
+        num_workers,
+    )
     gt_tiles = []
     holdout_tiles = []
-    for tile_path in tile_paths:
-        has_gt = _tile_has_gt(tile_path, gt_vector_paths, downsample_factor)
-        if has_gt:
-            gt_tiles.append(tile_path)
-        else:
-            holdout_tiles.append(tile_path)
+    if num_workers <= 1:
+        for tile_path in tile_paths:
+            has_gt = _tile_has_gt(tile_path, gt_vector_paths, downsample_factor)
+            if has_gt:
+                gt_tiles.append(tile_path)
+            else:
+                holdout_tiles.append(tile_path)
+    else:
+        chunk_count = max(1, num_workers * 4)
+        chunk_size = max(1, (len(tile_paths) + chunk_count - 1) // chunk_count)
+        chunks = _chunk_tiles(tile_paths, chunk_size)
+        logger.info(
+            "auto split: chunk_size=%s, chunks=%s",
+            chunk_size,
+            len(chunks),
+        )
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            for gt_chunk, holdout_chunk in ex.map(
+                _tiles_with_gt_chunk,
+                chunks,
+                repeat(gt_vector_paths),
+                repeat(downsample_factor),
+            ):
+                gt_tiles.extend(gt_chunk)
+                holdout_tiles.extend(holdout_chunk)
 
     if not gt_tiles:
         raise ValueError("no tiles overlap GT vectors; cannot build source/val")

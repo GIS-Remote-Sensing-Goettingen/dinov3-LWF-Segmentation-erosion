@@ -95,10 +95,8 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 
 ## 7) Code Architecture (modules)
 - `main.py`: CLI wrapper for the full pipeline (delegates to `segedge/pipeline/run.py`).
-- `split_eval.py`: CLI wrapper for split evaluation (delegates to `segedge/pipeline/split_eval.py`).
 - `config.py`: All tunable paths/hyperparams.
 - `segedge/pipeline/run.py`: Orchestrator—loads data, builds banks, runs kNN + XGB, selects champion, plots, CRF, shadow filter, exports shapefiles/YAML.
-- `segedge/pipeline/split_eval.py`: Validation/holdout split evaluation flow.
 - `segedge/pipeline/common.py`: Shared helpers for entrypoints.
 - `segedge/core/timing_utils.py`: Timing helpers + debug flags.
 - `segedge/core/features.py`: Tiling, cropping, DINO feature extraction, prefetch, normalization.
