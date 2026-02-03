@@ -10,7 +10,7 @@ SOURCE_TILE = "data/tiles/dop20_596000_5974000_1km_20cm.tif"
 TARGET_TILE = "data/dop20_592000_5982000_1km_20cm.tif"
 
 # Tile discovery + auto split (optional)
-TILES_DIR = "danota/tiles"
+TILES_DIR = "/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1"
 TILE_GLOB = "*.tif"
 AUTO_SPLIT_TILES = True
 VAL_SPLIT_FRACTION = 0.5
