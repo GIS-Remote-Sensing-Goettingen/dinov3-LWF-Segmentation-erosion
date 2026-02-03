@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -21,6 +23,7 @@ from ..core.io_utils import (
     backup_union_shapefile,
     build_sh_buffer_mask,
     consolidate_features_for_image,
+    count_shapefile_features,
     export_best_settings,
     load_dop20_image,
     rasterize_vector_labels,
@@ -732,10 +735,10 @@ def infer_on_holdout(
         best_raw_config = {**tuned["best_xgb_config"], **metrics_xgb}
 
     crf_cfg = tuned["best_crf_config"]
-    best_crf_mask = refine_with_densecrf(
+    mask_crf_knn = refine_with_densecrf(
         img_b,
-        champion_score,
-        thr_center_for_crf,
+        score_knn,
+        knn_thr,
         sh_buffer_mask,
         prob_softness=crf_cfg["prob_softness"],
         n_iters=5,
@@ -745,16 +748,50 @@ def infer_on_holdout(
         bilateral_xy_std=crf_cfg["bilateral_xy_std"],
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
     )
+    mask_crf_xgb = refine_with_densecrf(
+        img_b,
+        score_xgb,
+        xgb_thr,
+        sh_buffer_mask,
+        prob_softness=crf_cfg["prob_softness"],
+        n_iters=5,
+        pos_w=crf_cfg["pos_w"],
+        pos_xy_std=crf_cfg["pos_xy_std"],
+        bilateral_w=crf_cfg["bilateral_w"],
+        bilateral_xy_std=crf_cfg["bilateral_xy_std"],
+        bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+    )
+    if champion_source == "raw":
+        best_crf_mask = mask_crf_knn
+    else:
+        best_crf_mask = mask_crf_xgb
     best_crf_config = {**crf_cfg, **compute_metrics(best_crf_mask, gt_mask_eval)}
 
     shadow_cfg = tuned["shadow_cfg"]
+    protect_score = shadow_cfg.get("protect_score")
     shadow_mask = _apply_shadow_filter(
         img_b,
         best_crf_mask,
         shadow_cfg["weights"],
         shadow_cfg["threshold"],
         champion_score,
-        shadow_cfg.get("protect_score"),
+        protect_score,
+    )
+    shadow_mask_knn = _apply_shadow_filter(
+        img_b,
+        mask_crf_knn,
+        shadow_cfg["weights"],
+        shadow_cfg["threshold"],
+        score_knn,
+        protect_score,
+    )
+    shadow_mask_xgb = _apply_shadow_filter(
+        img_b,
+        mask_crf_xgb,
+        shadow_cfg["weights"],
+        shadow_cfg["threshold"],
+        score_xgb,
+        protect_score,
     )
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
     shadow_cfg_full = {**shadow_cfg, **shadow_metrics}
@@ -815,7 +852,22 @@ def infer_on_holdout(
         ),
     )
 
-    return shadow_mask, holdout_path
+    champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
+    return {
+        "ref_path": holdout_path,
+        "image_id": image_id_b,
+        "masks": {
+            "knn_raw": mask_knn,
+            "knn_crf": mask_crf_knn,
+            "knn_shadow": shadow_mask_knn,
+            "xgb_raw": mask_xgb,
+            "xgb_crf": mask_crf_xgb,
+            "xgb_shadow": shadow_mask_xgb,
+            "champion_raw": champ_raw_mask,
+            "champion_crf": best_crf_mask,
+            "champion_shadow": shadow_mask,
+        },
+    }
 
 
 def main():
@@ -834,17 +886,31 @@ def main():
     # ------------------------------------------------------------
     output_root = getattr(cfg, "OUTPUT_DIR", "output")
     os.makedirs(output_root, exist_ok=True)
-    existing = sorted(d for d in os.listdir(output_root) if d.startswith("run_"))
-    next_idx = 1
-    if existing:
-        try:
-            next_idx = (
-                max(int(d.split("_")[1]) for d in existing if d.split("_")[1].isdigit())
-                + 1
-            )
-        except ValueError:
-            next_idx = len(existing) + 1
-    run_dir = os.path.join(output_root, f"run_{next_idx:03d}")
+    resume_run = bool(getattr(cfg, "RESUME_RUN", False))
+    resume_dir = getattr(cfg, "RESUME_RUN_DIR", None)
+    if resume_run:
+        if not resume_dir:
+            raise ValueError("RESUME_RUN_DIR must be set when RESUME_RUN=True")
+        if not os.path.isdir(resume_dir):
+            raise ValueError(f"RESUME_RUN_DIR not found: {resume_dir}")
+        run_dir = resume_dir
+        logger.info("resume run: %s", run_dir)
+    else:
+        existing = sorted(d for d in os.listdir(output_root) if d.startswith("run_"))
+        next_idx = 1
+        if existing:
+            try:
+                next_idx = (
+                    max(
+                        int(d.split("_")[1])
+                        for d in existing
+                        if d.split("_")[1].isdigit()
+                    )
+                    + 1
+                )
+            except ValueError:
+                next_idx = len(existing) + 1
+        run_dir = os.path.join(output_root, f"run_{next_idx:03d}")
     plot_dir = os.path.join(run_dir, "plots")
     shape_dir = os.path.join(run_dir, "shapes")
     os.makedirs(plot_dir, exist_ok=True)
@@ -853,27 +919,66 @@ def main():
     cfg.BEST_SETTINGS_PATH = os.path.join(run_dir, "best_settings.yml")
     cfg.LOG_PATH = os.path.join(run_dir, "run.log")
     setup_logging(getattr(cfg, "LOG_PATH", None))
-    union_path = os.path.join(shape_dir, "pred_mask_best_shadow_merged.shp")
+    processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
+    processed_tiles: set[str] = set()
+    if resume_run and os.path.exists(processed_log_path):
+        with open(processed_log_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("status") == "done" and record.get("tile_path"):
+                    processed_tiles.add(record["tile_path"])
+        logger.info("resume: loaded %s processed tiles", len(processed_tiles))
+
     union_backup_every = int(getattr(cfg, "UNION_BACKUP_EVERY", 10) or 0)
-    union_backup_dir = getattr(cfg, "UNION_BACKUP_DIR", None) or os.path.join(
-        shape_dir, "backups"
-    )
-    union_feature_id = 0
-    union_tiles_processed = 0
+    union_root = os.path.join(shape_dir, "unions")
+    union_streams = ["knn", "xgb", "champion"]
+    union_variants = ["raw", "crf", "shadow"]
+    union_states: dict[tuple[str, str], dict[str, str | int]] = {}
+    for stream in union_streams:
+        for variant in union_variants:
+            union_dir = os.path.join(union_root, stream, variant)
+            os.makedirs(union_dir, exist_ok=True)
+            union_path = os.path.join(union_dir, "union.shp")
+            feature_id = count_shapefile_features(union_path) if resume_run else 0
+            union_states[(stream, variant)] = {
+                "path": union_path,
+                "backup_dir": os.path.join(union_dir, "backups"),
+                "feature_id": feature_id,
+            }
+            if resume_run and feature_id:
+                logger.info(
+                    "resume union: %s/%s features=%s",
+                    stream,
+                    variant,
+                    feature_id,
+                )
     logger.info(
-        "rolling union: path=%s backup_every=%s",
-        union_path,
+        "rolling unions: root=%s backup_every=%s",
+        union_root,
         union_backup_every,
     )
 
-    def _append_union(mask, ref_path) -> None:
-        nonlocal union_feature_id, union_tiles_processed
-        union_feature_id = append_mask_to_union_shapefile(
-            mask, ref_path, union_path, start_id=union_feature_id
+    def _append_union(
+        stream: str, variant: str, mask, ref_path: str, step: int
+    ) -> None:
+        state = union_states[(stream, variant)]
+        union_path = str(state["path"])
+        backup_dir = str(state["backup_dir"])
+        feature_id = int(state["feature_id"])
+        state["feature_id"] = append_mask_to_union_shapefile(
+            mask,
+            ref_path,
+            union_path,
+            start_id=feature_id,
         )
-        union_tiles_processed += 1
-        if union_backup_every > 0 and union_tiles_processed % union_backup_every == 0:
-            backup_union_shapefile(union_path, union_backup_dir, union_tiles_processed)
+        if union_backup_every > 0 and step % union_backup_every == 0:
+            backup_union_shapefile(union_path, backup_dir, step)
 
     # ------------------------------------------------------------
     # Init DINOv3 model & processor
@@ -1062,7 +1167,7 @@ def main():
     # Run inference on validation tiles with fixed settings (for plots/metrics)
     logger.info("phase:start validation_inference")
     for val_path in val_tiles:
-        shadow_mask, ref_path = infer_on_holdout(
+        infer_on_holdout(
             val_path,
             gt_vector_paths,
             model,
@@ -1078,12 +1183,15 @@ def main():
             shape_dir,
             context_radius,
         )
-        _append_union(shadow_mask, ref_path)
     logger.info("phase:end validation_inference")
 
     logger.info("phase:start holdout_inference")
+    holdout_tiles_processed = len(processed_tiles)
     for b_path in holdout_tiles:
-        shadow_mask, ref_path = infer_on_holdout(
+        if b_path in processed_tiles:
+            logger.info("holdout skip (already processed): %s", b_path)
+            continue
+        result = infer_on_holdout(
             b_path,
             gt_vector_paths,
             model,
@@ -1099,7 +1207,27 @@ def main():
             shape_dir,
             context_radius,
         )
-        _append_union(shadow_mask, ref_path)
+        holdout_tiles_processed += 1
+        ref_path = result["ref_path"]
+        masks = result["masks"]
+        for stream in ("knn", "xgb", "champion"):
+            for variant in ("raw", "crf", "shadow"):
+                mask_key = f"{stream}_{variant}"
+                _append_union(
+                    stream,
+                    variant,
+                    masks[mask_key],
+                    ref_path,
+                    holdout_tiles_processed,
+                )
+        record = {
+            "tile_path": b_path,
+            "image_id": result["image_id"],
+            "status": "done",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        with open(processed_log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
     logger.info("phase:end holdout_inference")
 
     # ------------------------------------------------------------

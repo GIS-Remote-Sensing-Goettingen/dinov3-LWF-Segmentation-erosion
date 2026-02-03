@@ -62,6 +62,9 @@ OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
+# Resume previous run (requires RESUME_RUN_DIR).
+RESUME_RUN = False
+RESUME_RUN_DIR = None
 # Rolling union shapefile backups (0 disables backups).
 UNION_BACKUP_EVERY = 10
 UNION_BACKUP_DIR = None

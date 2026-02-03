@@ -425,6 +425,28 @@ def backup_union_shapefile(out_path: str, backup_dir: str, step: int) -> None:
     logger.info("union shapefile backup written: %s", backup_base + ".shp")
 
 
+def count_shapefile_features(path: str) -> int:
+    """Count features in a shapefile (0 if missing).
+
+    Args:
+        path (str): Shapefile path.
+
+    Returns:
+        int: Number of features.
+
+    Examples:
+        >>> callable(count_shapefile_features)
+        True
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        with fiona.open(path, "r") as shp:
+            return sum(1 for _ in shp)
+    except Exception:
+        return 0
+
+
 def consolidate_features_for_image(
     feature_dir: str, image_id: str, output_suffix: str = "_features_full.npy"
 ):

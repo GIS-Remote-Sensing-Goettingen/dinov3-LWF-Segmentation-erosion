@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add holdout-only rolling unions for kNN/XGB/Champion streams with resume logging.
+- file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
+- reason: Track per-stream unions during holdout inference and resume safely after interruptions.
+- problems fixed: Enables incremental union outputs and skip/restart logic based on processed tiles.
+
 - Description: Write rolling union shapefile updates with periodic backups.
 - file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
 - reason: Keep union shapes updated during inference and protect against partial runs.
