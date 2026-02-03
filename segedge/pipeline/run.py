@@ -42,7 +42,7 @@ from ..core.xdboost import (
     train_xgb_classifier,
     xgb_score_image_b,
 )
-from .common import init_model
+from .common import init_model, resolve_tile_splits_from_gt
 
 # Config-driven flags
 USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
@@ -886,11 +886,35 @@ def main():
     source_tile_default = cfg.SOURCE_TILE
     source_label_raster = cfg.SOURCE_LABEL_RASTER
     gt_vector_paths = cfg.EVAL_GT_VECTORS
+    auto_split_tiles = getattr(cfg, "AUTO_SPLIT_TILES", False)
 
     # ------------------------------------------------------------
     # Resolve one or more labeled source images (Image A list)
     # ------------------------------------------------------------
-    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
+    if auto_split_tiles:
+        tiles_dir = getattr(cfg, "TILES_DIR", "data/tiles")
+        tile_glob = getattr(cfg, "TILE_GLOB", "*.tif")
+        val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
+        seed = int(getattr(cfg, "SPLIT_SEED", 42))
+        downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
+        img_a_paths, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
+            tiles_dir,
+            tile_glob,
+            gt_vector_paths,
+            val_fraction,
+            seed,
+            downsample_factor=downsample_factor,
+        )
+        logger.info(
+            "auto split tiles: source=%s val=%s holdout=%s",
+            len(img_a_paths),
+            len(val_tiles),
+            len(holdout_tiles),
+        )
+    else:
+        img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
+        val_tiles = cfg.VAL_TILES
+        holdout_tiles = cfg.HOLDOUT_TILES
     lab_a_paths = [source_label_raster] * len(img_a_paths)
 
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
@@ -898,11 +922,10 @@ def main():
     # ------------------------------------------------------------
     # Resolve validation + holdout tiles (required)
     # ------------------------------------------------------------
-    val_tiles = cfg.VAL_TILES
-    holdout_tiles = cfg.HOLDOUT_TILES
-    if not val_tiles or not holdout_tiles:
-        raise ValueError("VAL_TILES and HOLDOUT_TILES must be set for main.py.")
-    gt_vector_paths = cfg.EVAL_GT_VECTORS
+    if not val_tiles:
+        raise ValueError("VAL_TILES must be set for main.py.")
+    if not holdout_tiles:
+        logger.warning("no holdout tiles resolved; skipping holdout inference")
 
     # ------------------------------------------------------------
     # Feature caching

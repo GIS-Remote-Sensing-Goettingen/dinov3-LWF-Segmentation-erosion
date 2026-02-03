@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 
@@ -21,6 +22,96 @@ from ..core.io_utils import (
 from ..core.timing_utils import time_end, time_start
 
 logger = logging.getLogger(__name__)
+
+
+def _tile_has_gt(
+    tile_path: str, gt_vector_paths: list[str], downsample_factor: int
+) -> bool:
+    """Return True if GT vectors overlap the tile.
+
+    Args:
+        tile_path (str): Tile path to test.
+        gt_vector_paths (list[str]): GT vector paths.
+        downsample_factor (int): Downsample factor for rasterization.
+
+    Returns:
+        bool: True if GT positives exist for the tile.
+
+    Examples:
+        >>> callable(_tile_has_gt)
+        True
+    """
+    gt_mask = rasterize_vector_labels(
+        gt_vector_paths, tile_path, downsample_factor=downsample_factor
+    )
+    return bool(np.any(gt_mask))
+
+
+def resolve_tile_splits_from_gt(
+    tiles_dir: str,
+    tile_glob: str,
+    gt_vector_paths: list[str],
+    val_fraction: float,
+    seed: int,
+    downsample_factor: int | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Resolve source/val/holdout tiles using GT presence.
+
+    Tiles with any GT positives are split into source (train) and validation.
+    Tiles without GT positives are assigned to holdout.
+
+    Args:
+        tiles_dir (str): Directory containing tiles.
+        tile_glob (str): Glob pattern for tile files.
+        gt_vector_paths (list[str]): Ground-truth vector paths.
+        val_fraction (float): Fraction of GT tiles for validation.
+        seed (int): RNG seed for split.
+        downsample_factor (int | None): Downsample factor for GT presence checks.
+
+    Returns:
+        tuple[list[str], list[str], list[str]]: Source, validation, holdout tiles.
+
+    Examples:
+        >>> callable(resolve_tile_splits_from_gt)
+        True
+    """
+    if not gt_vector_paths:
+        raise ValueError("EVAL_GT_VECTORS must be set for auto split")
+    if not os.path.isdir(tiles_dir):
+        raise ValueError(f"tiles directory not found: {tiles_dir}")
+    tile_paths = sorted(glob.glob(os.path.join(tiles_dir, tile_glob)))
+    if not tile_paths:
+        raise ValueError(f"no tiles found in {tiles_dir} with {tile_glob}")
+    if downsample_factor is None:
+        downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+
+    gt_tiles = []
+    holdout_tiles = []
+    for tile_path in tile_paths:
+        has_gt = _tile_has_gt(tile_path, gt_vector_paths, downsample_factor)
+        if has_gt:
+            gt_tiles.append(tile_path)
+        else:
+            holdout_tiles.append(tile_path)
+
+    if not gt_tiles:
+        raise ValueError("no tiles overlap GT vectors; cannot build source/val")
+    if len(gt_tiles) == 1:
+        logger.warning(
+            "only one GT tile found; using it for both source and validation"
+        )
+        return gt_tiles, gt_tiles, holdout_tiles
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(gt_tiles))
+    rng.shuffle(indices)
+    val_count = max(1, int(round(len(gt_tiles) * val_fraction)))
+    if val_count >= len(gt_tiles):
+        val_count = len(gt_tiles) - 1
+    val_idx = set(indices[:val_count].tolist())
+    source_tiles = [p for i, p in enumerate(gt_tiles) if i not in val_idx]
+    val_tiles = [p for i, p in enumerate(gt_tiles) if i in val_idx]
+    return source_tiles, val_tiles, holdout_tiles
 
 
 def init_model(model_name: str):

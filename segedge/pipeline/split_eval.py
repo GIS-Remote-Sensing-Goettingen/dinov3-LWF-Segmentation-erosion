@@ -32,7 +32,13 @@ from ..core.xdboost import (
     train_xgb_classifier,
     xgb_score_image_b,
 )
-from .common import build_xgb_training_data, init_model, log_metrics, prep_b_tile
+from .common import (
+    build_xgb_training_data,
+    init_model,
+    log_metrics,
+    prep_b_tile,
+    resolve_tile_splits_from_gt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -529,14 +535,39 @@ def main():
         feature_dir = None
     logger.info("feature cache mode: %s", feature_cache_mode)
 
-    val_b_path = getattr(cfg, "VAL_TILE", None) or cfg.TARGET_TILE
+    auto_split_tiles = getattr(cfg, "AUTO_SPLIT_TILES", False)
     gt_paths = cfg.EVAL_GT_VECTORS
-
-    holdout_b_paths = getattr(cfg, "HOLDOUT_TILES", None)
-    if not holdout_b_paths:
-        raise ValueError("HOLDOUT_TILES must be set for split evaluation.")
-
-    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
+    if auto_split_tiles:
+        tiles_dir = getattr(cfg, "TILES_DIR", "data/tiles")
+        tile_glob = getattr(cfg, "TILE_GLOB", "*.tif")
+        val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
+        seed = int(getattr(cfg, "SPLIT_SEED", 42))
+        downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
+        img_a_paths, val_tiles, holdout_b_paths = resolve_tile_splits_from_gt(
+            tiles_dir,
+            tile_glob,
+            gt_paths,
+            val_fraction,
+            seed,
+            downsample_factor=downsample_factor,
+        )
+        if not val_tiles:
+            raise ValueError("auto split produced no validation tiles")
+        val_b_path = val_tiles[0]
+        if not holdout_b_paths:
+            logger.warning("no holdout tiles resolved; skipping holdout eval")
+        logger.info(
+            "auto split tiles: source=%s val=%s holdout=%s",
+            len(img_a_paths),
+            len(val_tiles),
+            len(holdout_b_paths),
+        )
+    else:
+        val_b_path = getattr(cfg, "VAL_TILE", None) or cfg.TARGET_TILE
+        holdout_b_paths = getattr(cfg, "HOLDOUT_TILES", None)
+        if not holdout_b_paths:
+            raise ValueError("HOLDOUT_TILES must be set for split evaluation.")
+        img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
     lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
     image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)

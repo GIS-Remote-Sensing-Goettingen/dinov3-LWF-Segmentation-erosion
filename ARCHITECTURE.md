@@ -18,4 +18,6 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 
 ## Workflow
 1. Configure paths and hyperparameters in `config.py`.
-2. Run `python main.py` for full pipeline or `python split_eval.py` for split evaluation.
+2. If `AUTO_SPLIT_TILES=True`, tiles are discovered from `TILES_DIR` and split into
+   source/validation using `EVAL_GT_VECTORS`; tiles without GT become holdout.
+3. Run `python main.py` for full pipeline or `python split_eval.py` for split evaluation.

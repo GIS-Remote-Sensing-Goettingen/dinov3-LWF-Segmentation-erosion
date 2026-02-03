@@ -9,6 +9,15 @@
 SOURCE_TILE = "data/tiles/dop20_596000_5974000_1km_20cm.tif"
 TARGET_TILE = "data/dop20_592000_5982000_1km_20cm.tif"
 
+# Tile discovery + auto split (optional)
+TILES_DIR = "data/tiles"
+TILE_GLOB = "*.tif"
+AUTO_SPLIT_TILES = True
+VAL_SPLIT_FRACTION = 0.2
+SPLIT_SEED = 42
+# Downsample factor for GT presence checks (None uses RESAMPLE_FACTOR).
+GT_PRESENCE_DOWNSAMPLE = None
+
 # Label raster used to build banks on SOURCE_* tiles.
 SOURCE_LABEL_RASTER = "data/lables/planet_labels_2022.tif"
 
@@ -21,6 +30,7 @@ EVAL_GT_VECTORS = [
 ]
 
 # Multi-tile inputs (set to None to use SOURCE_TILE).
+# When AUTO_SPLIT_TILES=True, these are overridden by the auto split.
 SOURCE_TILES = [
     "data/tiles/dop20_596000_5974000_1km_20cm.tif",
     "data/tiles/dop20_596000_5975000_1km_20cm.tif",
@@ -30,11 +40,13 @@ SOURCE_TILES = [
 ]
 
 # Validation tiles (first is used for tuning; the rest are evaluated with fixed settings).
+# When AUTO_SPLIT_TILES=True, these are overridden by the auto split.
 VAL_TILES = [
     "data/tiles/dop20_596000_5974000_1km_20cm.tif",
     "data/tiles/dop20_596000_5977000_1km_20cm.tif",
     "data/tiles/dop20_596000_5983000_1km_20cm.tif",
 ]
+# Holdout tiles (used for final inference). Overridden by auto split.
 HOLDOUT_TILES = [
     "data/tiles/dop20_596000_5975000_1km_20cm.tif",
     "data/tiles/dop20_596000_5976000_1km_20cm.tif",
