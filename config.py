@@ -72,7 +72,7 @@ FEATURE_CACHE_MODE = "memory"  # "disk" | "memory"
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-sat493m"
 RESAMPLE_FACTOR = 1  # 3x downsample: 0.2 m/px -> 0.6 m/px
 PATCH_SIZE = 16  # ViT patch size
-TILE_SIZE = 1024
+TILE_SIZE = 2048
 STRIDE = 512
 BUFFER_M = 8.0  # spatial prior buffer (meters)
 
