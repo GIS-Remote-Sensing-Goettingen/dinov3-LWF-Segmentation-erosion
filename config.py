@@ -65,6 +65,8 @@ LOG_PATH = "output/run.log"
 
 # Feature cache mode: "disk" caches tiles to FEATURE_DIR, "memory" reuses per-image in RAM.
 FEATURE_CACHE_MODE = "memory"  # "disk" | "memory"
+# Batch size for feature extraction (1 disables batching).
+FEATURE_BATCH_SIZE = 4
 
 # -----------------------------------------------------------------------------
 # 2) Model + tiling
@@ -74,7 +76,7 @@ RESAMPLE_FACTOR = 1  # 3x downsample: 0.2 m/px -> 0.6 m/px
 PATCH_SIZE = 16  # ViT patch size
 TILE_SIZE = 2048
 STRIDE = 512
-BUFFER_M = 8.0  # spatial prior buffer (meters)
+BUFFER_M = 5.0  # spatial prior buffer (meters)
 
 # Patch labeling for banks.
 POS_FRAC_THRESH = 0.05  # patch is positive if FG fraction >= this

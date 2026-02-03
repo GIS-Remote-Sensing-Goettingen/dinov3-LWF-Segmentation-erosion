@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Added batched feature extraction for single-scale tiles.
+- file touched: `config.py`, `segedge/core/features.py`, `CHANGELOG.md`
+- reason: Improve GPU utilization by processing multiple tiles per forward pass.
+- problems fixed: Reduces overhead from per-tile model calls during prefetch.
+
 - Description: Use cached vector geometry intersection for GT presence checks.
 - file touched: `segedge/pipeline/common.py`, `CHANGELOG.md`
 - reason: Avoid per-tile rasterization during auto split.
