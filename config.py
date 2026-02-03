@@ -62,6 +62,9 @@ OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
+# Rolling union shapefile backups (0 disables backups).
+UNION_BACKUP_EVERY = 10
+UNION_BACKUP_DIR = None
 
 # Feature cache mode: "disk" caches tiles to FEATURE_DIR, "memory" reuses per-image in RAM.
 FEATURE_CACHE_MODE = "memory"  # "disk" | "memory"

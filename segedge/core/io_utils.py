@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 
 import fiona
 import numpy as np
@@ -342,6 +343,86 @@ def export_masks_to_shapefile_union(
                 idx += 1
     time_end("export_masks_to_shapefile_union", t0)
     logger.info("union shapefile written to: %s (features=%s)", out_path, idx)
+
+
+def append_mask_to_union_shapefile(
+    mask: np.ndarray,
+    ref_raster_path: str,
+    out_path: str,
+    start_id: int = 0,
+) -> int:
+    """Append a mask's polygons into a union shapefile.
+
+    Args:
+        mask (np.ndarray): Binary mask.
+        ref_raster_path (str): Reference raster path for CRS/transform.
+        out_path (str): Union shapefile path (created if missing).
+        start_id (int): Starting feature id.
+
+    Returns:
+        int: Next feature id after appending.
+
+    Examples:
+        >>> callable(append_mask_to_union_shapefile)
+        True
+    """
+    mask_uint8 = mask.astype("uint8")
+    if mask_uint8.max() == 0:
+        return start_id
+    t0 = time_start()
+    with rasterio.open(ref_raster_path) as src:
+        transform = src.transform
+        crs = src.crs
+    shape_generator = rfeatures.shapes(
+        mask_uint8, mask=mask_uint8 == 1, transform=transform
+    )
+    schema = {"geometry": "Polygon", "properties": {"id": "int"}}
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    mode = "a" if os.path.exists(out_path) else "w"
+    idx = start_id
+    with fiona.open(
+        out_path,
+        mode=mode,
+        driver="ESRI Shapefile",
+        crs=crs.to_dict() if crs is not None else None,
+        schema=schema,
+    ) as shp:
+        for geom, value in shape_generator:
+            if value != 1:
+                continue
+            shp.write({"geometry": geom, "properties": {"id": int(idx)}})
+            idx += 1
+    time_end("append_mask_to_union_shapefile", t0)
+    logger.info("union shapefile appended: %s (+%s features)", out_path, idx - start_id)
+    return idx
+
+
+def backup_union_shapefile(out_path: str, backup_dir: str, step: int) -> None:
+    """Copy a union shapefile set to a backup directory.
+
+    Args:
+        out_path (str): Union shapefile path.
+        backup_dir (str): Directory for backups.
+        step (int): Step index for naming.
+
+    Examples:
+        >>> callable(backup_union_shapefile)
+        True
+    """
+    if not os.path.exists(out_path):
+        logger.warning("union shapefile missing; skipping backup")
+        return
+    os.makedirs(backup_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(out_path))[0]
+    backup_base = os.path.join(backup_dir, f"{base}_step_{step:05d}")
+    exts = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
+    for ext in exts:
+        src_path = os.path.splitext(out_path)[0] + ext
+        if not os.path.exists(src_path):
+            continue
+        dst_path = backup_base + ext
+        shutil.copy2(src_path, dst_path)
+    logger.info("union shapefile backup written: %s", backup_base + ".shp")
 
 
 def consolidate_features_for_image(

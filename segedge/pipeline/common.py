@@ -14,6 +14,7 @@ import torch
 from pyproj import Transformer
 from rasterio import open as rio_open
 from rasterio.crs import CRS
+from rasterio.warp import transform_bounds
 from shapely.geometry import box, shape
 from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
@@ -258,6 +259,45 @@ def resolve_tile_splits_from_gt(
         raise ValueError(f"no tiles found in {tiles_dir} with {tile_glob}")
     if downsample_factor is None:
         downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+
+    raster_path = getattr(cfg, "SOURCE_LABEL_RASTER", None)
+    filtered_paths = []
+    excluded_by_raster = 0
+    if raster_path:
+        with rio_open(raster_path) as src:
+            raster_crs = src.crs
+            raster_bounds = src.bounds
+        for tile_path in tile_paths:
+            with rio_open(tile_path) as tile_src:
+                tile_bounds = tile_src.bounds
+                tile_crs = tile_src.crs
+            if raster_crs is not None and tile_crs is not None:
+                if tile_crs != raster_crs:
+                    tile_bounds = transform_bounds(
+                        tile_crs, raster_crs, *tile_bounds, densify_pts=21
+                    )
+            tb_left, tb_bottom, tb_right, tb_top = tile_bounds
+            rb_left, rb_bottom, rb_right, rb_top = raster_bounds
+            intersects = not (
+                tb_right <= rb_left
+                or tb_left >= rb_right
+                or tb_top <= rb_bottom
+                or tb_bottom >= rb_top
+            )
+            if intersects:
+                filtered_paths.append(tile_path)
+            else:
+                excluded_by_raster += 1
+    else:
+        filtered_paths = tile_paths
+    if excluded_by_raster:
+        logger.info(
+            "auto split: excluded %s tiles with no SOURCE_LABEL_RASTER overlap",
+            excluded_by_raster,
+        )
+    tile_paths = filtered_paths
+    if not tile_paths:
+        raise ValueError("no tiles overlap SOURCE_LABEL_RASTER")
 
     num_workers = _resolve_gt_workers(num_workers)
     logger.info(

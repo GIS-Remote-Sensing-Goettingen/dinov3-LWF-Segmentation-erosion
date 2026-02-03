@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Write rolling union shapefile updates with periodic backups.
+- file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
+- reason: Keep union shapes updated during inference and protect against partial runs.
+- problems fixed: Avoids waiting for the final merge step to see union outputs.
+
+- Description: Filter auto-split tiles to those overlapping SOURCE_LABEL_RASTER.
+- file touched: `segedge/pipeline/common.py`, `CHANGELOG.md`
+- reason: Skip tiles outside label raster coverage during auto split.
+- problems fixed: Prevents unnecessary GT scans for tiles without label coverage.
+
 - Description: Added batched feature extraction for single-scale tiles.
 - file touched: `config.py`, `segedge/core/features.py`, `CHANGELOG.md`
 - reason: Improve GPU utilization by processing multiple tiles per forward pass.

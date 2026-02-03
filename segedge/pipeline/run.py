@@ -17,10 +17,11 @@ from ..core.banks import build_banks_single_scale
 from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
+    append_mask_to_union_shapefile,
+    backup_union_shapefile,
     build_sh_buffer_mask,
     consolidate_features_for_image,
     export_best_settings,
-    export_masks_to_shapefile_union,
     load_dop20_image,
     rasterize_vector_labels,
     reproject_labels_to_image,
@@ -852,6 +853,27 @@ def main():
     cfg.BEST_SETTINGS_PATH = os.path.join(run_dir, "best_settings.yml")
     cfg.LOG_PATH = os.path.join(run_dir, "run.log")
     setup_logging(getattr(cfg, "LOG_PATH", None))
+    union_path = os.path.join(shape_dir, "pred_mask_best_shadow_merged.shp")
+    union_backup_every = int(getattr(cfg, "UNION_BACKUP_EVERY", 10) or 0)
+    union_backup_dir = getattr(cfg, "UNION_BACKUP_DIR", None) or os.path.join(
+        shape_dir, "backups"
+    )
+    union_feature_id = 0
+    union_tiles_processed = 0
+    logger.info(
+        "rolling union: path=%s backup_every=%s",
+        union_path,
+        union_backup_every,
+    )
+
+    def _append_union(mask, ref_path) -> None:
+        nonlocal union_feature_id, union_tiles_processed
+        union_feature_id = append_mask_to_union_shapefile(
+            mask, ref_path, union_path, start_id=union_feature_id
+        )
+        union_tiles_processed += 1
+        if union_backup_every > 0 and union_tiles_processed % union_backup_every == 0:
+            backup_union_shapefile(union_path, union_backup_dir, union_tiles_processed)
 
     # ------------------------------------------------------------
     # Init DINOv3 model & processor
@@ -1037,11 +1059,10 @@ def main():
     )
     logger.info("phase:end validation_tuning")
 
-    masks_for_union = []
     # Run inference on validation tiles with fixed settings (for plots/metrics)
     logger.info("phase:start validation_inference")
     for val_path in val_tiles:
-        infer_on_holdout(
+        shadow_mask, ref_path = infer_on_holdout(
             val_path,
             gt_vector_paths,
             model,
@@ -1057,6 +1078,7 @@ def main():
             shape_dir,
             context_radius,
         )
+        _append_union(shadow_mask, ref_path)
     logger.info("phase:end validation_inference")
 
     logger.info("phase:start holdout_inference")
@@ -1077,15 +1099,8 @@ def main():
             shape_dir,
             context_radius,
         )
-        masks_for_union.append((shadow_mask, ref_path))
+        _append_union(shadow_mask, ref_path)
     logger.info("phase:end holdout_inference")
-
-    if masks_for_union:
-        logger.info("phase:start union_export")
-        export_masks_to_shapefile_union(
-            masks_for_union, os.path.join(shape_dir, "pred_mask_best_shadow_merged.shp")
-        )
-        logger.info("phase:end union_export")
 
     # ------------------------------------------------------------
     # Consolidate tile-level feature files (.npy) → one per image
