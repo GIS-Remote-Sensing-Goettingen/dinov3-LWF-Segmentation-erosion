@@ -8,8 +8,15 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from itertools import repeat
 
+import fiona
 import numpy as np
 import torch
+from pyproj import Transformer
+from rasterio import open as rio_open
+from rasterio.crs import CRS
+from shapely.geometry import box, shape
+from shapely.ops import transform as shp_transform
+from shapely.strtree import STRtree
 from transformers import AutoImageProcessor, AutoModel
 
 import config as cfg
@@ -25,6 +32,9 @@ from ..core.timing_utils import time_end, time_start
 
 logger = logging.getLogger(__name__)
 
+_GT_INDEX_CACHE: dict[tuple[tuple[str, ...], str], tuple[STRtree | None, list]] = {}
+_GT_CRS_LOGGED: set[str] = set()
+
 
 def _tile_has_gt(
     tile_path: str, gt_vector_paths: list[str], downsample_factor: int
@@ -34,7 +44,7 @@ def _tile_has_gt(
     Args:
         tile_path (str): Tile path to test.
         gt_vector_paths (list[str]): GT vector paths.
-        downsample_factor (int): Downsample factor for rasterization.
+        downsample_factor (int): Downsample factor (unused for intersection).
 
     Returns:
         bool: True if GT positives exist for the tile.
@@ -43,10 +53,97 @@ def _tile_has_gt(
         >>> callable(_tile_has_gt)
         True
     """
-    gt_mask = rasterize_vector_labels(
-        gt_vector_paths, tile_path, downsample_factor=downsample_factor
+    with rio_open(tile_path) as src:
+        tile_crs = src.crs
+        tile_bounds = src.bounds
+    tile_box = box(
+        tile_bounds.left, tile_bounds.bottom, tile_bounds.right, tile_bounds.top
     )
-    return bool(np.any(gt_mask))
+    tree, geoms = _get_gt_index(gt_vector_paths, tile_crs)
+    if tree is None or not geoms:
+        return False
+    hits = tree.query(tile_box)
+    if len(hits) == 0:
+        return False
+    first = hits[0]
+    if isinstance(first, (int, np.integer)):
+        return any(tile_box.intersects(geoms[int(idx)]) for idx in hits)
+    return any(tile_box.intersects(geom) for geom in hits)
+
+
+def _load_gt_geometries(
+    gt_vector_paths: list[str],
+    target_crs,
+) -> list:
+    """Load GT geometries and reproject into target CRS if needed.
+
+    Args:
+        gt_vector_paths (list[str]): GT vector paths.
+        target_crs (CRS | None): Target CRS for reprojection.
+
+    Returns:
+        list: List of shapely geometries.
+
+    Examples:
+        >>> callable(_load_gt_geometries)
+        True
+    """
+    geoms = []
+    target_crs_dict = target_crs.to_dict() if target_crs is not None else None
+    for vp in gt_vector_paths:
+        with fiona.open(vp, "r") as shp:
+            vec_crs = shp.crs
+            if not vec_crs:
+                logger.warning(
+                    "vector CRS missing for %s; assuming EPSG:4326 (WGS84)", vp
+                )
+                vec_crs = CRS.from_epsg(4326).to_dict()
+            transformer = None
+            if target_crs_dict and vec_crs != target_crs_dict:
+                transformer = Transformer.from_crs(
+                    vec_crs, target_crs_dict, always_xy=True
+                )
+            for feat in shp:
+                geom = feat.get("geometry")
+                if not geom:
+                    continue
+                geom_obj = shape(geom)
+                if geom_obj.is_empty:
+                    continue
+                if transformer is not None:
+                    geom_obj = shp_transform(transformer.transform, geom_obj)
+                geoms.append(geom_obj)
+    return geoms
+
+
+def _get_gt_index(
+    gt_vector_paths: list[str],
+    target_crs,
+) -> tuple[STRtree | None, list]:
+    """Return cached STRtree and geometries for the target CRS.
+
+    Args:
+        gt_vector_paths (list[str]): GT vector paths.
+        target_crs (CRS | None): Target CRS for reprojection.
+
+    Returns:
+        tuple[STRtree | None, list]: Spatial index and geometries.
+
+    Examples:
+        >>> callable(_get_gt_index)
+        True
+    """
+    crs_key = target_crs.to_string() if target_crs is not None else "<none>"
+    cache_key = (tuple(gt_vector_paths), crs_key)
+    if cache_key in _GT_INDEX_CACHE:
+        return _GT_INDEX_CACHE[cache_key]
+    if crs_key not in _GT_CRS_LOGGED:
+        logger.info("GT presence CRS key: %s", crs_key)
+        _GT_CRS_LOGGED.add(crs_key)
+    geoms = _load_gt_geometries(gt_vector_paths, target_crs)
+    tree = STRtree(geoms) if geoms else None
+    _GT_INDEX_CACHE[cache_key] = (tree, geoms)
+    return tree, geoms
 
 
 def _resolve_gt_workers(num_workers: int | None) -> int:

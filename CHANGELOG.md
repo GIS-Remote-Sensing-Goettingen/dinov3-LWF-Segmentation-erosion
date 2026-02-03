@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Use cached vector geometry intersection for GT presence checks.
+- file touched: `segedge/pipeline/common.py`, `CHANGELOG.md`
+- reason: Avoid per-tile rasterization during auto split.
+- problems fixed: Eliminates repeated GT reprojection logs and reduces tile scan overhead.
+
 - Description: Parallelized GT presence checks for auto tile splitting.
 - file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
 - reason: Speed up auto split when scanning large tile directories.
