@@ -27,7 +27,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
   8. Median filter champion mask; CRF search around champion.
   9. Continuity bridging (skeleton + shortest path) to close small gaps.
   10. Shadow filtering (RGB weighted dark-pixel removal).
-  11. Export unified plots, rolling union shapefiles (holdout-only), and best-settings YAML.
+  11. Export unified plots, rolling union shapefiles (holdout-only), and inference best-settings YAML.
 - Design choices: zero-shot (no fine-tuning of backbone), aggressive caching, grid-search for self-calibration, post-hoc refinements (CRF, shadow) to clean edges/dark areas.
 - Backbone detail: DINOv3 ViT-L/16 (sat493m pretrain), embedding dim ~1024, patch grid size Hp×Wp where Hp = H/16, Wp = W/16 on each tile.
 
@@ -117,7 +117,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - `segedge/core/knn.py`: kNN scoring, threshold sweep, fine-tune threshold.
 - `segedge/core/metrics_utils.py`: Metrics (IoU/F1/P/R) and batched GPU/CPU threshold eval; oracle upper bound.
 - `segedge/core/crf_utils.py`: DenseCRF refine and grid search.
-- `segedge/core/io_utils.py`: I/O (load images, reproject, rasterize, buffer, shapefile export, feature consolidation, best-settings YAML).
+- `segedge/core/io_utils.py`: I/O (load images, reproject, rasterize, buffer, shapefile export, feature consolidation, best-settings YAML writer).
 - `segedge/core/plotting.py`: Plots for raw/CRF/shadow and GT/kNN/XGB overlays.
 - `segedge/core/shadow_filter.py`: Weighted-sum dark-pixel filtering under mask.
 - `segedge/core/xdboost.py`: Build XGB dataset, train, hyperparam search by IoU on B, score image B.
@@ -179,7 +179,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - Plots to inspect:
    - `*_unified.png`: RGB, GT (if available), kNN/XGB/Champion raw/CRF/shadow, skeleton + endpoints.
 - Shapefiles to consume: rolling unions under `shapes/unions/` (kNN/XGB/Champion × raw/CRF/shadow).
-- Best-settings YAML records champion configs and context (paths, buffer, pixel size, tiling, neg_alpha, pos_frac).
+- `inference_best_setting.yml` records the frozen configs and weighted-mean metrics after validation.
 - Typical run flow in main: build banks → prefetch B → kNN grid → fine-tune → median filter → XGB IoU search → overlays → CRF → shadow → exports.
 - Roads penalty: if configured, kNN/XGB score maps are multiplied by a roads mask penalty before thresholds/CRF.
 - Logs: Main stdout includes timing, kNN evals, XGB search logs, CRF evals; plots show overlays; YAML captures configs.
@@ -246,7 +246,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 
 ## 16) Exports & Schemas
 - Shapefiles: Polygons of predicted FG; schema has a single `id` int field; CRS matches the reference raster of Image B.
-- Best-settings YAML: Captures `best_raw_config`, `best_crf_config`, optional `best_shadow_config`, model name, image paths, buffer_m, pixel_size_m, tiling/patch sizes, neg_alpha, pos_frac, and champion params.
+- Inference best settings: Captures tuned configs, shadow/roads/bridge settings, counts, and weighted metrics for each phase.
 - Feature consolidations: `{image_id}_features_full.npy` are (N_patches × C) arrays; useful for offline analysis or alternate classifiers.
 
 ---

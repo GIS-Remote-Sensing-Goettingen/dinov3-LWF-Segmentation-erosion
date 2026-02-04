@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Write a single inference_best_setting.yml after validation and stop per-tile settings.
+- file touched: `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Freeze holdout settings once and include weighted validation metrics.
+- problems fixed: Removes redundant per-tile settings and captures run-level metrics.
+
 - Description: Point roads mask path to data/roads.
 - file touched: `config.py`, `CHANGELOG.md`
 - reason: Align roads penalty with new data layout.

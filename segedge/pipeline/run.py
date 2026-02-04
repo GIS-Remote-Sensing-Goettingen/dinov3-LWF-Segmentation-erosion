@@ -1018,10 +1018,8 @@ def infer_on_holdout(
     champion_source = tuned["champion_source"]
     if champion_source == "raw":
         champion_score = score_knn
-        best_raw_config = {**tuned["best_raw_config"], **metrics_knn}
     else:
         champion_score = score_xgb
-        best_raw_config = {**tuned["best_xgb_config"], **metrics_xgb}
 
     crf_cfg = tuned["best_crf_config"]
     mask_crf_knn, prob_crf_knn = refine_with_densecrf(
@@ -1056,7 +1054,6 @@ def infer_on_holdout(
         best_crf_mask = mask_crf_knn
     else:
         best_crf_mask = mask_crf_xgb
-    best_crf_config = {**crf_cfg, **compute_metrics(best_crf_mask, gt_mask_eval)}
 
     bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
     bridge_mask = best_crf_mask
@@ -1108,7 +1105,6 @@ def infer_on_holdout(
     metrics_champion_crf = compute_metrics(best_crf_mask, gt_mask_eval)
     metrics_champion_bridge = compute_metrics(bridge_mask, gt_mask_eval)
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
-    shadow_cfg_full = {**shadow_cfg, **shadow_metrics}
 
     skel, endpoints = skeletonize_with_endpoints(bridge_mask)
     metrics_map = {
@@ -1151,44 +1147,13 @@ def infer_on_holdout(
         bridge_enabled=bridge_enabled,
     )
 
-    export_best_settings(
-        best_raw_config,
-        best_crf_config,
-        cfg.MODEL_NAME,
-        getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
-        holdout_path,
-        buffer_m,
-        pixel_size_m,
-        shadow_cfg=shadow_cfg_full,
-        extra_settings={
-            "tile_size": tile_size,
-            "stride": stride,
-            "patch_size": ps,
-            "feat_context_radius": context_radius,
-            "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
-            "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
-            "roads_penalty": roads_penalty,
-            "roads_mask_path": getattr(cfg, "ROADS_MASK_PATH", None),
-            "gap_bridging": bridge_enabled,
-            "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            "bridge_min_component_px": int(
-                getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
-            ),
-            "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
-        },
-        best_settings_path=os.path.join(
-            os.path.dirname(cfg.BEST_SETTINGS_PATH), f"best_settings_{image_id_b}.yml"
-        ),
-    )
-
     champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
     return {
         "ref_path": holdout_path,
         "image_id": image_id_b,
         "gt_available": gt_available,
+        "buffer_m": buffer_m,
+        "pixel_size_m": pixel_size_m,
         "metrics": metrics_map,
         "masks": {
             "knn_raw": mask_knn,
@@ -1501,6 +1466,8 @@ def main():
 
     val_phase_metrics: dict[str, list[dict]] = {}
     holdout_phase_metrics: dict[str, list[dict]] = {}
+    val_buffer_m = None
+    val_pixel_size_m = None
 
     # Run inference on validation tiles with fixed settings (for plots/metrics)
     _log_phase("START", "validation_inference")
@@ -1524,7 +1491,55 @@ def main():
         )
         if result["gt_available"]:
             _update_phase_metrics(val_phase_metrics, result["metrics"])
+        if val_buffer_m is None:
+            val_buffer_m = result["buffer_m"]
+            val_pixel_size_m = result["pixel_size_m"]
     _log_phase("END", "validation_inference")
+
+    weighted_phase_metrics: dict[str, dict[str, float]] = {}
+    metric_keys = ["iou", "f1", "precision", "recall"]
+    for phase, metrics_list in val_phase_metrics.items():
+        weights = [float(m.get("_weight", 0.0)) for m in metrics_list]
+        weighted_phase_metrics[phase] = {
+            key: _weighted_mean([m.get(key, 0.0) for m in metrics_list], weights)
+            for key in metric_keys
+        }
+
+    inference_best_settings_path = os.path.join(run_dir, "inference_best_setting.yml")
+    export_best_settings(
+        tuned["best_raw_config"],
+        tuned["best_crf_config"],
+        cfg.MODEL_NAME,
+        getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
+        f"holdout_tiles={len(holdout_tiles)}",
+        float(val_buffer_m) if val_buffer_m is not None else 0.0,
+        float(val_pixel_size_m) if val_pixel_size_m is not None else 0.0,
+        shadow_cfg=tuned["shadow_cfg"],
+        extra_settings={
+            "tile_size": tile_size,
+            "stride": stride,
+            "patch_size": ps,
+            "feat_context_radius": context_radius,
+            "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
+            "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            "roads_penalty": tuned.get("roads_penalty", 1.0),
+            "roads_mask_path": getattr(cfg, "ROADS_MASK_PATH", None),
+            "gap_bridging": bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)),
+            "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
+            "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
+            "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
+            "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
+            "bridge_min_component_px": int(
+                getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
+            ),
+            "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            "val_tiles_count": len(val_tiles),
+            "holdout_tiles_count": len(holdout_tiles),
+            "weighted_phase_metrics": weighted_phase_metrics,
+        },
+        best_settings_path=inference_best_settings_path,
+    )
+    logger.info("wrote inference best settings: %s", inference_best_settings_path)
 
     _log_phase("START", "holdout_inference")
     holdout_tiles_processed = len(processed_tiles)
