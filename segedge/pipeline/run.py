@@ -55,9 +55,83 @@ CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
 logger = logging.getLogger(__name__)
 
 _CRF_PARALLEL_CONTEXTS: list[dict] | None = None
+_ROADS_MASK_CACHE: dict[tuple[str, int], np.ndarray] = {}
+
+
+def _get_roads_mask(tile_path: str, downsample_factor: int) -> np.ndarray | None:
+    """Load or cache a roads mask rasterized to the tile grid.
+
+    Args:
+        tile_path (str): Tile path.
+        downsample_factor (int): Downsample factor for rasterization.
+
+    Returns:
+        np.ndarray | None: Boolean mask if available.
+
+    Examples:
+        >>> callable(_get_roads_mask)
+        True
+    """
+    roads_path = getattr(cfg, "ROADS_MASK_PATH", None)
+    if not roads_path:
+        return None
+    if not os.path.exists(roads_path):
+        logger.warning("roads mask not found: %s", roads_path)
+        return None
+    key = (tile_path, downsample_factor)
+    if key in _ROADS_MASK_CACHE:
+        return _ROADS_MASK_CACHE[key]
+    mask = rasterize_vector_labels(
+        roads_path, tile_path, downsample_factor=downsample_factor
+    ).astype(bool)
+    _ROADS_MASK_CACHE[key] = mask
+    return mask
+
+
+def _apply_roads_penalty(
+    score_map: np.ndarray,
+    roads_mask: np.ndarray | None,
+    penalty: float,
+) -> np.ndarray:
+    """Apply a multiplicative penalty on road pixels.
+
+    Args:
+        score_map (np.ndarray): Score map.
+        roads_mask (np.ndarray | None): Roads mask.
+        penalty (float): Multiplicative penalty in [0, 1].
+
+    Returns:
+        np.ndarray: Penalized score map.
+
+    Examples:
+        >>> import numpy as np
+        >>> score = np.array([[1.0, 2.0]], dtype=np.float32)
+        >>> mask = np.array([[True, False]])
+        >>> _apply_roads_penalty(score, mask, 0.5).tolist()
+        [[0.5, 2.0]]
+    """
+    if roads_mask is None or penalty >= 1.0:
+        return score_map
+    if roads_mask.shape != score_map.shape:
+        raise ValueError("roads_mask must match score_map shape")
+    penalty_map = np.where(roads_mask, penalty, 1.0).astype(score_map.dtype)
+    return score_map * penalty_map
 
 
 def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    """Compute weighted mean with safe fallback.
+
+    Args:
+        values (list[float]): Values.
+        weights (list[float]): Weights.
+
+    Returns:
+        float: Weighted mean or simple mean if total weight is zero.
+
+    Examples:
+        >>> _weighted_mean([1.0, 3.0], [1.0, 1.0])
+        2.0
+    """
     total_w = float(np.sum(weights))
     if total_w <= 0:
         return float(np.mean(values)) if values else 0.0
@@ -65,6 +139,16 @@ def _weighted_mean(values: list[float], weights: list[float]) -> float:
 
 
 def _log_phase(kind: str, name: str) -> None:
+    """Log a phase marker with ANSI color.
+
+    Args:
+        kind (str): Phase kind.
+        name (str): Phase name.
+
+    Examples:
+        >>> callable(_log_phase)
+        True
+    """
     msg = f"PHASE {kind}: {name}".upper()
     logger.info("\033[31m%s\033[0m", msg)
 
@@ -323,6 +407,7 @@ def tune_on_validation_multi(
         raise ValueError("VAL_TILES is empty.")
 
     val_contexts = []
+    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
     for val_path in val_paths:
         logger.info("tune: preparing validation tile %s", val_path)
         (
@@ -351,6 +436,7 @@ def tune_on_validation_multi(
             feature_dir,
             image_id_b,
         )
+        roads_mask = _get_roads_mask(val_path, ds)
         val_contexts.append(
             {
                 "path": val_path,
@@ -361,98 +447,14 @@ def tune_on_validation_multi(
                 "gt_mask_eval": gt_mask_eval,
                 "sh_buffer_mask": sh_buffer_mask,
                 "gt_weight": gt_weight,
+                "roads_mask": roads_mask,
                 "prefetched_b": prefetched_b,
                 "buffer_m": buffer_m,
                 "pixel_size_m": pixel_size_m,
             }
         )
 
-    # kNN tuning (weighted-mean IoU across val tiles)
-    best_raw_config = None
-    for k in cfg.K_VALUES:
-        stats_by_thr = {
-            thr: {
-                "iou": 0.0,
-                "f1": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "w": 0.0,
-                "n": 0,
-            }
-            for thr in cfg.THRESHOLDS
-        }
-        for ctx in val_contexts:
-            logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
-            score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
-                img_b=ctx["img_b"],
-                pos_bank=pos_bank,
-                neg_bank=neg_bank,
-                model=model,
-                processor=processor,
-                device=device,
-                ps=ps,
-                tile_size=tile_size,
-                stride=stride,
-                k=k,
-                aggregate_layers=None,
-                feature_dir=feature_dir,
-                image_id=ctx["image_id"],
-                neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
-                prefetched_tiles=ctx["prefetched_b"],
-                use_fp16_matmul=USE_FP16_KNN,
-                context_radius=context_radius,
-            )
-            try:
-                metrics_list = compute_metrics_batch_gpu(
-                    score_full,
-                    cfg.THRESHOLDS,
-                    ctx["sh_buffer_mask"],
-                    ctx["gt_mask_eval"],
-                    device=device,
-                )
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                metrics_list = compute_metrics_batch_cpu(
-                    score_full,
-                    cfg.THRESHOLDS,
-                    ctx["sh_buffer_mask"],
-                    ctx["gt_mask_eval"],
-                )
-            weight = float(ctx["gt_weight"])
-            for m in metrics_list:
-                stats = stats_by_thr[m["threshold"]]
-                stats["iou"] += float(m["iou"]) * weight
-                stats["f1"] += float(m["f1"]) * weight
-                stats["precision"] += float(m["precision"]) * weight
-                stats["recall"] += float(m["recall"]) * weight
-                stats["w"] += weight
-                stats["n"] += 1
-
-        for thr, stats in stats_by_thr.items():
-            if stats["w"] > 0:
-                weighted_iou = float(stats["iou"] / stats["w"])
-                weighted_f1 = float(stats["f1"] / stats["w"])
-                weighted_precision = float(stats["precision"] / stats["w"])
-                weighted_recall = float(stats["recall"] / stats["w"])
-            else:
-                weighted_iou = 0.0
-                weighted_f1 = 0.0
-                weighted_precision = 0.0
-                weighted_recall = 0.0
-            if best_raw_config is None or weighted_iou > best_raw_config["iou"]:
-                best_raw_config = {
-                    "k": k,
-                    "threshold": thr,
-                    "source": "raw",
-                    "iou": weighted_iou,
-                    "f1": weighted_f1,
-                    "precision": weighted_precision,
-                    "recall": weighted_recall,
-                }
-    if best_raw_config is None:
-        raise ValueError("kNN tuning returned no results")
-
-    # XGB tuning (weighted-mean IoU across val tiles)
+    # XGB training (shared across road penalties)
     use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
     param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
     num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
@@ -462,8 +464,7 @@ def tune_on_validation_multi(
     if param_grid is None:
         param_grid = [None]
 
-    best_xgb_config = None
-    best_bst = None
+    xgb_candidates = []
     for overrides in param_grid:
         if overrides is None:
             bst = train_xgb_classifier(
@@ -498,87 +499,215 @@ def tune_on_validation_multi(
                 seed=42,
                 context_radius=context_radius,
             )
+        xgb_candidates.append({"bst": bst, "params": params_used})
 
-        stats_by_thr = {
-            thr: {
-                "iou": 0.0,
-                "f1": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "w": 0.0,
-                "n": 0,
+    roads_penalties = [float(p) for p in getattr(cfg, "ROADS_PENALTY_VALUES", [1.0])]
+    best_bundle = None
+    best_champion_iou = None
+
+    for penalty in roads_penalties:
+        logger.info("tune: roads penalty=%s", penalty)
+
+        # kNN tuning (weighted-mean IoU across val tiles)
+        best_raw_config = None
+        for k in cfg.K_VALUES:
+            stats_by_thr = {
+                thr: {
+                    "iou": 0.0,
+                    "f1": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "w": 0.0,
+                    "n": 0,
+                }
+                for thr in cfg.THRESHOLDS
             }
-            for thr in cfg.THRESHOLDS
-        }
-        for ctx in val_contexts:
-            logger.info("tune: XGB scoring on %s", ctx["path"])
-            score_full = xgb_score_image_b(
-                ctx["img_b"],
-                bst,
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                ctx["image_id"],
-                prefetched_tiles=ctx["prefetched_b"],
-                context_radius=context_radius,
-            )
-            try:
-                metrics_list = compute_metrics_batch_gpu(
-                    score_full,
-                    cfg.THRESHOLDS,
-                    ctx["sh_buffer_mask"],
-                    ctx["gt_mask_eval"],
+            for ctx in val_contexts:
+                logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
+                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
+                    img_b=ctx["img_b"],
+                    pos_bank=pos_bank,
+                    neg_bank=neg_bank,
+                    model=model,
+                    processor=processor,
                     device=device,
+                    ps=ps,
+                    tile_size=tile_size,
+                    stride=stride,
+                    k=k,
+                    aggregate_layers=None,
+                    feature_dir=feature_dir,
+                    image_id=ctx["image_id"],
+                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                    prefetched_tiles=ctx["prefetched_b"],
+                    use_fp16_matmul=USE_FP16_KNN,
+                    context_radius=context_radius,
                 )
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                metrics_list = compute_metrics_batch_cpu(
-                    score_full,
-                    cfg.THRESHOLDS,
-                    ctx["sh_buffer_mask"],
-                    ctx["gt_mask_eval"],
+                score_full = _apply_roads_penalty(
+                    score_full, ctx["roads_mask"], penalty
                 )
-            weight = float(ctx["gt_weight"])
-            for m in metrics_list:
-                stats = stats_by_thr[m["threshold"]]
-                stats["iou"] += float(m["iou"]) * weight
-                stats["f1"] += float(m["f1"]) * weight
-                stats["precision"] += float(m["precision"]) * weight
-                stats["recall"] += float(m["recall"]) * weight
-                stats["w"] += weight
-                stats["n"] += 1
+                try:
+                    metrics_list = compute_metrics_batch_gpu(
+                        score_full,
+                        cfg.THRESHOLDS,
+                        ctx["sh_buffer_mask"],
+                        ctx["gt_mask_eval"],
+                        device=device,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    metrics_list = compute_metrics_batch_cpu(
+                        score_full,
+                        cfg.THRESHOLDS,
+                        ctx["sh_buffer_mask"],
+                        ctx["gt_mask_eval"],
+                    )
+                weight = float(ctx["gt_weight"])
+                for m in metrics_list:
+                    stats = stats_by_thr[m["threshold"]]
+                    stats["iou"] += float(m["iou"]) * weight
+                    stats["f1"] += float(m["f1"]) * weight
+                    stats["precision"] += float(m["precision"]) * weight
+                    stats["recall"] += float(m["recall"]) * weight
+                    stats["w"] += weight
+                    stats["n"] += 1
 
-        for thr, stats in stats_by_thr.items():
-            if stats["w"] > 0:
-                weighted_iou = float(stats["iou"] / stats["w"])
-                weighted_f1 = float(stats["f1"] / stats["w"])
-                weighted_precision = float(stats["precision"] / stats["w"])
-                weighted_recall = float(stats["recall"] / stats["w"])
-            else:
-                weighted_iou = 0.0
-                weighted_f1 = 0.0
-                weighted_precision = 0.0
-                weighted_recall = 0.0
-            cand = {
-                "k": -1,
-                "threshold": thr,
-                "source": "xgb",
-                "iou": weighted_iou,
-                "f1": weighted_f1,
-                "precision": weighted_precision,
-                "recall": weighted_recall,
-                "params": params_used,
+            for thr, stats in stats_by_thr.items():
+                if stats["w"] > 0:
+                    weighted_iou = float(stats["iou"] / stats["w"])
+                    weighted_f1 = float(stats["f1"] / stats["w"])
+                    weighted_precision = float(stats["precision"] / stats["w"])
+                    weighted_recall = float(stats["recall"] / stats["w"])
+                else:
+                    weighted_iou = 0.0
+                    weighted_f1 = 0.0
+                    weighted_precision = 0.0
+                    weighted_recall = 0.0
+                if best_raw_config is None or weighted_iou > best_raw_config["iou"]:
+                    best_raw_config = {
+                        "k": k,
+                        "threshold": thr,
+                        "source": "raw",
+                        "iou": weighted_iou,
+                        "f1": weighted_f1,
+                        "precision": weighted_precision,
+                        "recall": weighted_recall,
+                    }
+        if best_raw_config is None:
+            raise ValueError("kNN tuning returned no results")
+
+        # XGB tuning (weighted-mean IoU across val tiles)
+        best_xgb_config = None
+        best_bst = None
+        for candidate in xgb_candidates:
+            bst = candidate["bst"]
+            params_used = candidate["params"]
+            stats_by_thr = {
+                thr: {
+                    "iou": 0.0,
+                    "f1": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "w": 0.0,
+                    "n": 0,
+                }
+                for thr in cfg.THRESHOLDS
             }
-            if best_xgb_config is None or weighted_iou > best_xgb_config["iou"]:
-                best_xgb_config = cand
-                best_bst = bst
-    if best_xgb_config is None or best_bst is None:
-        raise ValueError("XGB tuning returned no results")
+            for ctx in val_contexts:
+                logger.info("tune: XGB scoring on %s", ctx["path"])
+                score_full = xgb_score_image_b(
+                    ctx["img_b"],
+                    bst,
+                    ps,
+                    tile_size,
+                    stride,
+                    feature_dir,
+                    ctx["image_id"],
+                    prefetched_tiles=ctx["prefetched_b"],
+                    context_radius=context_radius,
+                )
+                score_full = _apply_roads_penalty(
+                    score_full, ctx["roads_mask"], penalty
+                )
+                try:
+                    metrics_list = compute_metrics_batch_gpu(
+                        score_full,
+                        cfg.THRESHOLDS,
+                        ctx["sh_buffer_mask"],
+                        ctx["gt_mask_eval"],
+                        device=device,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    metrics_list = compute_metrics_batch_cpu(
+                        score_full,
+                        cfg.THRESHOLDS,
+                        ctx["sh_buffer_mask"],
+                        ctx["gt_mask_eval"],
+                    )
+                weight = float(ctx["gt_weight"])
+                for m in metrics_list:
+                    stats = stats_by_thr[m["threshold"]]
+                    stats["iou"] += float(m["iou"]) * weight
+                    stats["f1"] += float(m["f1"]) * weight
+                    stats["precision"] += float(m["precision"]) * weight
+                    stats["recall"] += float(m["recall"]) * weight
+                    stats["w"] += weight
+                    stats["n"] += 1
 
-    champion_source = (
-        "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
-    )
+            for thr, stats in stats_by_thr.items():
+                if stats["w"] > 0:
+                    weighted_iou = float(stats["iou"] / stats["w"])
+                    weighted_f1 = float(stats["f1"] / stats["w"])
+                    weighted_precision = float(stats["precision"] / stats["w"])
+                    weighted_recall = float(stats["recall"] / stats["w"])
+                else:
+                    weighted_iou = 0.0
+                    weighted_f1 = 0.0
+                    weighted_precision = 0.0
+                    weighted_recall = 0.0
+                cand = {
+                    "k": -1,
+                    "threshold": thr,
+                    "source": "xgb",
+                    "iou": weighted_iou,
+                    "f1": weighted_f1,
+                    "precision": weighted_precision,
+                    "recall": weighted_recall,
+                    "params": params_used,
+                }
+                if best_xgb_config is None or weighted_iou > best_xgb_config["iou"]:
+                    best_xgb_config = cand
+                    best_bst = bst
+        if best_xgb_config is None or best_bst is None:
+            raise ValueError("XGB tuning returned no results")
+
+        champion_source = (
+            "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
+        )
+        champion_iou = (
+            best_raw_config["iou"]
+            if champion_source == "raw"
+            else best_xgb_config["iou"]
+        )
+        if best_champion_iou is None or champion_iou > best_champion_iou:
+            best_champion_iou = champion_iou
+            best_bundle = {
+                "roads_penalty": penalty,
+                "best_raw_config": best_raw_config,
+                "best_xgb_config": best_xgb_config,
+                "best_bst": best_bst,
+                "champion_source": champion_source,
+            }
+
+    if best_bundle is None:
+        raise ValueError("roads penalty tuning returned no results")
+
+    roads_penalty = best_bundle["roads_penalty"]
+    best_raw_config = best_bundle["best_raw_config"]
+    best_xgb_config = best_bundle["best_xgb_config"]
+    best_bst = best_bundle["best_bst"]
+    champion_source = best_bundle["champion_source"]
 
     thr_center = (
         best_raw_config["threshold"]
@@ -618,6 +747,9 @@ def tune_on_validation_multi(
                 prefetched_tiles=ctx["prefetched_b"],
                 context_radius=context_radius,
             )
+        score_full = _apply_roads_penalty(
+            score_full, ctx["roads_mask"], float(roads_penalty)
+        )
         ctx["score_full"] = score_full
         ctx["thr_center"] = thr_center
 
@@ -751,6 +883,7 @@ def tune_on_validation_multi(
     if best_shadow_cfg is None:
         raise ValueError("shadow tuning returned no results")
 
+    logger.info("tune: roads penalty selected=%s", roads_penalty)
     return {
         "bst": best_bst,
         "best_raw_config": best_raw_config,
@@ -758,6 +891,7 @@ def tune_on_validation_multi(
         "champion_source": champion_source,
         "best_crf_config": {**best_crf_cfg, "k": best_raw_config["k"]},
         "shadow_cfg": best_shadow_cfg,
+        "roads_penalty": float(roads_penalty),
     }
 
 
@@ -819,6 +953,9 @@ def infer_on_holdout(
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
     gt_weight = float(gt_mask_eval.sum())
+    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    roads_mask = _get_roads_mask(holdout_path, ds)
+    roads_penalty = float(tuned.get("roads_penalty", 1.0))
 
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
     prefetched_b = prefetch_features_single_scale_image(
@@ -855,6 +992,7 @@ def infer_on_holdout(
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
     )
+    score_knn = _apply_roads_penalty(score_knn, roads_mask, roads_penalty)
     mask_knn = (score_knn >= knn_thr) & sh_buffer_mask
     mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
     metrics_knn = compute_metrics(mask_knn, gt_mask_eval)
@@ -872,6 +1010,7 @@ def infer_on_holdout(
         prefetched_tiles=prefetched_b,
         context_radius=context_radius,
     )
+    score_xgb = _apply_roads_penalty(score_xgb, roads_mask, roads_penalty)
     mask_xgb = (score_xgb >= xgb_thr) & sh_buffer_mask
     mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
     metrics_xgb = compute_metrics(mask_xgb, gt_mask_eval)
@@ -1028,6 +1167,8 @@ def infer_on_holdout(
             "feat_context_radius": context_radius,
             "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            "roads_penalty": roads_penalty,
+            "roads_mask_path": getattr(cfg, "ROADS_MASK_PATH", None),
             "gap_bridging": bridge_enabled,
             "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
             "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),

@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add tunable roads mask penalty for kNN/XGB score maps.
+- file touched: `config.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Downweight predictions on roads with a validated multiplier.
+- problems fixed: Allows road suppression without hard masking.
+
 - Description: Switch tuning to weighted-mean IoU and add red phase markers.
 - file touched: `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
 - reason: Ensure configs are chosen by GT-weighted validation performance and make phases easy to spot.
