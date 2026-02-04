@@ -16,6 +16,7 @@ from skimage.transform import resize
 import config as cfg
 
 from ..core.banks import build_banks_single_scale
+from ..core.continuity import bridge_skeleton_gaps, skeletonize_with_endpoints
 from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
@@ -37,7 +38,7 @@ from ..core.metrics_utils import (
     compute_metrics_batch_gpu,
     compute_oracle_upper_bound,
 )
-from ..core.plotting import save_best_model_plot, save_knn_xgb_gt_plot, save_plot
+from ..core.plotting import save_unified_plot
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import (
     build_xgb_dataset,
@@ -54,6 +55,72 @@ CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
 logger = logging.getLogger(__name__)
 
 _CRF_PARALLEL_CONTEXTS: list[dict] | None = None
+
+
+def _update_phase_metrics(acc: dict[str, list[dict]], metrics_map: dict) -> None:
+    for key, metrics in metrics_map.items():
+        acc.setdefault(key, []).append(metrics)
+
+
+def _summarize_phase_metrics(
+    acc: dict[str, list[dict]], label: str, bridge_enabled: bool
+) -> None:
+    if not acc:
+        logger.info("summary %s: no metrics", label)
+        return
+    metric_keys = ["iou", "f1", "precision", "recall"]
+    phase_order = [
+        "knn_raw",
+        "knn_crf",
+        "knn_shadow",
+        "xgb_raw",
+        "xgb_crf",
+        "xgb_shadow",
+        "champion_raw",
+        "champion_crf",
+    ]
+    if bridge_enabled:
+        phase_order.append("champion_bridge")
+    phase_order.append("champion_shadow")
+
+    logger.info("summary %s: phase metrics", label)
+    for phase in phase_order:
+        if phase not in acc or not acc[phase]:
+            continue
+        vals = {k: [m.get(k, 0.0) for m in acc[phase]] for k in metric_keys}
+        mean_vals = {k: float(np.mean(v)) for k, v in vals.items()}
+        med_vals = {k: float(np.median(v)) for k, v in vals.items()}
+        logger.info(
+            "summary %s %s mean IoU=%.3f F1=%.3f P=%.3f R=%.3f | median IoU=%.3f F1=%.3f",
+            label,
+            phase,
+            mean_vals["iou"],
+            mean_vals["f1"],
+            mean_vals["precision"],
+            mean_vals["recall"],
+            med_vals["iou"],
+            med_vals["f1"],
+        )
+
+    champ_chain = ["champion_raw", "champion_crf"]
+    if bridge_enabled:
+        champ_chain.append("champion_bridge")
+    champ_chain.append("champion_shadow")
+    for prev, curr in zip(champ_chain, champ_chain[1:], strict=True):
+        if prev not in acc or curr not in acc:
+            continue
+        prev_iou = np.mean([m.get("iou", 0.0) for m in acc[prev]])
+        curr_iou = np.mean([m.get("iou", 0.0) for m in acc[curr]])
+        prev_f1 = np.mean([m.get("f1", 0.0) for m in acc[prev]])
+        curr_f1 = np.mean([m.get("f1", 0.0) for m in acc[curr]])
+        logger.info(
+            "summary %s delta %s→%s IoU=%.3f F1=%.3f",
+            label,
+            prev,
+            curr,
+            float(curr_iou - prev_iou),
+            float(curr_f1 - prev_f1),
+        )
 
 
 def _init_crf_parallel(contexts: list[dict]) -> None:
@@ -628,6 +695,7 @@ def infer_on_holdout(
     feature_dir: str | None,
     shape_dir: str,
     context_radius: int,
+    plot_with_metrics: bool = True,
 ):
     """Run inference on a holdout tile using tuned settings.
 
@@ -646,9 +714,10 @@ def infer_on_holdout(
         feature_dir (str | None): Feature cache directory.
         shape_dir (str): Output shapefile directory.
         context_radius (int): Feature context radius.
+        plot_with_metrics (bool): Whether to show metrics on plots.
 
     Returns:
-        tuple[np.ndarray, str]: Shadow mask and reference path.
+        dict: Masks, metrics, and metadata for the tile.
 
     Examples:
         >>> callable(infer_on_holdout)
@@ -664,6 +733,7 @@ def infer_on_holdout(
         buffer_m,
         pixel_size_m,
     ) = load_b_tile_context(holdout_path, gt_vector_paths)
+    gt_available = gt_mask_eval is not None
     if gt_mask_eval is None:
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
@@ -727,15 +797,13 @@ def infer_on_holdout(
     champion_source = tuned["champion_source"]
     if champion_source == "raw":
         champion_score = score_knn
-        thr_center_for_crf = knn_thr
         best_raw_config = {**tuned["best_raw_config"], **metrics_knn}
     else:
         champion_score = score_xgb
-        thr_center_for_crf = xgb_thr
         best_raw_config = {**tuned["best_xgb_config"], **metrics_xgb}
 
     crf_cfg = tuned["best_crf_config"]
-    mask_crf_knn = refine_with_densecrf(
+    mask_crf_knn, prob_crf_knn = refine_with_densecrf(
         img_b,
         score_knn,
         knn_thr,
@@ -747,8 +815,9 @@ def infer_on_holdout(
         bilateral_w=crf_cfg["bilateral_w"],
         bilateral_xy_std=crf_cfg["bilateral_xy_std"],
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+        return_prob=True,
     )
-    mask_crf_xgb = refine_with_densecrf(
+    mask_crf_xgb, prob_crf_xgb = refine_with_densecrf(
         img_b,
         score_xgb,
         xgb_thr,
@@ -760,6 +829,7 @@ def infer_on_holdout(
         bilateral_w=crf_cfg["bilateral_w"],
         bilateral_xy_std=crf_cfg["bilateral_xy_std"],
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+        return_prob=True,
     )
     if champion_source == "raw":
         best_crf_mask = mask_crf_knn
@@ -767,11 +837,26 @@ def infer_on_holdout(
         best_crf_mask = mask_crf_xgb
     best_crf_config = {**crf_cfg, **compute_metrics(best_crf_mask, gt_mask_eval)}
 
+    bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
+    bridge_mask = best_crf_mask
+    if bridge_enabled:
+        prob_crf = prob_crf_knn if champion_source == "raw" else prob_crf_xgb
+        bridge_mask = bridge_skeleton_gaps(
+            best_crf_mask,
+            prob_crf,
+            max_gap_px=int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
+            max_pairs_per_endpoint=int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
+            max_avg_cost=float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
+            bridge_width_px=int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
+            min_component_area_px=int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
+            spur_prune_iters=int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+        )
+
     shadow_cfg = tuned["shadow_cfg"]
     protect_score = shadow_cfg.get("protect_score")
     shadow_mask = _apply_shadow_filter(
         img_b,
-        best_crf_mask,
+        bridge_mask,
         shadow_cfg["weights"],
         shadow_cfg["threshold"],
         champion_score,
@@ -793,41 +878,53 @@ def infer_on_holdout(
         score_xgb,
         protect_score,
     )
+    metrics_knn_crf = compute_metrics(mask_crf_knn, gt_mask_eval)
+    metrics_knn_shadow = compute_metrics(shadow_mask_knn, gt_mask_eval)
+    metrics_xgb_crf = compute_metrics(mask_crf_xgb, gt_mask_eval)
+    metrics_xgb_shadow = compute_metrics(shadow_mask_xgb, gt_mask_eval)
+    champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
+    metrics_champion_raw = compute_metrics(champ_raw_mask, gt_mask_eval)
+    metrics_champion_crf = compute_metrics(best_crf_mask, gt_mask_eval)
+    metrics_champion_bridge = compute_metrics(bridge_mask, gt_mask_eval)
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
     shadow_cfg_full = {**shadow_cfg, **shadow_metrics}
 
-    save_knn_xgb_gt_plot(
+    skel, endpoints = skeletonize_with_endpoints(bridge_mask)
+    metrics_map = {
+        "knn_raw": metrics_knn,
+        "knn_crf": metrics_knn_crf,
+        "knn_shadow": metrics_knn_shadow,
+        "xgb_raw": metrics_xgb,
+        "xgb_crf": metrics_xgb_crf,
+        "xgb_shadow": metrics_xgb_shadow,
+        "champion_raw": metrics_champion_raw,
+        "champion_crf": metrics_champion_crf,
+        "champion_bridge": metrics_champion_bridge,
+        "champion_shadow": shadow_metrics,
+    }
+    masks_map = {
+        "knn_raw": mask_knn,
+        "knn_crf": mask_crf_knn,
+        "knn_shadow": shadow_mask_knn,
+        "xgb_raw": mask_xgb,
+        "xgb_crf": mask_crf_xgb,
+        "xgb_shadow": shadow_mask_xgb,
+        "champion_raw": champ_raw_mask,
+        "champion_crf": best_crf_mask,
+        "champion_bridge": bridge_mask,
+        "champion_shadow": shadow_mask,
+    }
+    save_unified_plot(
         img_b,
         gt_mask_eval,
-        mask_knn,
-        mask_xgb,
+        masks_map,
+        metrics_map,
         cfg.PLOT_DIR,
         image_id_b,
-        title_knn=f"kNN IoU={metrics_knn['iou']:.3f}",
-        title_xgb=f"XGB IoU={metrics_xgb['iou']:.3f}",
-        filename_suffix="knn_vs_xgb.png",
-    )
-    save_best_model_plot(
-        img_b,
-        gt_mask_eval,
-        mask_knn if champion_source == "raw" else mask_xgb,
-        title=f"Champion ({champion_source}) IoU={best_raw_config['iou']:.3f}",
-        plot_dir=cfg.PLOT_DIR,
-        image_id_b=image_id_b,
-        filename_suffix="champion_pre_crf.png",
-    )
-    save_plot(
-        img_b,
-        gt_mask_eval,
-        mask_knn if champion_source == "raw" else mask_xgb,
-        best_raw_config,
-        best_crf_mask,
-        best_crf_config,
-        thr_center_for_crf,
-        cfg.PLOT_DIR,
-        image_id_b,
-        best_shadow={"cfg": shadow_cfg_full, "mask": shadow_mask},
-        labels_sh=labels_sh,
+        show_metrics=plot_with_metrics and gt_available,
+        skeleton=skel,
+        endpoints=endpoints,
+        bridge_enabled=bridge_enabled,
     )
 
     export_best_settings(
@@ -846,6 +943,15 @@ def infer_on_holdout(
             "feat_context_radius": context_radius,
             "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            "gap_bridging": bridge_enabled,
+            "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
+            "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
+            "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
+            "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
+            "bridge_min_component_px": int(
+                getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
+            ),
+            "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
         },
         best_settings_path=os.path.join(
             os.path.dirname(cfg.BEST_SETTINGS_PATH), f"best_settings_{image_id_b}.yml"
@@ -856,6 +962,8 @@ def infer_on_holdout(
     return {
         "ref_path": holdout_path,
         "image_id": image_id_b,
+        "gt_available": gt_available,
+        "metrics": metrics_map,
         "masks": {
             "knn_raw": mask_knn,
             "knn_crf": mask_crf_knn,
@@ -865,6 +973,7 @@ def infer_on_holdout(
             "xgb_shadow": shadow_mask_xgb,
             "champion_raw": champ_raw_mask,
             "champion_crf": best_crf_mask,
+            "champion_bridge": bridge_mask,
             "champion_shadow": shadow_mask,
         },
     }
@@ -1164,10 +1273,13 @@ def main():
     )
     logger.info("phase:end validation_tuning")
 
+    val_phase_metrics: dict[str, list[dict]] = {}
+    holdout_phase_metrics: dict[str, list[dict]] = {}
+
     # Run inference on validation tiles with fixed settings (for plots/metrics)
     logger.info("phase:start validation_inference")
     for val_path in val_tiles:
-        infer_on_holdout(
+        result = infer_on_holdout(
             val_path,
             gt_vector_paths,
             model,
@@ -1182,7 +1294,10 @@ def main():
             feature_dir,
             shape_dir,
             context_radius,
+            plot_with_metrics=True,
         )
+        if result["gt_available"]:
+            _update_phase_metrics(val_phase_metrics, result["metrics"])
     logger.info("phase:end validation_inference")
 
     logger.info("phase:start holdout_inference")
@@ -1206,7 +1321,10 @@ def main():
             feature_dir,
             shape_dir,
             context_radius,
+            plot_with_metrics=False,
         )
+        if result["gt_available"]:
+            _update_phase_metrics(holdout_phase_metrics, result["metrics"])
         holdout_tiles_processed += 1
         ref_path = result["ref_path"]
         masks = result["masks"]
@@ -1229,6 +1347,10 @@ def main():
         with open(processed_log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
     logger.info("phase:end holdout_inference")
+
+    bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
+    _summarize_phase_metrics(val_phase_metrics, "validation", bridge_enabled)
+    _summarize_phase_metrics(holdout_phase_metrics, "holdout", bridge_enabled)
 
     # ------------------------------------------------------------
     # Consolidate tile-level feature files (.npy) → one per image

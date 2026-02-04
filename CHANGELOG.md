@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Add continuity bridging, unified plots, and phase summaries for kNN/XGB/Champion.
+- file touched: `config.py`, `segedge/core/continuity.py`, `segedge/core/crf_utils.py`, `segedge/core/plotting.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Improve topological continuity and make phase-by-phase gains visible.
+- problems fixed: Reduces broken segments and consolidates diagnostic plots.
+
+- Description: Document rolling unions, resume, and auto split updates in KB.
+- file touched: `KB.md`, `CHANGELOG.md`
+- reason: Keep docs aligned with current pipeline behavior and outputs.
+- problems fixed: Prevents outdated output paths and config guidance.
+
 - Description: Add holdout-only rolling unions for kNN/XGB/Champion streams with resume logging.
 - file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
 - reason: Track per-stream unions during holdout inference and resume safely after interruptions.

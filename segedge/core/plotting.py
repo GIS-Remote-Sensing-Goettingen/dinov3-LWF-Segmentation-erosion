@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import matplotlib.pyplot as plt
@@ -218,3 +219,115 @@ def save_knn_xgb_gt_plot(
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved kNN/XGB/GT overlay to %s", plot_path)
+
+
+def save_unified_plot(
+    img_b,
+    gt_mask,
+    masks: dict,
+    metrics: dict,
+    plot_dir,
+    image_id_b,
+    show_metrics: bool,
+    skeleton=None,
+    endpoints=None,
+    bridge_enabled: bool = False,
+):
+    """Save a unified multi-panel plot for all phases.
+
+    Args:
+        img_b (np.ndarray): Image B RGB array.
+        gt_mask (np.ndarray): Ground-truth mask.
+        masks (dict): Mask dict keyed by phase.
+        metrics (dict): Metrics dict keyed by phase.
+        plot_dir (str): Output directory.
+        image_id_b (str): Image identifier.
+        show_metrics (bool): Whether to include metrics in titles.
+        skeleton (np.ndarray | None): Optional skeleton mask.
+        endpoints (np.ndarray | None): Optional endpoint coordinates.
+        bridge_enabled (bool): Whether bridge mask is present.
+
+    Examples:
+        >>> callable(save_unified_plot)
+        True
+    """
+
+    def _title(base: str, key: str | None = None) -> str:
+        if not show_metrics or key is None or key not in metrics:
+            return base
+        m = metrics[key]
+        return f"{base} IoU={m['iou']:.3f}, F1={m['f1']:.3f}"
+
+    panels = []
+    panels.append(("RGB", img_b, None))
+    panels.append(("GT" if show_metrics else "GT (missing)", gt_mask > 0, "gray"))
+
+    phase_order = [
+        ("knn_raw", "kNN raw"),
+        ("knn_crf", "kNN CRF"),
+        ("knn_shadow", "kNN shadow"),
+        ("xgb_raw", "XGB raw"),
+        ("xgb_crf", "XGB CRF"),
+        ("xgb_shadow", "XGB shadow"),
+        ("champion_raw", "Champion raw"),
+        ("champion_crf", "Champion CRF"),
+    ]
+    if bridge_enabled:
+        phase_order.append(("champion_bridge", "Champion bridge"))
+    phase_order.append(("champion_shadow", "Champion shadow"))
+
+    for key, label in phase_order:
+        if key not in masks:
+            continue
+        overlay = img_b.copy()
+        overlay[masks[key].astype(bool)] = (
+            0.5 * overlay[masks[key].astype(bool)] + 0.5 * np.array([255, 0, 0])
+        ).astype(overlay.dtype)
+        panels.append((_title(label, key), overlay, None))
+
+    if skeleton is not None:
+        overlay_skel = img_b.copy()
+        overlay_skel[skeleton.astype(bool)] = (
+            0.5 * overlay_skel[skeleton.astype(bool)] + 0.5 * np.array([0, 255, 255])
+        ).astype(overlay_skel.dtype)
+        panels.append(("Skeleton + endpoints", overlay_skel, None))
+
+    cols = 3
+    rows = int(math.ceil(len(panels) / cols))
+    fig, axs = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows))
+    axs = np.array(axs).reshape(rows, cols)
+
+    for idx, (title, img, cmap) in enumerate(panels):
+        r = idx // cols
+        c = idx % cols
+        if cmap is None:
+            axs[r, c].imshow(img)
+        else:
+            axs[r, c].imshow(img, cmap=cmap)
+        axs[r, c].set_title(title)
+        axs[r, c].axis("off")
+        if (
+            skeleton is not None
+            and title == "Skeleton + endpoints"
+            and endpoints is not None
+        ):
+            if len(endpoints) > 0:
+                axs[r, c].scatter(
+                    endpoints[:, 1],
+                    endpoints[:, 0],
+                    s=12,
+                    c="red",
+                    marker="o",
+                )
+
+    for idx in range(len(panels), rows * cols):
+        r = idx // cols
+        c = idx % cols
+        axs[r, c].axis("off")
+
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{image_id_b}_unified.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot saved unified to %s", plot_path)

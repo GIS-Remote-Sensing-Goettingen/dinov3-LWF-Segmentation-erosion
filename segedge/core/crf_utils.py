@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
+from typing import Any, Literal, overload
 
 import numpy as np
 from skimage.transform import resize
 
+from .metrics_utils import compute_metrics
+from .timing_utils import time_end, time_start
+
 try:
-    from pydensecrf import densecrf as dcrf
-    from pydensecrf.utils import unary_from_softmax
+    from pydensecrf import densecrf as dcrf  # type: ignore[import-not-found]
+    from pydensecrf.utils import unary_from_softmax  # type: ignore[import-not-found]
 
     _HAS_DCRF = True
 except ImportError:  # pragma: no cover - optional dependency
@@ -17,8 +21,44 @@ except ImportError:  # pragma: no cover - optional dependency
     unary_from_softmax = None
     _HAS_DCRF = False
 
-from .metrics_utils import compute_metrics
-from .timing_utils import time_end, time_start
+dcrf_any: Any = dcrf
+unary_from_softmax_any: Any = unary_from_softmax
+
+
+@overload
+def refine_with_densecrf(
+    img_rgb: np.ndarray,
+    score_map: np.ndarray,
+    threshold_center: float,
+    sh_mask: np.ndarray | None = None,
+    prob_softness: float = 0.05,
+    n_iters: int = 5,
+    pos_w: float = 3.0,
+    pos_xy_std: float = 3.0,
+    bilateral_w: float = 5.0,
+    bilateral_xy_std: float = 50.0,
+    bilateral_rgb_std: float = 5.0,
+    *,
+    return_prob: Literal[False] = False,
+) -> np.ndarray: ...
+
+
+@overload
+def refine_with_densecrf(
+    img_rgb: np.ndarray,
+    score_map: np.ndarray,
+    threshold_center: float,
+    sh_mask: np.ndarray | None = None,
+    prob_softness: float = 0.05,
+    n_iters: int = 5,
+    pos_w: float = 3.0,
+    pos_xy_std: float = 3.0,
+    bilateral_w: float = 5.0,
+    bilateral_xy_std: float = 50.0,
+    bilateral_rgb_std: float = 5.0,
+    *,
+    return_prob: Literal[True],
+) -> tuple[np.ndarray, np.ndarray]: ...
 
 
 def refine_with_densecrf(
@@ -33,7 +73,9 @@ def refine_with_densecrf(
     bilateral_w: float = 5.0,
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
-) -> np.ndarray:
+    *,
+    return_prob: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Run DenseCRF with a logistic unary centered at threshold_center.
 
     Args:
@@ -50,7 +92,8 @@ def refine_with_densecrf(
         bilateral_rgb_std (float): Bilateral color std.
 
     Returns:
-        np.ndarray: Refined boolean mask.
+        np.ndarray | tuple[np.ndarray, np.ndarray]: Refined mask, and optionally
+        the CRF foreground probability map when return_prob=True.
 
     Examples:
         >>> callable(refine_with_densecrf)
@@ -72,14 +115,14 @@ def refine_with_densecrf(
     p_bg = 1.0 - p_fg
     probs = np.stack([p_bg, p_fg], axis=0)
 
-    d = dcrf.DenseCRF2D(w, h, 2)
-    unary = unary_from_softmax(probs)
+    d = dcrf_any.DenseCRF2D(w, h, 2)
+    unary = unary_from_softmax_any(probs)
     d.setUnaryEnergy(unary)
     d.addPairwiseGaussian(
         sxy=(pos_xy_std, pos_xy_std),
         compat=pos_w,
-        kernel=dcrf.DIAG_KERNEL,
-        normalization=dcrf.NORMALIZE_SYMMETRIC,
+        kernel=dcrf_any.DIAG_KERNEL,
+        normalization=dcrf_any.NORMALIZE_SYMMETRIC,
     )
     img_rgb_u8 = img_rgb.astype(np.uint8) if img_rgb.dtype != np.uint8 else img_rgb
     if not img_rgb_u8.flags["C_CONTIGUOUS"]:
@@ -89,16 +132,20 @@ def refine_with_densecrf(
         srgb=(bilateral_rgb_std, bilateral_rgb_std, bilateral_rgb_std),
         rgbim=img_rgb_u8,
         compat=bilateral_w,
-        kernel=dcrf.DIAG_KERNEL,
-        normalization=dcrf.NORMALIZE_SYMMETRIC,
+        kernel=dcrf_any.DIAG_KERNEL,
+        normalization=dcrf_any.NORMALIZE_SYMMETRIC,
     )
     Q = d.inference(n_iters)
     Q = np.array(Q).reshape(2, h, w)
+    p_fg_crf = Q[1].astype(np.float32)
     labels = np.argmax(Q, axis=0).astype(np.uint8)
     refined_mask = labels == 1
     if sh_mask is not None:
         refined_mask = np.logical_and(refined_mask, sh_mask)
+        p_fg_crf[~sh_mask] = eps
     time_end("refine_with_densecrf", t0)
+    if return_prob:
+        return refined_mask, p_fg_crf
     return refined_mask
 
 
