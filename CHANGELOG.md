@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Point roads mask path to data/roads.
+- file touched: `config.py`, `CHANGELOG.md`
+- reason: Align roads penalty with new data layout.
+- problems fixed: Prevents missing roads mask after folder move.
+
 - Description: Add tunable roads mask penalty for kNN/XGB score maps.
 - file touched: `config.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
 - reason: Downweight predictions on roads with a validated multiplier.

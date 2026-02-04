@@ -142,7 +142,7 @@ SHADOW_THRESHOLDS = [
 SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
 
 # Roads mask penalty (multiplicative) for kNN/XGB scores
-ROADS_MASK_PATH = "roads/osm_out/roads_mask.shp"
+ROADS_MASK_PATH = "data/roads/roads_mask.shp"
 ROADS_PENALTY_VALUES = [1.0, 0.98, 0.95, 0.9, 0.85]
 
 # Continuity bridging (post-CRF, pre-shadow)
