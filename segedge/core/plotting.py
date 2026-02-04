@@ -315,7 +315,7 @@ def save_unified_plot(
                 axs[r, c].scatter(
                     endpoints[:, 1],
                     endpoints[:, 0],
-                    s=12,
+                    s=3,
                     c="red",
                     marker="o",
                 )
