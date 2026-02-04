@@ -57,6 +57,18 @@ logger = logging.getLogger(__name__)
 _CRF_PARALLEL_CONTEXTS: list[dict] | None = None
 
 
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    total_w = float(np.sum(weights))
+    if total_w <= 0:
+        return float(np.mean(values)) if values else 0.0
+    return float(np.sum(np.array(values) * np.array(weights)) / total_w)
+
+
+def _log_phase(kind: str, name: str) -> None:
+    msg = f"PHASE {kind}: {name}".upper()
+    logger.info("\033[31m%s\033[0m", msg)
+
+
 def _update_phase_metrics(acc: dict[str, list[dict]], metrics_map: dict) -> None:
     for key, metrics in metrics_map.items():
         acc.setdefault(key, []).append(metrics)
@@ -87,11 +99,12 @@ def _summarize_phase_metrics(
     for phase in phase_order:
         if phase not in acc or not acc[phase]:
             continue
+        weights = [float(m.get("_weight", 0.0)) for m in acc[phase]]
         vals = {k: [m.get(k, 0.0) for m in acc[phase]] for k in metric_keys}
-        mean_vals = {k: float(np.mean(v)) for k, v in vals.items()}
+        mean_vals = {k: _weighted_mean(v, weights) for k, v in vals.items()}
         med_vals = {k: float(np.median(v)) for k, v in vals.items()}
         logger.info(
-            "summary %s %s mean IoU=%.3f F1=%.3f P=%.3f R=%.3f | median IoU=%.3f F1=%.3f",
+            "summary %s %s wmean IoU=%.3f F1=%.3f P=%.3f R=%.3f | median IoU=%.3f F1=%.3f",
             label,
             phase,
             mean_vals["iou"],
@@ -109,10 +122,12 @@ def _summarize_phase_metrics(
     for prev, curr in zip(champ_chain, champ_chain[1:], strict=True):
         if prev not in acc or curr not in acc:
             continue
-        prev_iou = np.mean([m.get("iou", 0.0) for m in acc[prev]])
-        curr_iou = np.mean([m.get("iou", 0.0) for m in acc[curr]])
-        prev_f1 = np.mean([m.get("f1", 0.0) for m in acc[prev]])
-        curr_f1 = np.mean([m.get("f1", 0.0) for m in acc[curr]])
+        prev_weights = [float(m.get("_weight", 0.0)) for m in acc[prev]]
+        curr_weights = [float(m.get("_weight", 0.0)) for m in acc[curr]]
+        prev_iou = _weighted_mean([m.get("iou", 0.0) for m in acc[prev]], prev_weights)
+        curr_iou = _weighted_mean([m.get("iou", 0.0) for m in acc[curr]], curr_weights)
+        prev_f1 = _weighted_mean([m.get("f1", 0.0) for m in acc[prev]], prev_weights)
+        curr_f1 = _weighted_mean([m.get("f1", 0.0) for m in acc[curr]], curr_weights)
         logger.info(
             "summary %s delta %s→%s IoU=%.3f F1=%.3f",
             label,
@@ -133,6 +148,7 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
         raise RuntimeError("CRF contexts not initialized")
     prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
     ious = []
+    weights = []
     for ctx in _CRF_PARALLEL_CONTEXTS:
         mask_crf_local = refine_with_densecrf(
             ctx["img_b"],
@@ -148,7 +164,8 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
             bilateral_rgb_std=bi_rgb,
         )
         ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
-    return float(np.median(ious)), cfg
+        weights.append(float(ctx["gt_weight"]))
+    return _weighted_mean(ious, weights), cfg
 
 
 def _apply_shadow_filter(
@@ -277,7 +294,7 @@ def tune_on_validation_multi(
     feature_dir: str | None,
     context_radius: int,
 ):
-    """Tune hyperparameters using median IoU across validation tiles.
+    """Tune hyperparameters using weighted-mean IoU across validation tiles.
 
     Args:
         val_paths (list[str]): Validation tile paths.
@@ -320,6 +337,7 @@ def tune_on_validation_multi(
         if gt_mask_eval is None:
             raise ValueError("Validation requires GT vectors for metric-based tuning.")
         _ = compute_oracle_upper_bound(gt_mask_eval, sh_buffer_mask)
+        gt_weight = float(gt_mask_eval.sum())
         image_id_b = os.path.splitext(os.path.basename(val_path))[0]
         prefetched_b = prefetch_features_single_scale_image(
             img_b,
@@ -342,16 +360,27 @@ def tune_on_validation_multi(
                 "gt_mask_B": gt_mask_B,
                 "gt_mask_eval": gt_mask_eval,
                 "sh_buffer_mask": sh_buffer_mask,
+                "gt_weight": gt_weight,
                 "prefetched_b": prefetched_b,
                 "buffer_m": buffer_m,
                 "pixel_size_m": pixel_size_m,
             }
         )
 
-    # kNN tuning (median IoU across val tiles)
+    # kNN tuning (weighted-mean IoU across val tiles)
     best_raw_config = None
     for k in cfg.K_VALUES:
-        iou_by_thr = {thr: [] for thr in cfg.THRESHOLDS}
+        stats_by_thr = {
+            thr: {
+                "iou": 0.0,
+                "f1": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "w": 0.0,
+                "n": 0,
+            }
+            for thr in cfg.THRESHOLDS
+        }
         for ctx in val_contexts:
             logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
             score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
@@ -389,22 +418,41 @@ def tune_on_validation_multi(
                     ctx["sh_buffer_mask"],
                     ctx["gt_mask_eval"],
                 )
+            weight = float(ctx["gt_weight"])
             for m in metrics_list:
-                iou_by_thr[m["threshold"]].append(m["iou"])
+                stats = stats_by_thr[m["threshold"]]
+                stats["iou"] += float(m["iou"]) * weight
+                stats["f1"] += float(m["f1"]) * weight
+                stats["precision"] += float(m["precision"]) * weight
+                stats["recall"] += float(m["recall"]) * weight
+                stats["w"] += weight
+                stats["n"] += 1
 
-        for thr, ious in iou_by_thr.items():
-            med_iou = float(np.median(ious))
-            if best_raw_config is None or med_iou > best_raw_config["iou"]:
+        for thr, stats in stats_by_thr.items():
+            if stats["w"] > 0:
+                weighted_iou = float(stats["iou"] / stats["w"])
+                weighted_f1 = float(stats["f1"] / stats["w"])
+                weighted_precision = float(stats["precision"] / stats["w"])
+                weighted_recall = float(stats["recall"] / stats["w"])
+            else:
+                weighted_iou = 0.0
+                weighted_f1 = 0.0
+                weighted_precision = 0.0
+                weighted_recall = 0.0
+            if best_raw_config is None or weighted_iou > best_raw_config["iou"]:
                 best_raw_config = {
                     "k": k,
                     "threshold": thr,
                     "source": "raw",
-                    "iou": med_iou,
+                    "iou": weighted_iou,
+                    "f1": weighted_f1,
+                    "precision": weighted_precision,
+                    "recall": weighted_recall,
                 }
     if best_raw_config is None:
         raise ValueError("kNN tuning returned no results")
 
-    # XGB tuning (median IoU across val tiles)
+    # XGB tuning (weighted-mean IoU across val tiles)
     use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
     param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
     num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
@@ -451,7 +499,17 @@ def tune_on_validation_multi(
                 context_radius=context_radius,
             )
 
-        iou_by_thr = {thr: [] for thr in cfg.THRESHOLDS}
+        stats_by_thr = {
+            thr: {
+                "iou": 0.0,
+                "f1": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "w": 0.0,
+                "n": 0,
+            }
+            for thr in cfg.THRESHOLDS
+        }
         for ctx in val_contexts:
             logger.info("tune: XGB scoring on %s", ctx["path"])
             score_full = xgb_score_image_b(
@@ -481,19 +539,38 @@ def tune_on_validation_multi(
                     ctx["sh_buffer_mask"],
                     ctx["gt_mask_eval"],
                 )
+            weight = float(ctx["gt_weight"])
             for m in metrics_list:
-                iou_by_thr[m["threshold"]].append(m["iou"])
+                stats = stats_by_thr[m["threshold"]]
+                stats["iou"] += float(m["iou"]) * weight
+                stats["f1"] += float(m["f1"]) * weight
+                stats["precision"] += float(m["precision"]) * weight
+                stats["recall"] += float(m["recall"]) * weight
+                stats["w"] += weight
+                stats["n"] += 1
 
-        for thr, ious in iou_by_thr.items():
-            med_iou = float(np.median(ious))
+        for thr, stats in stats_by_thr.items():
+            if stats["w"] > 0:
+                weighted_iou = float(stats["iou"] / stats["w"])
+                weighted_f1 = float(stats["f1"] / stats["w"])
+                weighted_precision = float(stats["precision"] / stats["w"])
+                weighted_recall = float(stats["recall"] / stats["w"])
+            else:
+                weighted_iou = 0.0
+                weighted_f1 = 0.0
+                weighted_precision = 0.0
+                weighted_recall = 0.0
             cand = {
                 "k": -1,
                 "threshold": thr,
                 "source": "xgb",
-                "iou": med_iou,
+                "iou": weighted_iou,
+                "f1": weighted_f1,
+                "precision": weighted_precision,
+                "recall": weighted_recall,
                 "params": params_used,
             }
-            if best_xgb_config is None or med_iou > best_xgb_config["iou"]:
+            if best_xgb_config is None or weighted_iou > best_xgb_config["iou"]:
                 best_xgb_config = cand
                 best_bst = bst
     if best_xgb_config is None or best_bst is None:
@@ -599,7 +676,7 @@ def tune_on_validation_multi(
     protect_scores = getattr(cfg, "SHADOW_PROTECT_SCORES", [0.5])
     for weights in cfg.SHADOW_WEIGHT_SETS:
         iou_by_key = {
-            (thr, protect_score): []
+            (thr, protect_score): {"sum": 0.0, "w": 0.0}
             for thr in cfg.SHADOW_THRESHOLDS
             for protect_score in protect_scores
         }
@@ -634,6 +711,7 @@ def tune_on_validation_multi(
             mask_thr = vals[None, :] >= thr_arr
             gt_bool = gt_vals.astype(bool)
             score_vals = score_full.reshape(-1)[flat_base]
+            weight = float(ctx["gt_weight"])
             for protect_score in protect_scores:
                 protect_mask = score_vals >= protect_score
                 mask_keep = mask_thr | protect_mask[None, :]
@@ -654,18 +732,21 @@ def tune_on_validation_multi(
                 )
                 iou = tp / (tp + fp + fn + 1e-8)
                 for i, thr in enumerate(cfg.SHADOW_THRESHOLDS):
-                    iou_by_key[(thr, protect_score)].append(float(iou[i]))
+                    stats = iou_by_key[(thr, protect_score)]
+                    stats["sum"] += float(iou[i]) * weight
+                    stats["w"] += weight
 
-        for (thr, protect_score), ious in iou_by_key.items():
-            if not ious:
+        for (thr, protect_score), stats in iou_by_key.items():
+            if stats["w"] <= 0:
                 continue
-            med_iou = float(np.median(ious))
-            if best_shadow_iou is None or med_iou > best_shadow_iou:
-                best_shadow_iou = med_iou
+            weighted_iou = float(stats["sum"] / stats["w"])
+            if best_shadow_iou is None or weighted_iou > best_shadow_iou:
+                best_shadow_iou = weighted_iou
                 best_shadow_cfg = {
                     "weights": weights,
                     "threshold": thr,
                     "protect_score": protect_score,
+                    "iou": weighted_iou,
                 }
     if best_shadow_cfg is None:
         raise ValueError("shadow tuning returned no results")
@@ -737,6 +818,7 @@ def infer_on_holdout(
     if gt_mask_eval is None:
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
+    gt_weight = float(gt_mask_eval.sum())
 
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
     prefetched_b = prefetch_features_single_scale_image(
@@ -901,6 +983,9 @@ def infer_on_holdout(
         "champion_crf": metrics_champion_crf,
         "champion_bridge": metrics_champion_bridge,
         "champion_shadow": shadow_metrics,
+    }
+    metrics_map = {
+        key: {**metrics, "_weight": gt_weight} for key, metrics in metrics_map.items()
     }
     masks_map = {
         "knn_raw": mask_knn,
@@ -1092,9 +1177,9 @@ def main():
     # ------------------------------------------------------------
     # Init DINOv3 model & processor
     # ------------------------------------------------------------
-    logger.info("phase:start init_model")
+    _log_phase("START", "init_model")
     model, processor, device = init_model(model_name)
-    logger.info("phase:end init_model")
+    _log_phase("END", "init_model")
     ps = getattr(cfg, "PATCH_SIZE", model.config.patch_size)
     tile_size = getattr(cfg, "TILE_SIZE", 1024)
     stride = getattr(cfg, "STRIDE", tile_size)
@@ -1166,7 +1251,7 @@ def main():
     # ------------------------------------------------------------
     # Build DINOv3 banks + XGBoost training data from Image A sources
     # ------------------------------------------------------------
-    logger.info("phase:start image_a_processing")
+    _log_phase("START", "image_a_processing")
     pos_banks = []
     neg_banks = []
     X_list = []
@@ -1249,12 +1334,12 @@ def main():
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
     if X.size == 0 or y.size == 0:
         raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
-    logger.info("phase:end image_a_processing")
+    _log_phase("END", "image_a_processing")
 
     # ------------------------------------------------------------
     # Tune on validation tile, then infer on holdout tiles
     # ------------------------------------------------------------
-    logger.info("phase:start validation_tuning")
+    _log_phase("START", "validation_tuning")
     tuned = tune_on_validation_multi(
         val_tiles,
         gt_vector_paths,
@@ -1271,13 +1356,13 @@ def main():
         feature_dir,
         context_radius,
     )
-    logger.info("phase:end validation_tuning")
+    _log_phase("END", "validation_tuning")
 
     val_phase_metrics: dict[str, list[dict]] = {}
     holdout_phase_metrics: dict[str, list[dict]] = {}
 
     # Run inference on validation tiles with fixed settings (for plots/metrics)
-    logger.info("phase:start validation_inference")
+    _log_phase("START", "validation_inference")
     for val_path in val_tiles:
         result = infer_on_holdout(
             val_path,
@@ -1298,9 +1383,9 @@ def main():
         )
         if result["gt_available"]:
             _update_phase_metrics(val_phase_metrics, result["metrics"])
-    logger.info("phase:end validation_inference")
+    _log_phase("END", "validation_inference")
 
-    logger.info("phase:start holdout_inference")
+    _log_phase("START", "holdout_inference")
     holdout_tiles_processed = len(processed_tiles)
     for b_path in holdout_tiles:
         if b_path in processed_tiles:
@@ -1346,7 +1431,7 @@ def main():
         }
         with open(processed_log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
-    logger.info("phase:end holdout_inference")
+    _log_phase("END", "holdout_inference")
 
     bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
     _summarize_phase_metrics(val_phase_metrics, "validation", bridge_enabled)
@@ -1358,13 +1443,13 @@ def main():
     if feature_cache_mode == "disk":
         if feature_dir is None:
             raise ValueError("feature_dir must be set for disk cache mode")
-        logger.info("phase:start feature_consolidation")
+        _log_phase("START", "feature_consolidation")
         for image_id_a in image_id_a_list:
             consolidate_features_for_image(feature_dir, image_id_a)
         for b_path in val_tiles + holdout_tiles:
             image_id_b = os.path.splitext(os.path.basename(b_path))[0]
             consolidate_features_for_image(feature_dir, image_id_b)
-        logger.info("phase:end feature_consolidation")
+        _log_phase("END", "feature_consolidation")
 
     time_end("main (total)", t0_main)
 

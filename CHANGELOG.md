@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Switch tuning to weighted-mean IoU and add red phase markers.
+- file touched: `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Ensure configs are chosen by GT-weighted validation performance and make phases easy to spot.
+- problems fixed: Avoids selecting configs by non-weighted aggregation and improves log readability.
+
 - Description: Add continuity bridging, unified plots, and phase summaries for kNN/XGB/Champion.
 - file touched: `config.py`, `segedge/core/continuity.py`, `segedge/core/crf_utils.py`, `segedge/core/plotting.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
 - reason: Improve topological continuity and make phase-by-phase gains visible.

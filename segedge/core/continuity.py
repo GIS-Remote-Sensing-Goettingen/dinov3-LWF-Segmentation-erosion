@@ -5,12 +5,7 @@ import logging
 import numpy as np
 from scipy.ndimage import convolve
 from skimage.graph import route_through_array
-from skimage.morphology import (
-    binary_dilation,
-    disk,
-    remove_small_objects,
-    skeletonize,
-)
+from skimage.morphology import binary_dilation, disk, remove_small_objects, skeletonize
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +119,7 @@ def bridge_skeleton_gaps(
         if candidates.size == 0:
             continue
         order = candidates[np.argsort(dist[candidates])]
-        for j in order[: max_pairs_per_endpoint]:
+        for j in order[:max_pairs_per_endpoint]:
             a, b = sorted((i, int(j)))
             pairs.add((a, b))
 
