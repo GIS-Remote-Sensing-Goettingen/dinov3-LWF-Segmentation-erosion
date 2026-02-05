@@ -95,7 +95,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - CRF grid: softness/weights/sigmas, `CRF_NUM_WORKERS`, `CRF_MAX_CONFIGS` (from main).
 - XGBoost: `XGB_USE_GPU`, `XGB_PARAM_GRID`, `XGB_NUM_BOOST_ROUND`, `XGB_EARLY_STOP`, `XGB_VERBOSE_EVAL`, `XGB_VAL_FRACTION`.
 - Shadow: `SHADOW_WEIGHT_SETS`, `SHADOW_THRESHOLDS`.
-- Roads penalty: `ROADS_MASK_PATH`, `ROADS_MASK_RASTER_PATH`, `ROADS_RASTER_AUTO_BUILD`, `ROADS_PENALTY_VALUES`.
+- Roads penalty: `ROADS_MASK_PATH`, `ROADS_PENALTY_VALUES`.
 - Bridging: `ENABLE_GAP_BRIDGING`, `BRIDGE_MAX_GAP_PX`, `BRIDGE_MAX_PAIRS`, `BRIDGE_MAX_AVG_COST`, `BRIDGE_WIDTH_PX`, `BRIDGE_MIN_COMPONENT_PX`, `BRIDGE_SPUR_PRUNE_ITERS`.
 - Evaluation: `CLIP_GT_TO_BUFFER`.
 - Batching: `FEATURE_BATCH_SIZE` controls per-forward tile batching in prefetch.
@@ -182,7 +182,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - `inference_best_setting.yml` records the frozen configs and weighted-mean metrics after validation.
 - Typical run flow in main: build banks → prefetch B → kNN grid → fine-tune → median filter → XGB IoU search → overlays → CRF → shadow → exports.
 - Roads penalty: if configured, kNN/XGB score maps are multiplied by a roads mask penalty before thresholds/CRF.
-- Roads raster: auto-built once at tile resolution over SOURCE_LABEL_RASTER extent and window-read per tile.
+- Roads masking: per-tile rasterization using a cached spatial index (no global raster build).
 - Logs: Main stdout includes timing, kNN evals, XGB search logs, CRF evals; plots show overlays; YAML captures configs.
 - Logs: Phase summaries report weighted-mean IoU/F1 per phase and deltas along the champion chain.
 

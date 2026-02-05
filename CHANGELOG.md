@@ -2,10 +2,10 @@
 
 
 ## [Unreleased]
-- Description: Auto-build roads raster at tile resolution for fast per-tile masking.
-- file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
-- reason: Avoid per-tile vector rasterization of roads.
-- problems fixed: Cuts roads mask time from minutes to milliseconds per tile.
+- Description: Switch roads masking to per-tile spatial index rasterization.
+- file touched: `config.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Avoid OOM from global raster builds while keeping tile-resolution masking.
+- problems fixed: Prevents roads raster build OOM and keeps per-tile masking fast.
 
 - Description: Add source label, DINO similarity, and score heatmaps to unified plot.
 - file touched: `segedge/core/plotting.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`

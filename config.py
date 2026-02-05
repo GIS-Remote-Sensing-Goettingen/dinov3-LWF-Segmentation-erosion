@@ -143,8 +143,6 @@ SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
 
 # Roads mask penalty (multiplicative) for kNN/XGB scores
 ROADS_MASK_PATH = "data/roads/roads_mask.shp"
-ROADS_MASK_RASTER_PATH = "data/roads/roads_mask.tif"
-ROADS_RASTER_AUTO_BUILD = True
 ROADS_PENALTY_VALUES = [0.7, 0.6, 0.5]
 
 # Continuity bridging (post-CRF, pre-shadow)
