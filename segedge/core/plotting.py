@@ -224,11 +224,15 @@ def save_knn_xgb_gt_plot(
 def save_unified_plot(
     img_b,
     gt_mask,
+    labels_sh,
     masks: dict,
     metrics: dict,
     plot_dir,
     image_id_b,
     show_metrics: bool,
+    gt_available: bool,
+    similarity_map=None,
+    score_maps: dict | None = None,
     skeleton=None,
     endpoints=None,
     bridge_enabled: bool = False,
@@ -238,11 +242,15 @@ def save_unified_plot(
     Args:
         img_b (np.ndarray): Image B RGB array.
         gt_mask (np.ndarray): Ground-truth mask.
+        labels_sh (np.ndarray): Source label raster mask.
         masks (dict): Mask dict keyed by phase.
         metrics (dict): Metrics dict keyed by phase.
         plot_dir (str): Output directory.
         image_id_b (str): Image identifier.
         show_metrics (bool): Whether to include metrics in titles.
+        gt_available (bool): Whether GT labels are available.
+        similarity_map (np.ndarray | None): Optional DINO similarity map.
+        score_maps (dict | None): Optional score heatmaps (kNN/XGB).
         skeleton (np.ndarray | None): Optional skeleton mask.
         endpoints (np.ndarray | None): Optional endpoint coordinates.
         bridge_enabled (bool): Whether bridge mask is present.
@@ -258,9 +266,33 @@ def save_unified_plot(
         m = metrics[key]
         return f"{base} IoU={m['iou']:.3f}, F1={m['f1']:.3f}"
 
+    def _normalize_heatmap(values):
+        vals = values.astype(np.float32)
+        vmin = float(np.min(vals))
+        vmax = float(np.max(vals))
+        if vmax - vmin <= 1e-8:
+            return np.zeros_like(vals)
+        return (vals - vmin) / (vmax - vmin)
+
     panels = []
     panels.append(("RGB", img_b, None))
-    panels.append(("GT" if show_metrics else "GT (missing)", gt_mask > 0, "gray"))
+    if labels_sh is not None:
+        panels.append(("Source labels", labels_sh > 0, "gray"))
+    if gt_available:
+        panels.append(("GT" if show_metrics else "GT", gt_mask > 0, "gray"))
+    if similarity_map is not None:
+        panels.append(
+            ("DINO similarity", _normalize_heatmap(similarity_map), "coolwarm")
+        )
+    if score_maps:
+        if "knn" in score_maps:
+            panels.append(
+                ("kNN score", _normalize_heatmap(score_maps["knn"]), "coolwarm")
+            )
+        if "xgb" in score_maps:
+            panels.append(
+                ("XGB score", _normalize_heatmap(score_maps["xgb"]), "coolwarm")
+            )
 
     phase_order = [
         ("knn_raw", "kNN raw"),

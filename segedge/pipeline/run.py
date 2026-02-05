@@ -992,6 +992,7 @@ def infer_on_holdout(
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
     )
+    score_knn_raw = score_knn
     score_knn = _apply_roads_penalty(score_knn, roads_mask, roads_penalty)
     mask_knn = (score_knn >= knn_thr) & sh_buffer_mask
     mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
@@ -1135,13 +1136,17 @@ def infer_on_holdout(
         "champion_shadow": shadow_mask,
     }
     save_unified_plot(
-        img_b,
-        gt_mask_eval,
-        masks_map,
-        metrics_map,
-        cfg.PLOT_DIR,
-        image_id_b,
+        img_b=img_b,
+        gt_mask=gt_mask_eval,
+        labels_sh=labels_sh,
+        masks=masks_map,
+        metrics=metrics_map,
+        plot_dir=cfg.PLOT_DIR,
+        image_id_b=image_id_b,
         show_metrics=plot_with_metrics and gt_available,
+        gt_available=gt_available,
+        similarity_map=score_knn_raw,
+        score_maps={"knn": score_knn, "xgb": score_xgb},
         skeleton=skel,
         endpoints=endpoints,
         bridge_enabled=bridge_enabled,

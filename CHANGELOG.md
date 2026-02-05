@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add source label, DINO similarity, and score heatmaps to unified plot.
+- file touched: `segedge/core/plotting.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Improve plot diagnostics with label context and model score maps.
+- problems fixed: Makes score variations and label alignment visible per tile.
+
 - Description: Write a single inference_best_setting.yml after validation and stop per-tile settings.
 - file touched: `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
 - reason: Freeze holdout settings once and include weighted validation metrics.

@@ -177,7 +177,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 6. Champion selection: compare best IoU from kNN vs XGB (after median filter); champion feeds CRF; shadow filter runs after CRF.
 7. Tuning objective: configs are selected by weighted-mean IoU across validation tiles, weighted by GT-positive pixel count.
 - Plots to inspect:
-   - `*_unified.png`: RGB, GT (if available), kNN/XGB/Champion raw/CRF/shadow, skeleton + endpoints.
+   - `*_unified.png`: RGB, source label raster, GT (if available), DINO similarity, kNN/XGB score heatmaps, masks, skeleton + endpoints.
 - Shapefiles to consume: rolling unions under `shapes/unions/` (kNN/XGB/Champion × raw/CRF/shadow).
 - `inference_best_setting.yml` records the frozen configs and weighted-mean metrics after validation.
 - Typical run flow in main: build banks → prefetch B → kNN grid → fine-tune → median filter → XGB IoU search → overlays → CRF → shadow → exports.
