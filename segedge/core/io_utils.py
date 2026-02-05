@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 
@@ -14,6 +15,7 @@ from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.plot import reshape_as_image
+from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shp_transform
@@ -226,6 +228,102 @@ def rasterize_vector_labels(
         gt_mask = np.maximum(gt_mask, mask_i)
     time_end("rasterize_vector_labels", t0)
     return gt_mask
+
+
+def build_roads_raster_from_vector(
+    vector_path: str,
+    out_raster_path: str,
+    bounds: tuple[float, float, float, float],
+    pixel_size: tuple[float, float],
+    target_crs,
+) -> str:
+    """Rasterize road vectors into a single mask GeoTIFF.
+
+    Args:
+        vector_path (str): Roads vector path.
+        out_raster_path (str): Output GeoTIFF path.
+        bounds (tuple[float, float, float, float]): Target bounds (left, bottom, right, top).
+        pixel_size (tuple[float, float]): Pixel size (x, y).
+        target_crs: Target CRS for rasterization.
+
+    Returns:
+        str: Output raster path.
+
+    Examples:
+        >>> callable(build_roads_raster_from_vector)
+        True
+    """
+    t0 = time_start()
+    left, bottom, right, top = bounds
+    res_x, res_y = pixel_size
+    if res_x <= 0 or res_y <= 0:
+        raise ValueError("pixel_size must be positive")
+    width = int(math.ceil((right - left) / res_x))
+    height = int(math.ceil((top - bottom) / res_y))
+    transform = from_origin(left, top, res_x, res_y)
+    crs_obj = CRS.from_user_input(target_crs) if target_crs is not None else None
+
+    shapes = []
+    with fiona.open(vector_path, "r") as shp:
+        vec_crs = shp.crs
+        transformer = None
+        if vec_crs and crs_obj is not None:
+            vec_crs_obj = CRS.from_user_input(vec_crs)
+            if vec_crs_obj != crs_obj:
+                logger.info(
+                    "reprojecting road geometries from %s -> %s for %s",
+                    vec_crs_obj.to_string(),
+                    crs_obj.to_string(),
+                    vector_path,
+                )
+                transformer = Transformer.from_crs(vec_crs_obj, crs_obj, always_xy=True)
+        for feat in shp:
+            geom = feat.get("geometry")
+            if not geom:
+                continue
+            geom_obj = shape(geom)
+            if geom_obj.is_empty:
+                continue
+            if transformer is not None:
+                geom_obj = shp_transform(transformer.transform, geom_obj)
+            shapes.append((mapping(geom_obj), 1))
+
+    if not shapes:
+        raise ValueError(f"no geometries found in {vector_path}")
+
+    mask = rfeatures.rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        default_value=1,
+        dtype="uint8",
+        all_touched=False,
+    )
+
+    os.makedirs(os.path.dirname(out_raster_path), exist_ok=True)
+    with rasterio.open(
+        out_raster_path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=1,
+        dtype="uint8",
+        crs=crs_obj,
+        transform=transform,
+        compress="lzw",
+    ) as dst:
+        dst.write(mask, 1)
+
+    time_end("build_roads_raster_from_vector", t0)
+    logger.info(
+        "roads raster written: %s (shape=%s, features=%s)",
+        out_raster_path,
+        mask.shape,
+        len(shapes),
+    )
+    return out_raster_path
 
 
 def build_sh_buffer_mask(labels_sh: np.ndarray, buffer_pixels: int) -> np.ndarray:

@@ -9,7 +9,10 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
 import numpy as np
+import rasterio
 import torch
+from rasterio.warp import transform_bounds
+from rasterio.windows import from_bounds
 from scipy.ndimage import median_filter
 from skimage.transform import resize
 
@@ -22,6 +25,7 @@ from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
     append_mask_to_union_shapefile,
     backup_union_shapefile,
+    build_roads_raster_from_vector,
     build_sh_buffer_mask,
     consolidate_features_for_image,
     count_shapefile_features,
@@ -56,9 +60,65 @@ logger = logging.getLogger(__name__)
 
 _CRF_PARALLEL_CONTEXTS: list[dict] | None = None
 _ROADS_MASK_CACHE: dict[tuple[str, int], np.ndarray] = {}
+_ROADS_RASTER = None
+_ROADS_RASTER_PATH = None
 
 
-def _get_roads_mask(tile_path: str, downsample_factor: int) -> np.ndarray | None:
+def _ensure_roads_raster(tile_path: str, downsample_factor: int) -> str | None:
+    """Ensure the roads raster exists (auto-build if configured).
+
+    Args:
+        tile_path (str): Tile path used for CRS/resolution.
+        downsample_factor (int): Downsample factor for output resolution.
+
+    Returns:
+        str | None: Roads raster path if available.
+
+    Examples:
+        >>> callable(_ensure_roads_raster)
+        True
+    """
+    roads_vector = getattr(cfg, "ROADS_MASK_PATH", None)
+    roads_raster = getattr(cfg, "ROADS_MASK_RASTER_PATH", None)
+    auto_build = bool(getattr(cfg, "ROADS_RASTER_AUTO_BUILD", False))
+    if not roads_vector:
+        return None
+    if roads_raster and os.path.exists(roads_raster):
+        return roads_raster
+    if not auto_build:
+        logger.warning("roads raster missing and auto-build disabled")
+        return None
+    if not os.path.exists(roads_vector):
+        logger.warning("roads vector not found: %s", roads_vector)
+        return None
+
+    t0 = time_start()
+    with rasterio.open(tile_path) as tile_src:
+        tile_crs = tile_src.crs
+        res_x = abs(tile_src.transform.a) * downsample_factor
+        res_y = abs(tile_src.transform.e) * downsample_factor
+    with rasterio.open(cfg.SOURCE_LABEL_RASTER) as lbl:
+        bounds = lbl.bounds
+        lbl_crs = lbl.crs
+    if tile_crs is not None and lbl_crs is not None and tile_crs != lbl_crs:
+        bounds = transform_bounds(lbl_crs, tile_crs, *bounds, densify_pts=21)
+    roads_raster = roads_raster or os.path.splitext(roads_vector)[0] + ".tif"
+    build_roads_raster_from_vector(
+        roads_vector,
+        roads_raster,
+        bounds,
+        (res_x, res_y),
+        tile_crs,
+    )
+    time_end("roads_raster_auto_build", t0)
+    return roads_raster
+
+
+def _get_roads_mask(
+    tile_path: str,
+    downsample_factor: int,
+    target_shape: tuple[int, int] | None = None,
+) -> np.ndarray | None:
     """Load or cache a roads mask rasterized to the tile grid.
 
     Args:
@@ -72,20 +132,46 @@ def _get_roads_mask(tile_path: str, downsample_factor: int) -> np.ndarray | None
         >>> callable(_get_roads_mask)
         True
     """
-    roads_path = getattr(cfg, "ROADS_MASK_PATH", None)
-    if not roads_path:
-        return None
-    if not os.path.exists(roads_path):
-        logger.warning("roads mask not found: %s", roads_path)
+    roads_raster = _ensure_roads_raster(tile_path, downsample_factor)
+    if roads_raster is None:
         return None
     key = (tile_path, downsample_factor)
     if key in _ROADS_MASK_CACHE:
         return _ROADS_MASK_CACHE[key]
-    mask = rasterize_vector_labels(
-        roads_path, tile_path, downsample_factor=downsample_factor
-    ).astype(bool)
-    _ROADS_MASK_CACHE[key] = mask
-    return mask
+
+    global _ROADS_RASTER, _ROADS_RASTER_PATH
+    if _ROADS_RASTER is None or _ROADS_RASTER_PATH != roads_raster:
+        _ROADS_RASTER = rasterio.open(roads_raster)
+        _ROADS_RASTER_PATH = roads_raster
+
+    t0 = time_start()
+    with rasterio.open(tile_path) as tile_src:
+        tile_bounds = tile_src.bounds
+        tile_crs = tile_src.crs
+    if tile_crs is not None and _ROADS_RASTER.crs is not None:
+        if tile_crs != _ROADS_RASTER.crs:
+            tile_bounds = transform_bounds(
+                tile_crs, _ROADS_RASTER.crs, *tile_bounds, densify_pts=21
+            )
+    window = from_bounds(*tile_bounds, transform=_ROADS_RASTER.transform)
+    mask = _ROADS_RASTER.read(1, window=window, boundless=True, fill_value=0)
+    if target_shape is not None and mask.shape != target_shape:
+        mask = resize(
+            mask,
+            target_shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype("uint8")
+    mask_bool = mask.astype(bool)
+    time_end("roads_mask_window_read", t0)
+    _ROADS_MASK_CACHE[key] = mask_bool
+    logger.info(
+        "roads mask read: shape=%s coverage=%.4f",
+        mask_bool.shape,
+        float(mask_bool.mean()),
+    )
+    return mask_bool
 
 
 def _apply_roads_penalty(
@@ -436,7 +522,7 @@ def tune_on_validation_multi(
             feature_dir,
             image_id_b,
         )
-        roads_mask = _get_roads_mask(val_path, ds)
+        roads_mask = _get_roads_mask(val_path, ds, target_shape=img_b.shape[:2])
         val_contexts.append(
             {
                 "path": val_path,
@@ -954,7 +1040,7 @@ def infer_on_holdout(
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
     gt_weight = float(gt_mask_eval.sum())
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
-    roads_mask = _get_roads_mask(holdout_path, ds)
+    roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
     roads_penalty = float(tuned.get("roads_penalty", 1.0))
 
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
