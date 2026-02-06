@@ -62,6 +62,7 @@ FEATURE_DIR = "data/dino_features"
 BANK_CACHE_DIR = "data/dino_features/banks"
 OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
+TUNING_PLOT_MAX_TILES = 10
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
 LOG_LEVEL = logging.INFO

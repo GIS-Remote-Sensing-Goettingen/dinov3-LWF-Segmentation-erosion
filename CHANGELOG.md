@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.22]
+- Description: Add tuning-phase preview plots for up to 10 validation tiles.
+- file touched: `config.py`, `segedge/pipeline/tuning.py`, `CHANGELOG.md`
+- reason: Provide visual feedback during validation tuning without waiting for holdout inference.
+- problems fixed: Makes tuning progress visible while keeping plot volume bounded.
+
 ## [0.2.21]
 - Description: Promote internal debug logs to info and set default log level to INFO.
 - file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/core/knn.py`, `segedge/pipeline/common.py`, `segedge/pipeline/inference_utils.py`, `CHANGELOG.md`

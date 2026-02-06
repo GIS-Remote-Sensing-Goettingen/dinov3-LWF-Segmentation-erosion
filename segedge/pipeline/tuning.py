@@ -10,10 +10,12 @@ from skimage.morphology import binary_dilation, disk
 
 import config as cfg
 
+from ..core.continuity import bridge_skeleton_gaps
 from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.metrics_utils import compute_metrics, compute_oracle_upper_bound
+from ..core.plotting import save_unified_plot
 from ..core.summary_utils import weighted_mean
 from ..core.xdboost import (
     hyperparam_search_xgb_iou,
@@ -22,6 +24,7 @@ from ..core.xdboost import (
 )
 from .inference_utils import (
     _apply_roads_penalty,
+    _apply_shadow_filter,
     _compute_top_p,
     _get_roads_mask,
     _top_p_threshold,
@@ -64,6 +67,205 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
         ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
         weights.append(float(ctx["gt_weight"]))
     return weighted_mean(ious, weights), cfg
+
+
+def _render_tuning_plots(
+    val_contexts: list[dict],
+    model,
+    processor,
+    device,
+    pos_bank: np.ndarray,
+    neg_bank: np.ndarray | None,
+    best_raw_config: dict,
+    best_bst,
+    best_crf_cfg: dict,
+    best_shadow_cfg: dict,
+    champion_source: str,
+    roads_penalty: float,
+    top_p_a: float,
+    top_p_b: float,
+    top_p_min: float,
+    top_p_max: float,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str | None,
+    context_radius: int,
+) -> None:
+    max_tiles = int(getattr(cfg, "TUNING_PLOT_MAX_TILES", 10) or 0)
+    if max_tiles <= 0:
+        return
+
+    plot_dir = os.path.join(cfg.PLOT_DIR, "tuning")
+    os.makedirs(plot_dir, exist_ok=True)
+    logger.info(
+        "tune: writing validation preview plots to %s (max=%s)",
+        plot_dir,
+        max_tiles,
+    )
+    bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
+    protect_score = best_shadow_cfg.get("protect_score")
+
+    for idx, ctx in enumerate(val_contexts[:max_tiles], start=1):
+        image_id = ctx["image_id"]
+        logger.info(
+            "tune: preview plot %s/%s for %s",
+            idx,
+            max_tiles,
+            ctx["path"],
+        )
+        p_val = _compute_top_p(
+            ctx["buffer_density"], top_p_a, top_p_b, top_p_min, top_p_max
+        )
+        score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
+            img_b=ctx["img_b"],
+            pos_bank=pos_bank,
+            neg_bank=neg_bank,
+            model=model,
+            processor=processor,
+            device=device,
+            ps=ps,
+            tile_size=tile_size,
+            stride=stride,
+            k=best_raw_config["k"],
+            aggregate_layers=None,
+            feature_dir=feature_dir,
+            image_id=image_id,
+            neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+            prefetched_tiles=ctx["prefetched_b"],
+            use_fp16_matmul=USE_FP16_KNN,
+            context_radius=context_radius,
+        )
+        score_knn = _apply_roads_penalty(score_knn, ctx["roads_mask"], roads_penalty)
+        knn_thr, mask_knn = _top_p_threshold(score_knn, ctx["sh_buffer_mask"], p_val)
+        mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
+
+        score_xgb = xgb_score_image_b(
+            ctx["img_b"],
+            best_bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id,
+            prefetched_tiles=ctx["prefetched_b"],
+            context_radius=context_radius,
+        )
+        score_xgb = _apply_roads_penalty(score_xgb, ctx["roads_mask"], roads_penalty)
+        xgb_thr, mask_xgb = _top_p_threshold(score_xgb, ctx["sh_buffer_mask"], p_val)
+        mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+
+        mask_crf_knn, prob_crf_knn = refine_with_densecrf(
+            ctx["img_b"],
+            score_knn,
+            knn_thr,
+            ctx["sh_buffer_mask"],
+            prob_softness=best_crf_cfg["prob_softness"],
+            n_iters=5,
+            pos_w=best_crf_cfg["pos_w"],
+            pos_xy_std=best_crf_cfg["pos_xy_std"],
+            bilateral_w=best_crf_cfg["bilateral_w"],
+            bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
+            bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
+            return_prob=True,
+        )
+        mask_crf_xgb, prob_crf_xgb = refine_with_densecrf(
+            ctx["img_b"],
+            score_xgb,
+            xgb_thr,
+            ctx["sh_buffer_mask"],
+            prob_softness=best_crf_cfg["prob_softness"],
+            n_iters=5,
+            pos_w=best_crf_cfg["pos_w"],
+            pos_xy_std=best_crf_cfg["pos_xy_std"],
+            bilateral_w=best_crf_cfg["bilateral_w"],
+            bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
+            bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
+            return_prob=True,
+        )
+        mask_shadow_knn = _apply_shadow_filter(
+            ctx["img_b"],
+            mask_crf_knn,
+            best_shadow_cfg["weights"],
+            best_shadow_cfg["threshold"],
+            score_knn,
+            protect_score,
+        )
+        mask_shadow_xgb = _apply_shadow_filter(
+            ctx["img_b"],
+            mask_crf_xgb,
+            best_shadow_cfg["weights"],
+            best_shadow_cfg["threshold"],
+            score_xgb,
+            protect_score,
+        )
+
+        if champion_source == "raw":
+            champion_raw = mask_knn
+            champion_crf = mask_crf_knn
+            champion_score = score_knn
+            champion_prob = prob_crf_knn
+        else:
+            champion_raw = mask_xgb
+            champion_crf = mask_crf_xgb
+            champion_score = score_xgb
+            champion_prob = prob_crf_xgb
+
+        champion_bridge = champion_crf
+        if bridge_enabled:
+            champion_bridge = bridge_skeleton_gaps(
+                champion_crf,
+                champion_prob,
+                max_gap_px=int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
+                max_pairs_per_endpoint=int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
+                max_avg_cost=float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
+                bridge_width_px=int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
+                min_component_area_px=int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
+                spur_prune_iters=int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            )
+        champion_shadow = _apply_shadow_filter(
+            ctx["img_b"],
+            champion_bridge,
+            best_shadow_cfg["weights"],
+            best_shadow_cfg["threshold"],
+            champion_score,
+            protect_score,
+        )
+
+        masks_map = {
+            "knn_raw": mask_knn,
+            "knn_crf": mask_crf_knn,
+            "knn_shadow": mask_shadow_knn,
+            "xgb_raw": mask_xgb,
+            "xgb_crf": mask_crf_xgb,
+            "xgb_shadow": mask_shadow_xgb,
+            "champion_raw": champion_raw,
+            "champion_crf": champion_crf,
+            "champion_shadow": champion_shadow,
+        }
+        if bridge_enabled:
+            masks_map["champion_bridge"] = champion_bridge
+
+        metrics_map = {
+            key: compute_metrics(mask, ctx["gt_mask_eval"])
+            for key, mask in masks_map.items()
+        }
+        save_unified_plot(
+            img_b=ctx["img_b"],
+            gt_mask=ctx["gt_mask_eval"],
+            labels_sh=ctx["labels_sh"],
+            masks=masks_map,
+            metrics=metrics_map,
+            plot_dir=plot_dir,
+            image_id_b=f"{image_id}_tuning",
+            show_metrics=True,
+            gt_available=True,
+            similarity_map=None,
+            score_maps={"knn": score_knn, "xgb": score_xgb},
+            skeleton=None,
+            endpoints=None,
+            bridge_enabled=bridge_enabled,
+        )
 
 
 def tune_on_validation_multi(
@@ -612,6 +814,29 @@ def tune_on_validation_multi(
         raise ValueError("shadow tuning returned no results")
 
     logger.info("tune: roads penalty selected=%s", roads_penalty)
+    _render_tuning_plots(
+        val_contexts,
+        model,
+        processor,
+        device,
+        pos_bank,
+        neg_bank,
+        best_raw_config,
+        best_bst,
+        best_crf_cfg,
+        best_shadow_cfg,
+        champion_source,
+        float(roads_penalty),
+        float(top_p_a),
+        float(top_p_b),
+        float(top_p_min),
+        float(top_p_max),
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        context_radius,
+    )
     return {
         "bst": best_bst,
         "best_raw_config": best_raw_config,
