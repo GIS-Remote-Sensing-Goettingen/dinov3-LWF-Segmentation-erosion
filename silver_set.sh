@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=segmentation
-#SBATCH --output=segmentation_%j.out
-#SBATCH --error=segmentation_%j.err
+#SBATCH --job-name=erosion
+#SBATCH --output=erosion_%j.out
+#SBATCH --error=erosion_%j.err
 #SBATCH --mem=128G
 #SBATCH --partition=scc-gpu
 #SBATCH -G A100:1
