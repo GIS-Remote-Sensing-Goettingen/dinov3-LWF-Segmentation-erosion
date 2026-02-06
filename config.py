@@ -145,6 +145,17 @@ SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
 ROADS_MASK_PATH = "data/roads/roads_mask.shp"
 ROADS_PENALTY_VALUES = [0.7, 0.6, 0.5]
 
+# Adaptive top-p selection inside buffer
+TOP_P_A = 0.0
+TOP_P_B = 0.05
+TOP_P_MIN = 0.02
+TOP_P_MAX = 0.08
+TOP_P_A_VALUES = [0.0, 0.5, 1.0]
+TOP_P_B_VALUES = [0.02, 0.05, 0.08]
+TOP_P_MIN_VALUES = [0.02, 0.03]
+TOP_P_MAX_VALUES = [0.08, 0.1]
+SILVER_CORE_DILATE_PX = 1
+
 # Continuity bridging (post-CRF, pre-shadow)
 ENABLE_GAP_BRIDGING = True
 BRIDGE_MAX_GAP_PX = 500

@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add adaptive top-p selection with silver_core intersection outputs.
+- file touched: `config.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
+- reason: Enable unlabeled target inference with adaptive selection and high-precision core masks.
+- problems fixed: Avoids fixed-threshold drift and provides conservative silver supervision.
+
 - Description: Switch roads masking to per-tile spatial index rasterization.
 - file touched: `config.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
 - reason: Avoid OOM from global raster builds while keeping tile-resolution masking.
