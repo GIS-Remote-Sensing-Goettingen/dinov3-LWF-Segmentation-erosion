@@ -173,6 +173,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
     - Processed tile log: `output/run_*/processed_tiles.jsonl` for resume.
     - Phase summary logs: mean/median metrics per phase and deltas for champion chain.
     - Best settings YAML in `output/run_*/best_settings.yml` (or `BEST_SETTINGS_PATH`).
+    - Run summary YAML in `output/run_*/run_summary.yml` with validation metrics, deltas, and timing.
     - Consolidated features: `FEATURE_DIR/{image_id}_features_full.npy`.
 5. Evaluation metric: IoU (primary), plus F1/P/R—computed on validation tiles; if `CLIP_GT_TO_BUFFER=True`, GT is masked to SH buffer so max IoU can reach 1.0.
 6. Champion selection: compare best IoU from kNN vs XGB (after median filter); champion feeds CRF; shadow filter runs after CRF.

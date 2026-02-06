@@ -32,8 +32,9 @@ WARNING THE FOLLOWING IS MANDATORY YOU MUST FOLLOW THESE STEPS BEFORE COMING BAC
 2. If you create new files, add them to git (e.g., `git add <file>`).
 3. Run 'pytest --doctest-modules ' and other tests if you have them; do not respond without running them unless the user explicitly says not to).
 4. Update CHANGELOG.md with a short entry describing what changed (and why).
-5. If design/structure changed, update ARCHITECTURE.md.
-6. In the PR/response, include:
+5. For every satisfied request, release a new version in CHANGELOG.md (do not leave changes only under Unreleased).
+6. If design/structure changed, update ARCHITECTURE.md.
+7. In the PR/response, include:
    - Summary of changes (1–3 bullets)
    - Commands you ran + results
    - Any follow-ups or risks

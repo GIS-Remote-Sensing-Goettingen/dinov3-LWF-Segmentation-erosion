@@ -1,4 +1,6 @@
 # SegEdge zero-shot pipeline configuration.
+import logging
+
 # Organized by: IO paths, model/tiling, scoring/search, evaluation/runtime.
 
 # -----------------------------------------------------------------------------
@@ -62,6 +64,8 @@ OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
+LOG_LEVEL = logging.DEBUG
+DEBUG_REPROJECT = True
 # Resume previous run (requires RESUME_RUN_DIR).
 RESUME_RUN = False
 RESUME_RUN_DIR = None

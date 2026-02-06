@@ -259,6 +259,7 @@ def resolve_tile_splits_from_gt(
         raise ValueError(f"no tiles found in {tiles_dir} with {tile_glob}")
     if downsample_factor is None:
         downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    debug_reproject = bool(getattr(cfg, "DEBUG_REPROJECT", False))
 
     raster_path = getattr(cfg, "SOURCE_LABEL_RASTER", None)
     filtered_paths = []
@@ -284,6 +285,35 @@ def resolve_tile_splits_from_gt(
                 or tb_top <= rb_bottom
                 or tb_bottom >= rb_top
             )
+            if debug_reproject:
+                inter_left = max(tb_left, rb_left)
+                inter_right = min(tb_right, rb_right)
+                inter_bottom = max(tb_bottom, rb_bottom)
+                inter_top = min(tb_top, rb_top)
+                inter_w = max(0.0, inter_right - inter_left)
+                inter_h = max(0.0, inter_top - inter_bottom)
+                tile_area = max(0.0, (tb_right - tb_left) * (tb_top - tb_bottom))
+                coverage_ratio = (
+                    (inter_w * inter_h / tile_area) if tile_area > 0 else 0.0
+                )
+                left_gap = max(0.0, rb_left - tb_left)
+                right_gap = max(0.0, tb_right - rb_right)
+                top_gap = max(0.0, tb_top - rb_top)
+                bottom_gap = max(0.0, rb_bottom - tb_bottom)
+                logger.debug(
+                    "auto split: label coverage tile=%s bounds=%s "
+                    "raster_bounds=%s ratio=%.4f gaps(L/R/T/B)="
+                    "(%.3f, %.3f, %.3f, %.3f) intersects=%s",
+                    tile_path,
+                    tuple(tile_bounds),
+                    tuple(raster_bounds),
+                    coverage_ratio,
+                    left_gap,
+                    right_gap,
+                    top_gap,
+                    bottom_gap,
+                    intersects,
+                )
             if intersects:
                 filtered_paths.append(tile_path)
             else:

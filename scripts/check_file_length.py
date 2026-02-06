@@ -2,7 +2,7 @@
 
 Rules:
 - Warn if a file exceeds 1000 lines.
-- Fail if a file exceeds 2000 lines.
+- Fail if a file exceeds 1500 lines.
 
 Examples:
     >>> is_too_long(2001)
@@ -43,12 +43,12 @@ def is_too_long(lines: int) -> bool:
     """Return True if line count exceeds the hard limit.
 
     Examples:
-        >>> is_too_long(2000)
-        False
-        >>> is_too_long(2001)
-        True
+    >>> is_too_long(1500)
+    False
+    >>> is_too_long(1501)
+    True
     """
-    return lines > 2000
+    return lines > 1500
 
 
 def iter_repo_files(root: Path) -> Iterable[Path]:
@@ -108,10 +108,10 @@ def format_error(file_len: FileLength) -> str:
     """Format an error line.
 
     Examples:
-        >>> format_error(FileLength(Path("x.py"), 2001))
-        'ERROR: x.py has 2001 lines (limit 2000)'
+    >>> format_error(FileLength(Path("x.py"), 1501))
+    'ERROR: x.py has 1501 lines (limit 1500)'
     """
-    return f"ERROR: {file_len.path} has {file_len.lines} lines (limit 2000)"
+    return f"ERROR: {file_len.path} has {file_len.lines} lines (limit 1500)"
 
 
 def main() -> int:

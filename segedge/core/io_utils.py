@@ -16,7 +16,7 @@ from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.plot import reshape_as_image
 from rasterio.transform import from_origin
-from rasterio.warp import Resampling, reproject
+from rasterio.warp import Resampling, reproject, transform_bounds
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shp_transform
 from skimage.morphology import dilation, disk
@@ -86,7 +86,89 @@ def reproject_labels_to_image(
         True
     """
     t0 = time_start()
+    debug_reproject = bool(getattr(cfg, "DEBUG_REPROJECT", False))
+    logger.info(
+        "reproject labels: ref=%s labels=%s downsample_factor=%s",
+        ref_img_path,
+        labels_path,
+        downsample_factor,
+    )
     with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
+        if debug_reproject:
+            ref_res_x = abs(ref.transform.a)
+            ref_res_y = abs(ref.transform.e)
+            src_res_x = abs(src.transform.a)
+            src_res_y = abs(src.transform.e)
+            logger.debug(
+                "ref raster: crs=%s bounds=%s size=%sx%s transform=%s res=(%.6f, %.6f)",
+                ref.crs,
+                tuple(ref.bounds),
+                ref.width,
+                ref.height,
+                ref.transform,
+                ref_res_x,
+                ref_res_y,
+            )
+            logger.debug(
+                "label raster: crs=%s bounds=%s size=%sx%s transform=%s res=(%.6f, %.6f) "
+                "nodata=%s dtype=%s count=%s",
+                src.crs,
+                tuple(src.bounds),
+                src.width,
+                src.height,
+                src.transform,
+                src_res_x,
+                src_res_y,
+                src.nodata,
+                src.dtypes,
+                src.count,
+            )
+            src_bounds_ref = None
+            if ref.crs is not None and src.crs is not None:
+                try:
+                    if ref.crs != src.crs:
+                        src_bounds_ref = transform_bounds(
+                            src.crs, ref.crs, *src.bounds, densify_pts=21
+                        )
+                    else:
+                        src_bounds_ref = src.bounds
+                except Exception:
+                    logger.exception(
+                        "reproject labels: failed to transform label bounds into ref CRS"
+                    )
+            else:
+                logger.debug(
+                    "reproject labels: missing CRS ref=%s labels=%s",
+                    ref.crs,
+                    src.crs,
+                )
+            if src_bounds_ref is not None:
+                ref_left, ref_bottom, ref_right, ref_top = ref.bounds
+                src_left, src_bottom, src_right, src_top = src_bounds_ref
+                inter_left = max(ref_left, src_left)
+                inter_right = min(ref_right, src_right)
+                inter_bottom = max(ref_bottom, src_bottom)
+                inter_top = min(ref_top, src_top)
+                inter_w = max(0.0, inter_right - inter_left)
+                inter_h = max(0.0, inter_top - inter_bottom)
+                ref_area = max(0.0, (ref_right - ref_left) * (ref_top - ref_bottom))
+                coverage_ratio = (inter_w * inter_h / ref_area) if ref_area > 0 else 0.0
+                left_gap = max(0.0, src_left - ref_left)
+                right_gap = max(0.0, ref_right - src_right)
+                top_gap = max(0.0, ref_top - src_top)
+                bottom_gap = max(0.0, src_bottom - ref_bottom)
+                logger.debug(
+                    "label bounds in ref CRS: %s",
+                    tuple(src_bounds_ref),
+                )
+                logger.debug(
+                    "label coverage: ratio=%.4f gaps(L/R/T/B)=(%.3f, %.3f, %.3f, %.3f)",
+                    coverage_ratio,
+                    left_gap,
+                    right_gap,
+                    top_gap,
+                    bottom_gap,
+                )
         if downsample_factor > 1:
             dst_width = ref.width // downsample_factor
             dst_height = ref.height // downsample_factor
@@ -121,6 +203,14 @@ def reproject_labels_to_image(
                     resampling=Resampling.nearest,
                 )
             labels_arr = dst.read()
+            if debug_reproject:
+                logger.debug(
+                    "reproject labels: dst_size=%sx%s transform=%s labels_arr_shape=%s",
+                    dst_width,
+                    dst_height,
+                    dst_transform,
+                    labels_arr.shape,
+                )
     labels_2d = labels_arr[0]
     expected_shape = (dst_height, dst_width)
     if labels_2d.shape != expected_shape:
@@ -130,6 +220,12 @@ def reproject_labels_to_image(
             expected_shape,
             labels_path,
         )
+        if debug_reproject:
+            logger.debug(
+                "reproject labels: resizing labels from %s to %s",
+                labels_2d.shape,
+                expected_shape,
+            )
         labels_2d = resize(
             labels_2d,
             expected_shape,
@@ -137,6 +233,40 @@ def reproject_labels_to_image(
             preserve_range=True,
             anti_aliasing=False,
         ).astype(labels_2d.dtype)
+    if debug_reproject:
+        nonzero = int(np.count_nonzero(labels_2d))
+        min_val = float(np.min(labels_2d)) if labels_2d.size else 0.0
+        max_val = float(np.max(labels_2d)) if labels_2d.size else 0.0
+        logger.debug(
+            "reproject labels: final shape=%s dtype=%s min=%.3f max=%.3f nonzero=%s",
+            labels_2d.shape,
+            labels_2d.dtype,
+            min_val,
+            max_val,
+            nonzero,
+        )
+        if nonzero > 0:
+            rows, cols = np.where(labels_2d > 0)
+            row_min = int(rows.min())
+            row_max = int(rows.max())
+            col_min = int(cols.min())
+            col_max = int(cols.max())
+            left_margin = col_min
+            right_margin = labels_2d.shape[1] - 1 - col_max
+            top_margin = row_min
+            bottom_margin = labels_2d.shape[0] - 1 - row_max
+            logger.debug(
+                "reproject labels: nonzero rows=%s..%s cols=%s..%s "
+                "margins(L/R/T/B)=%s/%s/%s/%s",
+                row_min,
+                row_max,
+                col_min,
+                col_max,
+                left_margin,
+                right_margin,
+                top_margin,
+                bottom_margin,
+            )
     time_end(
         f"reproject_labels_to_image[{os.path.basename(labels_path)} -> {os.path.basename(ref_img_path)}]",
         t0,
@@ -680,3 +810,59 @@ def export_best_settings(
 
         _write_yaml(best_settings)
     logger.info("best settings written to %s", out_path)
+
+
+def export_run_summary(summary: dict, out_path: str) -> None:
+    """Write a run summary YAML to the given path.
+
+    Args:
+        summary (dict): Summary payload.
+        out_path (str): Output YAML path.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as d:
+        ...     path = os.path.join(d, "summary.yml")
+        ...     export_run_summary({"a": 1, "b": {"c": 2}}, path)
+        ...     os.path.exists(path)
+        True
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+
+        def _write_yaml_list(values, indent=0):
+            """Write a minimal YAML list.
+
+            Examples:
+                >>> _write_yaml_list([1, 2])  # doctest: +SKIP
+            """
+            prefix = "  " * indent
+            for item in values:
+                if isinstance(item, dict):
+                    f.write(prefix + "-\n")
+                    _write_yaml_mapping(item, indent + 1)
+                elif isinstance(item, list):
+                    f.write(prefix + "-\n")
+                    _write_yaml_list(item, indent + 1)
+                else:
+                    f.write(prefix + f"- {item}\n")
+
+        def _write_yaml_mapping(values, indent=0):
+            """Write a minimal YAML mapping.
+
+            Examples:
+                >>> _write_yaml_mapping({"a": 1})  # doctest: +SKIP
+            """
+            prefix = "  " * indent
+            for key, value in values.items():
+                if isinstance(value, dict):
+                    f.write(prefix + f"{key}:\n")
+                    _write_yaml_mapping(value, indent + 1)
+                elif isinstance(value, list):
+                    f.write(prefix + f"{key}:\n")
+                    _write_yaml_list(value, indent + 1)
+                else:
+                    f.write(prefix + f"{key}: {value}\n")
+
+        _write_yaml_mapping(summary)
+    logger.info("run summary written to %s", out_path)
