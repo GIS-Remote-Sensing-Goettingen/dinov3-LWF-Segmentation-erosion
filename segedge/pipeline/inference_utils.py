@@ -146,7 +146,19 @@ def _get_roads_mask(
         candidates = [geoms[int(idx)] for idx in hits]
     else:
         candidates = list(hits)
-    shapes = [mapping(g) for g in candidates if g.intersects(tile_box)]
+    simplify_tol = float(getattr(cfg, "ROADS_SIMPLIFY_TOLERANCE_M", 0.2))
+    shapes = []
+    for geom in candidates:
+        if not geom.intersects(tile_box):
+            continue
+        clipped = geom.intersection(tile_box)
+        if clipped.is_empty:
+            continue
+        if simplify_tol > 0:
+            clipped = clipped.simplify(simplify_tol, preserve_topology=True)
+            if clipped.is_empty:
+                continue
+        shapes.append(mapping(clipped))
     if not shapes:
         mask_empty = np.zeros(out_shape, dtype=bool)
         _ROADS_MASK_CACHE[key] = mask_empty
@@ -394,9 +406,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         left_margin = col_min if col_min >= 0 else -1
         right_margin = (labels_sh.shape[1] - 1 - col_max) if col_max >= 0 else -1
         top_margin = row_min if row_min >= 0 else -1
-        bottom_margin = (
-            (labels_sh.shape[0] - 1 - row_max) if row_max >= 0 else -1
-        )
+        bottom_margin = (labels_sh.shape[0] - 1 - row_max) if row_max >= 0 else -1
         logger.debug(
             "labels_sh coverage: nonzero=%s mean=%.6f cols=%s..%s rows=%s..%s "
             "margins(L/R/T/B)=%s/%s/%s/%s",

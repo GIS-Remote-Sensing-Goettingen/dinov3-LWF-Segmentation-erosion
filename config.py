@@ -147,7 +147,8 @@ SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
 
 # Roads mask penalty (multiplicative) for kNN/XGB scores
 ROADS_MASK_PATH = "data/roads/roads_mask.shp"
-ROADS_PENALTY_VALUES = [0.7, 0.6, 0.5]
+ROADS_PENALTY_VALUES = [0.8, 0.7, 0.6]
+ROADS_SIMPLIFY_TOLERANCE_M = 0.2
 
 # Adaptive top-p selection inside buffer
 TOP_P_A = 0.0

@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.20]
+- Description: Clip and simplify roads geometries before rasterization to reduce mask build time.
+- file touched: `config.py`, `segedge/pipeline/inference_utils.py`, `CHANGELOG.md`
+- reason: Avoid long stalls when rasterizing large road geometries per tile.
+- problems fixed: Cuts roads mask rasterization time during validation and holdout inference.
+
 ## [0.2.19]
 - Description: Release changelog entries into versioned sections, enforce per-request versioning, and tighten file-length limits.
 - file touched: `CHANGELOG.md`, `AGENTS.md`, `scripts/check_file_length.py`, `.pre-commit-config.yaml`, `segedge/pipeline/run.py`, `segedge/pipeline/inference_utils.py`, `segedge/pipeline/tuning.py`
@@ -72,7 +78,7 @@
 ## [0.2.8]
 - Description: Document rolling unions, resume, and auto split updates in KB.
 - file touched: `KB.md`, `CHANGELOG.md`
-- reason: Keep docs aligned with current pipeline behavior and outputs.
+  - reason: Keep docs aligned with current pipeline behavior and outputs.
 - problems fixed: Prevents outdated output paths and config guidance.
 
 ## [0.2.7]
