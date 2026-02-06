@@ -114,7 +114,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     matmul_time = resize_time = 0.0
     if prefetched_tiles is not None:
         tile_items = sorted(prefetched_tiles.items())
-        logger.debug(
+        logger.info(
             "zero_shot: using prefetched features for %s tiles", len(tile_items)
         )
         tile_iter = ((y, x, info) for (y, x), info in tile_items)
@@ -246,7 +246,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
     logger.info("B: cached tiles=%s, computed tiles=%s", cached_tiles, computed_tiles)
     if DEBUG_TIMING:
-        logger.debug(
+        logger.info(
             "k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time
         )
     return score_full, saliency_full

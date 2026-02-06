@@ -64,7 +64,7 @@ OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
-LOG_LEVEL = logging.DEBUG
+LOG_LEVEL = logging.INFO
 DEBUG_REPROJECT = True
 # Resume previous run (requires RESUME_RUN_DIR).
 RESUME_RUN = False

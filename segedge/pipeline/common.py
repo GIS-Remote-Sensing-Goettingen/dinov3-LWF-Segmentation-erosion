@@ -300,7 +300,7 @@ def resolve_tile_splits_from_gt(
                 right_gap = max(0.0, tb_right - rb_right)
                 top_gap = max(0.0, tb_top - rb_top)
                 bottom_gap = max(0.0, rb_bottom - tb_bottom)
-                logger.debug(
+                logger.info(
                     "auto split: label coverage tile=%s bounds=%s "
                     "raster_bounds=%s ratio=%.4f gaps(L/R/T/B)="
                     "(%.3f, %.3f, %.3f, %.3f) intersects=%s",

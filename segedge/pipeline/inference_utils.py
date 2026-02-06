@@ -320,7 +320,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
     img_b = load_dop20_image(img_path, downsample_factor=ds)
     if debug_reproject:
-        logger.debug("tile image: shape=%s dtype=%s", img_b.shape, img_b.dtype)
+        logger.info("tile image: shape=%s dtype=%s", img_b.shape, img_b.dtype)
     labels_sh = reproject_labels_to_image(
         img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds
     )
@@ -330,13 +330,13 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         else None
     )
     if debug_reproject:
-        logger.debug(
+        logger.info(
             "tile labels_sh: shape=%s dtype=%s",
             labels_sh.shape,
             labels_sh.dtype,
         )
         if gt_mask is not None:
-            logger.debug(
+            logger.info(
                 "tile gt_mask: shape=%s dtype=%s",
                 gt_mask.shape,
                 gt_mask.dtype,
@@ -350,7 +350,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
             target_shape,
         )
         if debug_reproject:
-            logger.debug(
+            logger.info(
                 "labels_sh resize: from=%s to=%s",
                 labels_sh.shape,
                 target_shape,
@@ -369,7 +369,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
             target_shape,
         )
         if debug_reproject:
-            logger.debug(
+            logger.info(
                 "gt_mask resize: from=%s to=%s",
                 gt_mask.shape,
                 target_shape,
@@ -383,8 +383,8 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         ).astype(gt_mask.dtype)
 
     if gt_mask is not None:
-        logger.debug("GT positives on B: %s", gt_mask.sum())
-    logger.debug("SH_2022 positives on B: %s", (labels_sh > 0).sum())
+        logger.info("GT positives on B: %s", gt_mask.sum())
+    logger.info("SH_2022 positives on B: %s", (labels_sh > 0).sum())
     if debug_reproject:
         label_mask = labels_sh > 0
         label_nonzero = int(label_mask.sum())
@@ -407,7 +407,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         right_margin = (labels_sh.shape[1] - 1 - col_max) if col_max >= 0 else -1
         top_margin = row_min if row_min >= 0 else -1
         bottom_margin = (labels_sh.shape[0] - 1 - row_max) if row_max >= 0 else -1
-        logger.debug(
+        logger.info(
             "labels_sh coverage: nonzero=%s mean=%.6f cols=%s..%s rows=%s..%s "
             "margins(L/R/T/B)=%s/%s/%s/%s",
             label_nonzero,
@@ -437,7 +437,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
 
     sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
     if debug_reproject:
-        logger.debug(
+        logger.info(
             "sh_buffer_mask coverage: mean=%.6f nonzero=%s",
             float(sh_buffer_mask.mean()),
             int(sh_buffer_mask.sum()),

@@ -99,7 +99,7 @@ def reproject_labels_to_image(
             ref_res_y = abs(ref.transform.e)
             src_res_x = abs(src.transform.a)
             src_res_y = abs(src.transform.e)
-            logger.debug(
+            logger.info(
                 "ref raster: crs=%s bounds=%s size=%sx%s transform=%s res=(%.6f, %.6f)",
                 ref.crs,
                 tuple(ref.bounds),
@@ -109,7 +109,7 @@ def reproject_labels_to_image(
                 ref_res_x,
                 ref_res_y,
             )
-            logger.debug(
+            logger.info(
                 "label raster: crs=%s bounds=%s size=%sx%s transform=%s res=(%.6f, %.6f) "
                 "nodata=%s dtype=%s count=%s",
                 src.crs,
@@ -137,7 +137,7 @@ def reproject_labels_to_image(
                         "reproject labels: failed to transform label bounds into ref CRS"
                     )
             else:
-                logger.debug(
+                logger.info(
                     "reproject labels: missing CRS ref=%s labels=%s",
                     ref.crs,
                     src.crs,
@@ -157,11 +157,11 @@ def reproject_labels_to_image(
                 right_gap = max(0.0, ref_right - src_right)
                 top_gap = max(0.0, ref_top - src_top)
                 bottom_gap = max(0.0, src_bottom - ref_bottom)
-                logger.debug(
+                logger.info(
                     "label bounds in ref CRS: %s",
                     tuple(src_bounds_ref),
                 )
-                logger.debug(
+                logger.info(
                     "label coverage: ratio=%.4f gaps(L/R/T/B)=(%.3f, %.3f, %.3f, %.3f)",
                     coverage_ratio,
                     left_gap,
@@ -204,7 +204,7 @@ def reproject_labels_to_image(
                 )
             labels_arr = dst.read()
             if debug_reproject:
-                logger.debug(
+                logger.info(
                     "reproject labels: dst_size=%sx%s transform=%s labels_arr_shape=%s",
                     dst_width,
                     dst_height,
@@ -221,7 +221,7 @@ def reproject_labels_to_image(
             labels_path,
         )
         if debug_reproject:
-            logger.debug(
+            logger.info(
                 "reproject labels: resizing labels from %s to %s",
                 labels_2d.shape,
                 expected_shape,
@@ -237,7 +237,7 @@ def reproject_labels_to_image(
         nonzero = int(np.count_nonzero(labels_2d))
         min_val = float(np.min(labels_2d)) if labels_2d.size else 0.0
         max_val = float(np.max(labels_2d)) if labels_2d.size else 0.0
-        logger.debug(
+        logger.info(
             "reproject labels: final shape=%s dtype=%s min=%.3f max=%.3f nonzero=%s",
             labels_2d.shape,
             labels_2d.dtype,
@@ -255,7 +255,7 @@ def reproject_labels_to_image(
             right_margin = labels_2d.shape[1] - 1 - col_max
             top_margin = row_min
             bottom_margin = labels_2d.shape[0] - 1 - row_max
-            logger.debug(
+            logger.info(
                 "reproject labels: nonzero rows=%s..%s cols=%s..%s "
                 "margins(L/R/T/B)=%s/%s/%s/%s",
                 row_min,

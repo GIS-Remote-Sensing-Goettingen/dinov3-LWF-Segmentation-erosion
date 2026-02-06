@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.21]
+- Description: Promote internal debug logs to info and set default log level to INFO.
+- file touched: `config.py`, `segedge/core/io_utils.py`, `segedge/core/knn.py`, `segedge/pipeline/common.py`, `segedge/pipeline/inference_utils.py`, `CHANGELOG.md`
+- reason: Keep our diagnostics visible without enabling third-party debug spam.
+- problems fixed: Reduces noisy dependency debug logs while retaining detailed pipeline tracing.
+
 ## [0.2.20]
 - Description: Clip and simplify roads geometries before rasterization to reduce mask build time.
 - file touched: `config.py`, `segedge/pipeline/inference_utils.py`, `CHANGELOG.md`
