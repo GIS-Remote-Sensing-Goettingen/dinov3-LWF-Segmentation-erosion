@@ -15,8 +15,17 @@ TARGET_TILE = "data/dop20_592000_5982000_1km_20cm.tif"
 TILES_DIR = "/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1"
 TILE_GLOB = "*.tif"
 AUTO_SPLIT_TILES = True
+# Auto-split mode:
+# - "gt_to_val_cap_holdout": all GT-overlap tiles are validation; source comes from
+#   SOURCE_TILES; holdout (non-GT) can be capped.
+# - "legacy_gt_source_val_holdout": split GT-overlap tiles into source/validation.
+AUTO_SPLIT_MODE = "gt_to_val_cap_holdout"
 VAL_SPLIT_FRACTION = 0.5
 SPLIT_SEED = 42
+# Holdout cap (applies in gt_to_val_cap_holdout mode).
+INFERENCE_TILE_CAP_ENABLED = True
+INFERENCE_TILE_CAP = 50
+INFERENCE_TILE_CAP_SEED = 42
 # Downsample factor for GT presence checks (None uses RESAMPLE_FACTOR).
 GT_PRESENCE_DOWNSAMPLE = None
 # Worker count for GT presence checks (None uses SLURM_CPUS_PER_TASK or os.cpu_count()).

@@ -38,7 +38,12 @@ from ..core.summary_utils import timing_summary as _timing_summary
 from ..core.summary_utils import weighted_mean as _weighted_mean
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import build_xgb_dataset, xgb_score_image_b
-from .common import init_model, resolve_tile_splits_from_gt
+from .common import (
+    AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT,
+    AUTO_SPLIT_MODE_LEGACY,
+    init_model,
+    resolve_tile_splits_from_gt,
+)
 from .inference_utils import (
     _apply_roads_penalty,
     _apply_shadow_filter,
@@ -600,11 +605,14 @@ def main():
     if auto_split_tiles:
         tiles_dir = getattr(cfg, "TILES_DIR", "data/tiles")
         tile_glob = getattr(cfg, "TILE_GLOB", "*.tif")
+        split_mode = str(
+            getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)
+        ).strip()
         val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
         seed = int(getattr(cfg, "SPLIT_SEED", 42))
         downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
         num_workers = getattr(cfg, "GT_PRESENCE_WORKERS", None)
-        img_a_paths, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
+        split_source_tiles, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
             tiles_dir,
             tile_glob,
             gt_vector_paths,
@@ -612,13 +620,36 @@ def main():
             seed,
             downsample_factor=downsample_factor,
             num_workers=num_workers,
+            mode=split_mode,
+            inference_tile_cap_enabled=getattr(
+                cfg, "INFERENCE_TILE_CAP_ENABLED", False
+            ),
+            inference_tile_cap=getattr(cfg, "INFERENCE_TILE_CAP", None),
+            inference_tile_cap_seed=getattr(cfg, "INFERENCE_TILE_CAP_SEED", seed),
         )
-        logger.info(
-            "auto split tiles: source=%s val=%s holdout=%s",
-            len(img_a_paths),
-            len(val_tiles),
-            len(holdout_tiles),
-        )
+        if split_mode == AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT:
+            img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
+            if not img_a_paths:
+                raise ValueError(
+                    "SOURCE_TILES must be set when "
+                    "AUTO_SPLIT_MODE='gt_to_val_cap_holdout'"
+                )
+            logger.info(
+                "auto split tiles mode=%s: source(manual)=%s val(gt)=%s holdout=%s",
+                split_mode,
+                len(img_a_paths),
+                len(val_tiles),
+                len(holdout_tiles),
+            )
+        else:
+            img_a_paths = split_source_tiles
+            logger.info(
+                "auto split tiles mode=%s: source=%s val=%s holdout=%s",
+                split_mode,
+                len(img_a_paths),
+                len(val_tiles),
+                len(holdout_tiles),
+            )
     else:
         img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
         val_tiles = cfg.VAL_TILES
@@ -810,7 +841,7 @@ def main():
         tuned["best_raw_config"],
         tuned["best_crf_config"],
         cfg.MODEL_NAME,
-        getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
+        img_a_paths if len(img_a_paths) > 1 else img_a_paths[0],
         f"holdout_tiles={len(holdout_tiles)}",
         float(val_buffer_m) if val_buffer_m is not None else 0.0,
         float(val_pixel_size_m) if val_pixel_size_m is not None else 0.0,
@@ -838,6 +869,14 @@ def main():
                 getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
             ),
             "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            "auto_split_tiles": bool(auto_split_tiles),
+            "auto_split_mode": str(
+                getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)
+            ),
+            "inference_tile_cap_enabled": bool(
+                getattr(cfg, "INFERENCE_TILE_CAP_ENABLED", False)
+            ),
+            "inference_tile_cap": getattr(cfg, "INFERENCE_TILE_CAP", None),
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,

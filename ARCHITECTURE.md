@@ -17,6 +17,10 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 
 ## Workflow
 1. Configure paths and hyperparameters in `config.py`.
-2. If `AUTO_SPLIT_TILES=True`, tiles are discovered from `TILES_DIR` and split into
-   source/validation using `EVAL_GT_VECTORS`; tiles without GT become holdout.
+2. If `AUTO_SPLIT_TILES=True`, tiles are discovered from `TILES_DIR` and split using
+   `AUTO_SPLIT_MODE`:
+   - `gt_to_val_cap_holdout`: all GT-overlap tiles become validation, source tiles
+     come from `SOURCE_TILES`, and non-GT holdout tiles can be capped.
+   - `legacy_gt_source_val_holdout`: GT-overlap tiles are split into source/validation,
+     and non-GT tiles become holdout.
 3. Run `python main.py` for the full pipeline.

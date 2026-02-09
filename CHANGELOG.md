@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.23]
+- Description: Add auto-split mode for GT-to-validation workflow with deterministic holdout tile cap.
+- file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Support workflows that validate on all GT-overlap tiles while limiting holdout inference runtime.
+- problems fixed: Prevents unwanted GT source/val splitting for this workflow and bounds inference tile count with reproducible sampling.
+
 ## [0.2.22]
 - Description: Add tuning-phase preview plots for up to 10 validation tiles.
 - file touched: `config.py`, `segedge/pipeline/tuning.py`, `CHANGELOG.md`
