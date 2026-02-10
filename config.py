@@ -82,6 +82,19 @@ TIMING_CSV_FILENAME = "tile_phase_timing.csv"
 TIMING_SUMMARY_CSV_FILENAME = "timing_opportunity_cost.csv"
 # Flush cadence for detailed rows (1 updates files after every completed tile).
 TIMING_CSV_FLUSH_EVERY = 1
+# Explainability outputs (Tier 1, no SHAP dependency).
+XAI_ENABLED = True
+XAI_SAVE_JSON = True
+XAI_SAVE_PLOTS = True
+XAI_DIRNAME = "xai"
+XAI_SUMMARY_FILENAME = "xai_summary.csv"
+XAI_TOP_FEATURES = 20
+XAI_TOP_PATCHES = 50
+XAI_INCLUDE_XGB = True
+XAI_INCLUDE_KNN = True
+XAI_HOLDOUT_CAP_ENABLED = True
+XAI_HOLDOUT_CAP = 10
+XAI_HOLDOUT_CAP_SEED = 42
 # Resume previous run (requires RESUME_RUN_DIR).
 RESUME_RUN = False
 RESUME_RUN_DIR = None

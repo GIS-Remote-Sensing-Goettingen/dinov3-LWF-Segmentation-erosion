@@ -3,6 +3,24 @@
 
 ## [Unreleased]
 
+## [0.2.28]
+- Description: Fix duplicate XAI JSON write per tile and align XAI write timing with actual single-write behavior.
+- file touched: `segedge/pipeline/run.py`, `CHANGELOG.md`
+- reason: Remove redundant disk I/O in the explainability path and keep timing telemetry trustworthy for runtime opportunity-cost analysis.
+- problems fixed: Prevents writing each XAI JSON twice and avoids underreporting `xai_write_s`/`xai_total_s` caused by an unmeasured second write.
+
+## [0.2.27]
+- Description: Add Tier-1 explainability outputs (XGB+kNN) with per-tile JSON/plots and capped holdout coverage.
+- file touched: `config.py`, `segedge/core/explainability.py`, `segedge/core/__init__.py`, `segedge/pipeline/run.py`, `tests/test_explainability.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Make model behavior inspectable during runtime without adding heavy dependencies, while keeping holdout overhead bounded.
+- problems fixed: Adds structured explainability artifacts, run-level XAI summaries, deterministic holdout XAI capping, and explicit XAI timings per tile.
+
+## [0.2.26]
+- Description: Expand architecture and knowledge base docs into code-aligned, thesis-ready technical references.
+- file touched: `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Provide complete, implementation-faithful documentation of runtime flow, split semantics, telemetry contracts, and reporting guidance.
+- problems fixed: Replaces outdated/incomplete docs with a structured architecture map and a reproducibility-focused knowledge base that matches current pipeline behavior.
+
 ## [0.2.25]
 - Description: Retune top-p/CRF/shadow search ranges in config for less top-p cap saturation and safer post-processing defaults.
 - file touched: `config.py`, `CHANGELOG.md`

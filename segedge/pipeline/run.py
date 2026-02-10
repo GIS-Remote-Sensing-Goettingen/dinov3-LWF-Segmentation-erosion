@@ -17,6 +17,18 @@ import config as cfg
 from ..core.banks import build_banks_single_scale
 from ..core.continuity import bridge_skeleton_gaps, skeletonize_with_endpoints
 from ..core.crf_utils import refine_with_densecrf
+from ..core.explainability import (
+    append_xai_summary_csv,
+    build_dim_activation_map,
+    build_xai_summary_row,
+    distribution_stats,
+    get_xgb_importance_dict,
+    save_xai_tile_plot,
+    select_holdout_tiles_for_xai,
+    summarize_knn_signals,
+    summarize_tile_latent_dims,
+    write_xai_tile_json,
+)
 from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
     append_mask_to_union_shapefile,
@@ -166,6 +178,7 @@ def infer_on_holdout(
     shape_dir: str,
     context_radius: int,
     plot_with_metrics: bool = True,
+    xai_options: dict | None = None,
 ):
     """Run inference on a holdout tile using tuned settings.
 
@@ -185,6 +198,7 @@ def infer_on_holdout(
         shape_dir (str): Output shapefile directory.
         context_radius (int): Feature context radius.
         plot_with_metrics (bool): Whether to show metrics on plots.
+        xai_options (dict | None): Optional explainability configuration.
 
     Returns:
         dict: Masks, metrics, and metadata for the tile.
@@ -242,7 +256,7 @@ def infer_on_holdout(
     buffer_density = float(sh_buffer_mask.mean())
     top_p_val = _compute_top_p(buffer_density, top_p_a, top_p_b, top_p_min, top_p_max)
     t0 = time.perf_counter()
-    score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
+    score_knn, saliency_knn = zero_shot_knn_single_scale_B_with_saliency(
         img_b,
         pos_bank,
         neg_bank,
@@ -459,6 +473,134 @@ def infer_on_holdout(
         bridge_enabled=bridge_enabled,
     )
     timings["plot_s"] = time.perf_counter() - t0
+
+    xai_cfg = xai_options or {}
+    xai_enabled = bool(xai_cfg.get("enabled", False))
+    if xai_enabled:
+        include_xgb = bool(xai_cfg.get("include_xgb", True))
+        include_knn = bool(xai_cfg.get("include_knn", True))
+        top_features = int(xai_cfg.get("top_features", 20) or 20)
+        top_patches = int(xai_cfg.get("top_patches", 50) or 50)
+        stage_name = str(xai_cfg.get("stage", "holdout")).strip().lower()
+        xai_root = str(xai_cfg.get("xai_dir", cfg.PLOT_DIR))
+        summary_csv_path = xai_cfg.get("summary_csv_path")
+        save_json = bool(xai_cfg.get("save_json", True))
+        save_plots = bool(xai_cfg.get("save_plots", True))
+
+        t0 = time.perf_counter()
+        xgb_importance = (
+            get_xgb_importance_dict(tuned.get("bst"), top_k=top_features)
+            if include_xgb
+            else {"top_dims": [], "importance": [], "xgb_gain_share_top5": 0.0}
+        )
+        latent_summary = summarize_tile_latent_dims(
+            prefetched_b,
+            xgb_importance["top_dims"],
+            top_patches=top_patches,
+        )
+        dim_activation_map = (
+            build_dim_activation_map(
+                prefetched_b,
+                img_b.shape[:2],
+                latent_summary.get("selected_dims", []),
+            )
+            if include_xgb
+            else np.zeros(img_b.shape[:2], dtype=np.float32)
+        )
+        knn_summary = (
+            summarize_knn_signals(
+                score_knn,
+                saliency_knn,
+                sh_buffer_mask,
+                threshold=knn_thr,
+            )
+            if include_knn
+            else {
+                "score_distribution": distribution_stats(score_knn),
+                "saliency_distribution": None,
+                "buffered_score_mean": 0.0,
+                "buffered_positive_ratio": None,
+            }
+        )
+        xgb_score_stats = distribution_stats(score_xgb)
+        timings["xai_prepare_s"] = time.perf_counter() - t0
+
+        xai_stage_dir = os.path.join(xai_root, stage_name)
+        os.makedirs(xai_stage_dir, exist_ok=True)
+        payload = {
+            "run_dir": os.path.dirname(cfg.PLOT_DIR),
+            "stage": stage_name,
+            "tile_path": holdout_path,
+            "image_id": image_id_b,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "xgb": {
+                "global_feature_importance": xgb_importance["importance"],
+                "top_dims": xgb_importance["top_dims"],
+                "xgb_gain_share_top5": xgb_importance["xgb_gain_share_top5"],
+                "tile_feature_activation_stats": latent_summary,
+                "score_distribution": xgb_score_stats,
+            },
+            "knn": knn_summary,
+            "masks": {
+                "knn_raw_nonzero": int(np.count_nonzero(mask_knn)),
+                "xgb_raw_nonzero": int(np.count_nonzero(mask_xgb)),
+                "champion_raw_nonzero": int(np.count_nonzero(champ_raw_mask)),
+                "champion_shadow_nonzero": int(np.count_nonzero(shadow_mask)),
+            },
+            "runtime": {},
+        }
+
+        t0 = time.perf_counter()
+        if save_plots:
+            xai_plot_path = os.path.join(xai_stage_dir, f"{image_id_b}_xai.png")
+            save_xai_tile_plot(
+                img_b=img_b,
+                score_xgb=score_xgb,
+                score_knn=score_knn,
+                dim_activation_map=dim_activation_map,
+                champion_mask=shadow_mask,
+                sh_buffer_mask=sh_buffer_mask,
+                out_path=xai_plot_path,
+                title_suffix=stage_name,
+            )
+            payload["xai_plot_path"] = xai_plot_path
+        timings["xai_plot_s"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        xai_json_path = None
+        payload["runtime"] = {
+            "xai_prepare_s": float(timings["xai_prepare_s"]),
+            "xai_plot_s": float(timings["xai_plot_s"]),
+        }
+        if save_json:
+            xai_json_path = os.path.join(xai_stage_dir, f"{image_id_b}.json")
+            payload["xai_json_path"] = xai_json_path
+            write_xai_tile_json(xai_json_path, payload)
+        timings["xai_write_s"] = time.perf_counter() - t0
+        timings["xai_total_s"] = (
+            timings.get("xai_prepare_s", 0.0)
+            + timings.get("xai_plot_s", 0.0)
+            + timings.get("xai_write_s", 0.0)
+        )
+        payload["runtime"] = {
+            "xai_prepare_s": float(timings["xai_prepare_s"]),
+            "xai_plot_s": float(timings["xai_plot_s"]),
+            "xai_write_s": float(timings["xai_write_s"]),
+            "xai_total_s": float(timings["xai_total_s"]),
+        }
+        if summary_csv_path:
+            summary_row = build_xai_summary_row(
+                stage=stage_name,
+                image_id=image_id_b,
+                tile_path=holdout_path,
+                top_dims=xgb_importance["top_dims"],
+                xgb_gain_share_top5=xgb_importance["xgb_gain_share_top5"],
+                knn_score_stats=knn_summary["score_distribution"],
+                xgb_score_stats=xgb_score_stats,
+                champion_mask=shadow_mask,
+                xai_total_s=float(timings["xai_total_s"]),
+            )
+            append_xai_summary_csv(str(summary_csv_path), summary_row)
     timings["total_s"] = time.perf_counter() - t0_total
 
     champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
@@ -748,6 +890,40 @@ def main():
     if not holdout_tiles:
         logger.warning("no holdout tiles resolved; skipping holdout inference")
 
+    xai_enabled = bool(getattr(cfg, "XAI_ENABLED", True))
+    xai_save_json = bool(getattr(cfg, "XAI_SAVE_JSON", True))
+    xai_save_plots = bool(getattr(cfg, "XAI_SAVE_PLOTS", True))
+    xai_include_xgb = bool(getattr(cfg, "XAI_INCLUDE_XGB", True))
+    xai_include_knn = bool(getattr(cfg, "XAI_INCLUDE_KNN", True))
+    xai_top_features = int(getattr(cfg, "XAI_TOP_FEATURES", 20) or 20)
+    xai_top_patches = int(getattr(cfg, "XAI_TOP_PATCHES", 50) or 50)
+    xai_dir = os.path.join(run_dir, str(getattr(cfg, "XAI_DIRNAME", "xai")))
+    xai_summary_csv_path = os.path.join(
+        run_dir,
+        str(getattr(cfg, "XAI_SUMMARY_FILENAME", "xai_summary.csv")),
+    )
+    xai_holdout_cap_enabled = bool(getattr(cfg, "XAI_HOLDOUT_CAP_ENABLED", True))
+    xai_holdout_cap = int(getattr(cfg, "XAI_HOLDOUT_CAP", 10) or 0)
+    xai_holdout_cap_seed = int(getattr(cfg, "XAI_HOLDOUT_CAP_SEED", 42) or 42)
+    xai_holdout_selected = (
+        select_holdout_tiles_for_xai(
+            holdout_tiles,
+            xai_holdout_cap_enabled,
+            xai_holdout_cap,
+            xai_holdout_cap_seed,
+        )
+        if xai_enabled
+        else set()
+    )
+    logger.info(
+        "xai: enabled=%s val=all holdout_selected=%s/%s cap_enabled=%s cap=%s",
+        xai_enabled,
+        len(xai_holdout_selected),
+        len(holdout_tiles),
+        xai_holdout_cap_enabled,
+        xai_holdout_cap,
+    )
+
     # ------------------------------------------------------------
     # Feature caching
     # ------------------------------------------------------------
@@ -921,6 +1097,18 @@ def main():
             shape_dir,
             context_radius,
             plot_with_metrics=True,
+            xai_options={
+                "enabled": xai_enabled,
+                "stage": "validation",
+                "xai_dir": xai_dir,
+                "summary_csv_path": xai_summary_csv_path,
+                "top_features": xai_top_features,
+                "top_patches": xai_top_patches,
+                "include_xgb": xai_include_xgb,
+                "include_knn": xai_include_knn,
+                "save_json": xai_save_json,
+                "save_plots": xai_save_plots,
+            },
         )
         if result["gt_available"]:
             _update_phase_metrics(val_phase_metrics, result["metrics"])
@@ -999,6 +1187,12 @@ def main():
                     cfg, "TIMING_SUMMARY_CSV_FILENAME", "timing_opportunity_cost.csv"
                 )
             ),
+            "xai_enabled": xai_enabled,
+            "xai_summary_filename": str(
+                getattr(cfg, "XAI_SUMMARY_FILENAME", "xai_summary.csv")
+            ),
+            "xai_holdout_cap_enabled": xai_holdout_cap_enabled,
+            "xai_holdout_cap": xai_holdout_cap,
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,
@@ -1013,6 +1207,7 @@ def main():
         if b_path in processed_tiles:
             logger.info("holdout skip (already processed): %s", b_path)
             continue
+        holdout_xai_enabled = xai_enabled and b_path in xai_holdout_selected
         result = infer_on_holdout(
             b_path,
             gt_vector_paths,
@@ -1029,6 +1224,18 @@ def main():
             shape_dir,
             context_radius,
             plot_with_metrics=False,
+            xai_options={
+                "enabled": holdout_xai_enabled,
+                "stage": "holdout",
+                "xai_dir": xai_dir,
+                "summary_csv_path": xai_summary_csv_path,
+                "top_features": xai_top_features,
+                "top_patches": xai_top_patches,
+                "include_xgb": xai_include_xgb,
+                "include_knn": xai_include_knn,
+                "save_json": xai_save_json,
+                "save_plots": xai_save_plots,
+            },
         )
         if result["gt_available"]:
             _update_phase_metrics(holdout_phase_metrics, result["metrics"])
@@ -1114,6 +1321,9 @@ def main():
             "timing_summary_csv_path": (
                 timing_summary_csv_path if timing_csv_enabled else None
             ),
+            "xai_enabled": bool(xai_enabled),
+            "xai_dir": xai_dir if xai_enabled else None,
+            "xai_summary_csv_path": xai_summary_csv_path if xai_enabled else None,
         },
         "validation": {
             "metrics": phase_summary_val,

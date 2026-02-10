@@ -12,6 +12,7 @@ __all__ = [
     "banks",
     "crf_utils",
     "features",
+    "explainability",
     "io_utils",
     "knn",
     "logging_utils",

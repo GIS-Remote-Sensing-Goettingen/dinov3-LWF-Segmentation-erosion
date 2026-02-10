@@ -1,262 +1,515 @@
-# Project Knowledge Base (for a new LLM)
+# Project Knowledge Base (Thesis-Grade Reference)
 
-This document gives a complete, self-contained description of the SegEdge zero-shot LWF segmentation pipeline: objectives, data, implementation, configs, performance, known issues, and reproduction steps. It assumes no prior knowledge.
+This document is the authoritative technical reference for the current SegEdge
+pipeline. It is written for paper/thesis use, engineering onboarding, and
+operations.
 
----
-
-## 1) Scope & Audience
-- Audience: a new LLM/engineer with zero context.
-- Goal: explain what the pipeline does, how it’s structured, how to run/evaluate it, and what has failed or been fixed.
-- Source tree: `/home/mak/PycharmProjects/dinov3-LWF-Segmentation-erosion`.
-- Style: practical “how it works + how to run + what to avoid”, not marketing.
-- Environment: see Section 12 for dependencies/versions and run recipes.
-
----
-
-## 2) High-Level Overview
-- Objective: Zero-shot segmentation of linear woody features (LWFs) on a target orthoimage (Image B) by transferring semantics from a labeled reference image (Image A).
-- Core idea: Use DINOv3 patch embeddings to represent texture/structure; build positive/negative patch banks from A; score B via kNN or a learned XGBoost patch classifier; refine with CRF and a shadow filter.
-- Pipeline stages:
-  1. Load imagery + SH_2022 raster + GT vector labels.
-  2. Buffer SH_2022 to constrain predictions.
-  3. Extract/cached DINO features (patch size 16), with optional batching.
-  4. Build banks (positives/negatives) from A.
-  5. Score B with kNN (pos − α·neg) over k grid; apply adaptive top-p inside buffer.
-  6. Optional XGBoost classifier on patch features; apply adaptive top-p inside buffer.
-  7. Choose champion (best validation IoU between kNN and XGB) and build silver_core = kNN ∩ XGB.
-  8. Median filter champion mask; CRF search around champion.
-  9. Continuity bridging (skeleton + shortest path) to close small gaps.
-  10. Shadow filtering (RGB weighted dark-pixel removal).
-  11. Export unified plots, rolling union shapefiles (holdout-only), and inference best-settings YAML.
-- Design choices: zero-shot (no fine-tuning of backbone), aggressive caching, grid-search for self-calibration, post-hoc refinements (CRF, shadow) to clean edges/dark areas.
-- Backbone detail: DINOv3 ViT-L/16 (sat493m pretrain), embedding dim ~1024, patch grid size Hp×Wp where Hp = H/16, Wp = W/16 on each tile.
+It focuses on three guarantees:
+1. **Code truth alignment**: statements reflect the current implementation.
+2. **Reproducibility readiness**: run contracts and artifact schemas are explicit.
+3. **Historical traceability**: major implemented experiments and changes are
+   documented by version.
 
 ---
 
-## 3) Data & Labeling Details
-- Inputs (config.py):
-  - Image A: `data/dop20_593000_5979000_1km_20cm.tif`
-  - Image B: `data/dop20_592000_5982000_1km_20cm.tif`
-  - SH_2022 raster: `data/planet_labels_2022.tif`
-  - GT vector (B): `data/labels_final.shp`
-- Reprojection: `io_utils.reproject_labels_to_image` aligns raster labels to image grids; `rasterize_vector_labels` rasterizes GT.
-- Buffer: `build_sh_buffer_mask` dilates SH_2022 by `BUFFER_M` meters (converted to pixels). Optional `CLIP_GT_TO_BUFFER` masks GT outside buffer to allow 100% IoU inside the allowed region.
-- Tiling: default `TILE_SIZE=1024`, `STRIDE=512`; tiles cropped to multiples of patch size (16).
-- Patch labeling for A: `labels_to_patch_masks` marks a patch positive if FG fraction ≥ `POS_FRAC_THRESH` (default 0.1); negative if zero FG.
-- CRS: Vector CRS is reprojected to raster CRS when needed; if vector CRS missing, assumes EPSG:4326 with a warning.
-- Auto split: `AUTO_SPLIT_TILES=True` scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then splits GT-positive tiles into source/val and the rest into holdout.
-- GT presence scan uses cached vector intersection (no per-tile rasterization) and can run in parallel.
-- All downstream masks can be clipped to the SH buffer to enforce spatial priors.
-- Typical buffer: 8 m → at 0.2 m/pixel, buffer_pixels ≈ 40 (configurable).
-- Label erosion: banks use a slight erosion (disk radius 2) to avoid noisy boundaries when picking positives.
-- Pos/neg counts: After subsampling, typical banks: ~6–10k positives, up to `MAX_NEG_BANK` negatives (default 8k).
+## 1) Scope, Audience, and Guarantees
+
+### Audience
+- Thesis/paper author (methodology and ablation sections).
+- Operator running large tile batches.
+- Engineer extending the pipeline.
+
+### Scope
+- Main pipeline only (`main.py` -> `segedge/pipeline/run.py`).
+- Split policy, tuning, inference, exports, telemetry, and failure handling.
+
+### Document Guarantees
+- **Normative**: behavior described as "current" is expected to match code.
+- **Historical**: experiment/change history is summarized from `CHANGELOG.md`.
+- **Template-based evidence**: result sections use explicit placeholders unless
+  values are directly tied to run artifacts.
 
 ---
 
-## 4) Model Components
-- **DINOv3**: HuggingFace `facebook/dinov3-vitl16-pretrain-sat493m`; patch size 16; features L2-normalized; optional FP16 matmul for kNN.
-- **kNN scorer** (`knn.py`):
-  - Score = mean top-k pos sims − α·mean top-k neg sims (`NEG_ALPHA`).
-  - FP16 matmul optional; negative bank subsampling (`MAX_NEG_BANK`).
-  - Threshold sweep via GPU/CPU batch metrics.
-- **XGBoost classifier** (`xdboost.py`):
-  - Trains on patch features from A (pos/neg); optional hyperparam search by IoU on B (`hyperparam_search_xgb_iou`).
-  - Params grid in `config.XGB_PARAM_GRID`; uses logloss for training/early stop but selection by IoU on B after threshold sweep.
-- **Champion selection**: Pick the model (kNN or XGB) with best IoU on validation; its score map drives CRF.
-- **Median filter**: 3×3 applied after thresholding (kNN and XGB) to remove speckle.
-- **Bank sizes (typical)**: Positives ~6–10k patches; negatives capped at `MAX_NEG_BANK` (default 8000) to control memory.
-- **DINO feature storage**: per-tile `.npy` (Hp×Wp×1024), consolidated full arrays for A/B for analysis.
-- **Champion rule**: Compare best IoU from kNN (post-median) vs XGB (post-median); the higher IoU becomes champion for CRF and onward.
+## 2) Problem Formulation
+
+### Task
+Given one or more source tiles with raster supervision (`SOURCE_LABEL_RASTER`) and
+an unlabeled target domain of tiles, segment linear woody features (LWF).
+
+### Inputs
+- RGB orthophoto tiles (`*.tif`).
+- Source supervision raster (`SOURCE_LABEL_RASTER`).
+- Evaluation vectors (`EVAL_GT_VECTORS`) for validation scoring and split logic.
+- Optional roads vector mask (`ROADS_MASK_PATH`) for multiplicative score penalty.
+
+### Outputs
+- Per-run plots, union shapefiles, frozen settings YAML, run summary YAML.
+- Incremental timing telemetry (`tile_phase_timing.csv`,
+  `timing_opportunity_cost.csv`).
+
+### Core Modeling Assumption
+Semantic transfer is possible via DINOv3 patch embeddings from source tiles to
+new tiles, then calibrated with validation-driven thresholding and
+post-processing.
 
 ---
 
-## 5) Post-Processing & Refinement
-- **Thresholding**: Adaptive top-p inside buffer (p(d) = clip(a·d + b)); median filter (size=3) applied to masks (kNN and XGB) to reduce speckle.
-- **CRF** (`crf_utils.py`):
-  - Unary = logistic(score − thr_center)/prob_softness; respects SH buffer (outside forced near-zero FG).
-  - Pairwise Gaussian + bilateral (color/XY).
-  - Grid search over softness/weights/sigmas; optional downsample; process-based parallelism.
-- **Shadow filter** (`shadow_filter.py`):
-  - Under the CRF mask, compute weighted RGB sums; sweep thresholds to drop dark pixels; select best IoU.
-- **Continuity bridging** (`continuity.py`):
-  - Skeletonize CRF mask and connect nearby endpoints via shortest paths on a cost map from CRF posterior.
-  - Dilation restores a thin ribbon; optional spur pruning and small-component removal.
-- **Resize strategy**: Patch scores are resized to pixel grid with bilinear (order=1, anti_aliasing=True) before accumulation; overlaps averaged by weights.
+## 3) Algorithmic Overview
+
+### Stage Graph
+1. Resolve source/validation/holdout tiles.
+2. Build source feature banks and XGB dataset.
+3. Tune settings on validation set.
+4. Infer on validation with frozen settings.
+5. Infer on holdout with frozen settings.
+6. Export unions, settings, summaries, and telemetry.
+
+### Per-Tile Inference Chain
+For each inference tile:
+1. Load image and masks (SH labels, optional GT).
+2. Build SH buffer mask.
+3. Prefetch tile features.
+4. Score with kNN and XGB.
+5. Apply adaptive top-p threshold in SH buffer.
+6. Compute silver core (kNN ∩ XGB, optional dilation).
+7. Select champion raw stream.
+8. CRF refinement.
+9. Optional continuity bridging.
+10. Shadow filtering.
+11. Plot/export/metrics/timing.
 
 ---
 
-## 6) Configuration & Runtime Controls (config.py)
-- Paths: `SOURCE_TILE`, `TARGET_TILE`, `SOURCE_LABEL_RASTER`, `EVAL_GT_VECTOR`/`EVAL_GT_VECTORS`, `FEATURE_DIR`, `BANK_CACHE_DIR`, `PLOT_DIR`, `BEST_SETTINGS_PATH`.
-- Geometry: `BUFFER_M`, `TILE_SIZE`, `STRIDE`, `PATCH_SIZE`.
-- Auto split: `AUTO_SPLIT_TILES`, `TILES_DIR`, `TILE_GLOB`, `VAL_SPLIT_FRACTION`, `SPLIT_SEED`.
-- GT scan: `GT_PRESENCE_WORKERS`, `GT_PRESENCE_DOWNSAMPLE`.
-- Banks/Scoring: `NEG_ALPHA`, `POS_FRAC_THRESH`, `MAX_NEG_BANK`.
-- kNN grid: `K_VALUES`, `THRESHOLDS`, `USE_FP16_KNN`, `USE_GPU_THRESHOLD_METRICS`, batch sizes.
-- CRF grid: softness/weights/sigmas, `CRF_NUM_WORKERS`, `CRF_MAX_CONFIGS` (from main).
-- XGBoost: `XGB_USE_GPU`, `XGB_PARAM_GRID`, `XGB_NUM_BOOST_ROUND`, `XGB_EARLY_STOP`, `XGB_VERBOSE_EVAL`, `XGB_VAL_FRACTION`.
-- Shadow: `SHADOW_WEIGHT_SETS`, `SHADOW_THRESHOLDS`.
-- Roads penalty: `ROADS_MASK_PATH`, `ROADS_PENALTY_VALUES`.
-- Top-p selection: `TOP_P_A`, `TOP_P_B`, `TOP_P_MIN`, `TOP_P_MAX`, plus tuning grids; `SILVER_CORE_DILATE_PX`.
-- Bridging: `ENABLE_GAP_BRIDGING`, `BRIDGE_MAX_GAP_PX`, `BRIDGE_MAX_PAIRS`, `BRIDGE_MAX_AVG_COST`, `BRIDGE_WIDTH_PX`, `BRIDGE_MIN_COMPONENT_PX`, `BRIDGE_SPUR_PRUNE_ITERS`.
-- Evaluation: `CLIP_GT_TO_BUFFER`.
-- Batching: `FEATURE_BATCH_SIZE` controls per-forward tile batching in prefetch.
-- Resume: `RESUME_RUN`, `RESUME_RUN_DIR` for continuing holdout inference.
-- Rolling unions: `UNION_BACKUP_EVERY`, `UNION_BACKUP_DIR`.
-- Plots: saved to `PLOT_DIR`, with overlays for kNN vs XGB vs GT, champion pre-CRF, and raw/CRF/shadow panels.
-- kNN neg weighting: `NEG_ALPHA` controls subtraction of negative bank similarity; set to 1.0 by default; lowering reduces penalty from negatives.
+## 4) Formal Definitions
+
+Let:
+- `S_knn(x)` be kNN score map at pixel `x`.
+- `S_xgb(x)` be XGB score map at pixel `x`.
+- `B(x)` be SH buffer mask (`True/False`).
+- `d = mean(B)` be buffer density.
+
+Adaptive top-p:
+- `p(d) = clip(a * d + b, p_min, p_max)`
+- Threshold `tau` is chosen so only top `p(d)` fraction inside buffer is kept.
+
+Binary mask from score `S`:
+- `M_raw(x) = 1[S(x) >= tau and B(x)]`
+- Median-filtered before downstream stages.
+
+Champion choice:
+- If `IoU(xgb_raw) >= IoU(knn_raw)`, champion source is `xgb`, else `knn`.
+
+Silver core:
+- `M_core = dilate(M_knn_raw ∩ M_xgb_raw, r = SILVER_CORE_DILATE_PX)`.
 
 ---
 
-## 7) Code Architecture (modules)
-- `main.py`: CLI wrapper for the full pipeline (delegates to `segedge/pipeline/run.py`).
-- `config.py`: All tunable paths/hyperparams.
-- `segedge/pipeline/run.py`: Orchestrator—loads data, builds banks, runs kNN + XGB, selects champion, plots, CRF, shadow filter, exports shapefiles/YAML.
-- `segedge/pipeline/common.py`: Shared helpers for entrypoints.
-- `segedge/core/timing_utils.py`: Timing helpers + debug flags.
-- `segedge/core/features.py`: Tiling, cropping, DINO feature extraction, prefetch, normalization.
-- `segedge/core/banks.py`: Build/load/save positive/negative banks; subsample negatives.
-- `segedge/core/knn.py`: kNN scoring, threshold sweep, fine-tune threshold.
-- `segedge/core/metrics_utils.py`: Metrics (IoU/F1/P/R) and batched GPU/CPU threshold eval; oracle upper bound.
-- `segedge/core/crf_utils.py`: DenseCRF refine and grid search.
-- `segedge/core/io_utils.py`: I/O (load images, reproject, rasterize, buffer, shapefile export, feature consolidation, best-settings YAML writer).
-- `segedge/core/plotting.py`: Plots for raw/CRF/shadow and GT/kNN/XGB overlays.
-- `segedge/core/shadow_filter.py`: Weighted-sum dark-pixel filtering under mask.
-- `segedge/core/xdboost.py`: Build XGB dataset, train, hyperparam search by IoU on B, score image B.
-- `KB.md`: This document.
+## 5) Data and Coordinate System Handling
+
+### Reprojection Policy
+- Raster labels are reprojected to tile grid by `reproject_labels_to_image`.
+- GT vectors are rasterized in tile CRS by `rasterize_vector_labels`.
+- Missing vector CRS triggers fallback warning behavior.
+
+### Buffer Construction
+- `BUFFER_M` converted to pixels using tile resolution.
+- `build_sh_buffer_mask` constrains candidate prediction area.
+
+### GT Clipping Option
+- `CLIP_GT_TO_BUFFER=True` masks GT outside buffer during evaluation.
+
+### Practical Implication
+- Metric comparability depends on consistent buffer policy and CRS alignment.
 
 ---
 
-## 8) Caching, Performance, Memory
-- Tile features cached under `FEATURE_DIR`; banks cached under `BANK_CACHE_DIR`.
-- Prefetch features for B to avoid repeated disk I/O.
-- Feature prefetch supports batched forward passes (`FEATURE_BATCH_SIZE`).
-- FP16 matmul for kNN to speed up GPU.
-- CPU/GPU fallbacks for threshold metrics; CRF parallelized with process pool; optional downsample for CRF search.
-- GT presence scan uses cached vector intersections and parallel workers for large tile sets.
-- Median filtering reduces tiny artifacts before CRF.
-- Memory cleanup before CRF: delete large intermediates and `torch.cuda.empty_cache()`.
-- Known bottlenecks: resizing per tile, CRF iterations; potential GPU OOM with XGB `gpu_hist` or large CRF grids.
-- Threshold metrics can fallback to CPU if GPU OOM; CRF search can be downsampled to reduce load.
-- Disk I/O considerations: feature caches can be large (Hp×Wp×1024 per tile); consolidated feature files can reach hundreds of MB—ensure sufficient disk.
-- XGB GPU support may be absent; code auto-falls back to CPU hist; training time rises but still workable with reduced rounds/depth.
-- Cache hygiene: If features become inconsistent, delete per-tile caches under `FEATURE_DIR` for the affected image(s) and rerun; banks will rebuild.
-- SH buffer sizing: Too small → drop valid GT; too large → allow spurious FPs; tune `BUFFER_M` relative to pixel size.
+## 6) Split and Resume Semantics
+
+### Auto Split (`AUTO_SPLIT_TILES=True`)
+Candidates from `TILES_DIR` + `TILE_GLOB` are filtered by overlap with
+`SOURCE_LABEL_RASTER` bounds, then partitioned by GT overlap.
+
+#### Mode A: `gt_to_val_cap_holdout`
+- Validation = all GT-overlap tiles.
+- Source = `SOURCE_TILES` from config.
+- Holdout = non-GT tiles, optionally capped by:
+  - `INFERENCE_TILE_CAP_ENABLED`
+  - `INFERENCE_TILE_CAP`
+  - `INFERENCE_TILE_CAP_SEED`
+
+#### Mode B: `legacy_gt_source_val_holdout`
+- GT-overlap tiles split into source/validation via:
+  - `VAL_SPLIT_FRACTION`
+  - `SPLIT_SEED`
+- Non-GT tiles become holdout.
+
+### Resume Behavior
+- `RESUME_RUN=True` + `RESUME_RUN_DIR` resumes existing run directory.
+- Completed holdout tiles are loaded from `processed_tiles.jsonl`.
+- Already done tiles are skipped.
 
 ---
 
-## 9) Experiments & Failures (notable issues encountered)
-- XGBoost `gpu_hist` unsupported on this build → auto-fallback to `hist`.
-- Earlier XGB shape mismatch (inconsistent tile sizes) fixed by cropping to patch multiples and padding.
-- Superpixels were removed (not helpful, caused errors).
-- CRF initially single-core; now process-based grid search.
-- IoU sometimes zero when SH buffer or CRS mismatch; GT clipping option added.
-- Median filter added post-threshold to reduce speckle.
-- Plot titles were clipped; fixed with `bbox_inches="tight"`.
-- Memory pressure before CRF addressed by deleting banks/prefetch caches and emptying CUDA cache.
-- Shadow filtering added to drop dark artifacts after CRF; weights/thresholds tunable.
-- Observed: resize time dominates kNN stage more than matmul; FP16 matmul yields small speedup but resize remains the bottleneck.
-- Observed: CRF can take ~30–40s per config on full-res; downsample=2 reduces cost substantially at slight accuracy loss.
-- Observed: kNN IoU improves with larger k up to a point; XGB can surpass kNN when param grid tuned; champion selection handles this automatically.
-- Observed: If SH buffer is misaligned (CRS mismatch), IoU collapses to ~0; verify CRS logs and buffer stats early.
-- Observed: Sparse GT outside buffer can cap max IoU; enable `CLIP_GT_TO_BUFFER` to get meaningful scores.
+## 7) Configuration Truth (Current Defaults)
+
+This section reflects current `config.py` defaults.
+
+### Key Runtime Defaults
+- `FEATURE_CACHE_MODE = "memory"`
+- `TILE_SIZE = 2048`
+- `STRIDE = 512`
+- `PATCH_SIZE = 16`
+- `BUFFER_M = 5.0`
+
+### Split Defaults
+- `AUTO_SPLIT_TILES = True`
+- `AUTO_SPLIT_MODE = "gt_to_val_cap_holdout"`
+- `INFERENCE_TILE_CAP_ENABLED = True`
+- `INFERENCE_TILE_CAP = 50`
+
+### Top-p Defaults
+- `TOP_P_A = 0.2`
+- `TOP_P_B = 0.04`
+- `TOP_P_MIN = 0.02`
+- `TOP_P_MAX = 0.12`
+
+Top-p candidate grids:
+- `TOP_P_A_VALUES = [0.0, 0.2, 0.4]`
+- `TOP_P_B_VALUES = [0.02, 0.04, 0.06]`
+- `TOP_P_MIN_VALUES = [0.02, 0.03]`
+- `TOP_P_MAX_VALUES = [0.06, 0.08, 0.1, 0.12]`
+
+### CRF/Shadow/Bridge Defaults
+- CRF softness/weights configured in `PROB_SOFTNESS_VALUES`, `POS_W_VALUES`,
+  `BILATERAL_*`.
+- Shadow tuned over `SHADOW_WEIGHT_SETS`, `SHADOW_THRESHOLDS`,
+  `SHADOW_PROTECT_SCORES`.
+- Bridge enabled (`ENABLE_GAP_BRIDGING=True`) with large-gap settings.
+
+### Timing Telemetry Defaults
+- `TIMING_CSV_ENABLED = True`
+- `TIMING_CSV_FILENAME = "tile_phase_timing.csv"`
+- `TIMING_SUMMARY_CSV_FILENAME = "timing_opportunity_cost.csv"`
+- `TIMING_CSV_FLUSH_EVERY = 1`
+
+### Explainability Defaults (Tier 1)
+- `XAI_ENABLED = True`
+- `XAI_INCLUDE_XGB = True`
+- `XAI_INCLUDE_KNN = True`
+- `XAI_TOP_FEATURES = 20`
+- `XAI_TOP_PATCHES = 50`
+- `XAI_HOLDOUT_CAP_ENABLED = True`
+- `XAI_HOLDOUT_CAP = 10`
+- `XAI_HOLDOUT_CAP_SEED = 42`
 
 ---
 
-## 10) How to Reproduce & Evaluate
-1. Ensure deps installed (PyTorch, transformers, xgboost, pydensecrf, rasterio, skimage, scipy).
-2. Set paths/hyperparams in `config.py` as needed.
-3. Run `python main.py` from the repo root.
-4. Outputs:
-    - Unified plots in `output/run_*/plots/` (`*_unified.png`). Holdout plots omit metric text.
-    - Rolling unions in `output/run_*/shapes/unions/{knn|xgb|champion}/{raw|crf|shadow}/union.shp` and `output/run_*/shapes/unions/silver_core/raw/union.shp` (holdout-only).
-    - Union backups every N tiles in `.../backups/` when `UNION_BACKUP_EVERY > 0`.
-    - Processed tile log: `output/run_*/processed_tiles.jsonl` for resume.
-    - Phase summary logs: mean/median metrics per phase and deltas for champion chain.
-    - Best settings YAML in `output/run_*/best_settings.yml` (or `BEST_SETTINGS_PATH`).
-    - Run summary YAML in `output/run_*/run_summary.yml` with validation metrics, deltas, and timing.
-    - Consolidated features: `FEATURE_DIR/{image_id}_features_full.npy`.
-5. Evaluation metric: IoU (primary), plus F1/P/R—computed on validation tiles; if `CLIP_GT_TO_BUFFER=True`, GT is masked to SH buffer so max IoU can reach 1.0.
-6. Champion selection: compare best IoU from kNN vs XGB (after median filter); champion feeds CRF; shadow filter runs after CRF.
-7. Tuning objective: configs are selected by weighted-mean IoU across validation tiles, weighted by GT-positive pixel count.
-8. Top-p selection: adaptive p(d) is tuned on validation, then frozen for unlabeled holdout tiles.
-- Plots to inspect:
-   - `*_unified.png`: RGB, source label raster, GT (if available), DINO similarity, kNN/XGB score heatmaps, masks, skeleton + endpoints.
-- Shapefiles to consume: rolling unions under `shapes/unions/` (kNN/XGB/Champion × raw/CRF/shadow).
-- `inference_best_setting.yml` records the frozen configs and weighted-mean metrics after validation.
-- Typical run flow in main: build banks → prefetch B → kNN/XGB scoring → adaptive top-p selection → median filter → CRF → shadow → exports.
-- Silver core: kNN ∩ XGB (optional dilation) used as high-precision supervision.
-- Roads penalty: if configured, kNN/XGB score maps are multiplied by a roads mask penalty before thresholds/CRF.
-- Roads masking: per-tile rasterization using a cached spatial index (no global raster build).
-- Logs: Main stdout includes timing, kNN evals, XGB search logs, CRF evals; plots show overlays; YAML captures configs.
-- Logs: Phase summaries report weighted-mean IoU/F1 per phase and deltas along the champion chain.
+## 8) Module Map and Responsibilities
+
+### Orchestration
+- `segedge/pipeline/run.py`: full run lifecycle, exports, telemetry integration.
+- `segedge/pipeline/tuning.py`: validation tuning and selection logic.
+- `segedge/pipeline/common.py`: split logic, model init, utility flow.
+- `segedge/pipeline/inference_utils.py`: context load and inference helpers.
+
+### Core Algorithms
+- `segedge/core/features.py`: tiling, feature extraction, prefetch.
+- `segedge/core/banks.py`: positive/negative bank construction.
+- `segedge/core/knn.py`: kNN scoring and threshold utilities.
+- `segedge/core/xdboost.py`: dataset build, train/search, scoring.
+- `segedge/core/crf_utils.py`: dense CRF refinement and search.
+- `segedge/core/continuity.py`: skeleton-based gap bridging.
+- `segedge/core/shadow_filter.py`: dark-region suppression.
+- `segedge/core/metrics_utils.py`: IoU/F1/P/R and batch metrics.
+
+### I/O and Telemetry
+- `segedge/core/io_utils.py`: image/vector I/O, shapefile/YAML exports.
+- `segedge/core/timing_csv.py`: detailed and summary timing CSV generation.
+- `segedge/core/summary_utils.py`: phase/timing aggregation for YAML.
 
 ---
 
-## 11) Quick Reference (key functions)
-- Feature extraction: `features.extract_patch_features_single_scale`, `prefetch_features_single_scale_image`.
-- Batched features: `features.extract_patch_features_batch_single_scale`.
-- Banks: `banks.build_banks_single_scale`.
-- kNN: `knn.zero_shot_knn_single_scale_B_with_saliency`, `grid_search_k_threshold`, `fine_tune_threshold`.
-- XGB: `xdboost.build_xgb_dataset`, `hyperparam_search_xgb_iou`, `xgb_score_image_b`.
-- Metrics: `metrics_utils.compute_metrics_batch_gpu/cpu`, `compute_metrics`.
-- CRF: `crf_utils.crf_grid_search`, `refine_with_densecrf`.
-- Shadow: `shadow_filter.shadow_filter_grid`.
-- Continuity: `continuity.bridge_skeleton_gaps`, `continuity.skeletonize_with_endpoints`.
-- Plots: `plotting.save_unified_plot`.
-- Exports: `io_utils.append_mask_to_union_shapefile`, `backup_union_shapefile`, `count_shapefile_features`, `export_best_settings`.
+## 9) Runtime Artifact Contract
+
+Each run writes to `output/run_XXX/`:
+
+### Control and Logs
+- `run.log`
+- `processed_tiles.jsonl`
+
+### Settings and Summaries
+- `best_settings.yml`
+- `inference_best_setting.yml`
+- `run_summary.yml`
+
+### Timing Telemetry
+- `tile_phase_timing.csv`
+- `timing_opportunity_cost.csv`
+
+### Explainability
+- `xai/{validation|holdout}/{image_id}.json`
+- `xai/{validation|holdout}/{image_id}_xai.png`
+- `xai_summary.csv`
+
+### Visual and Geospatial Outputs
+- `plots/*.png`
+- `shapes/unions/{knn|xgb|champion|silver_core}/{variant}/union.shp`
 
 ---
 
-## 12) Environment, Dependencies, and Run Recipes
-- Python: 3.12 (current environment). Key libs (install via pip/conda as available, no network inside sandbox):
-  - torch (with CUDA if available), transformers, xgboost, pydensecrf, rasterio, fiona, shapely, pyproj, skimage, scipy, matplotlib, numpy.
-  - If xgboost lacks GPU, it will auto-fall back to CPU (`tree_method=hist`).
-- Run recipes:
-  - Full pipeline (kNN + XGB + CRF + shadow): `python main.py`
-  - Disable XGB search: set `XGB_PARAM_GRID = []` or `None` in `config.py`.
-  - Force CPU for XGB: `XGB_USE_GPU = False`.
-  - Speed CRF: increase `downsample_factor` (in `crf_grid_search` call) or reduce `CRF_MAX_CONFIGS`.
-  - kNN-only comparison: set `XGB_PARAM_GRID = []` and inspect plots/shapefiles.
-- Outputs to expect:
-  - Unified plots in `PLOT_DIR`: `*_unified.png`.
-  - Rolling unions in `output/run_*/shapes/unions/` (including `silver_core`).
-- YAML: `inference_best_setting.yml` with frozen configs + weighted metrics.
-- Consolidated features: `{image_id}_features_full.npy` under `FEATURE_DIR`.
+## 10) Timing Telemetry Schema (Detailed CSV)
+
+File: `tile_phase_timing.csv`
+
+Row granularity:
+- One row per `(tile, phase_name)` timing event.
+
+Columns:
+- `run_dir`
+- `timestamp_utc`
+- `stage` (`source_training`, `validation_inference`, `holdout_inference`)
+- `tile_role` (`source`, `validation`, `holdout`)
+- `tile_path`
+- `image_id`
+- `phase_name`
+- `duration_s`
+- `gt_available`
+- `source_mode`
+- `auto_split_mode`
+- `resample_factor`
+- `tile_size`
+- `stride`
+- `status`
+
+Typical phase keys now include:
+- Source: `load_source_image_s`, `reproject_source_labels_s`,
+  `prefetch_source_features_s` (memory mode), `build_banks_s`,
+  `build_xgb_dataset_s`, `source_tile_total_s`.
+- Inference: `load_context_s`, `roads_mask_s`, `prefetch_features_s`,
+  `knn_score_s`, `knn_threshold_s`, `knn_metrics_s`, `knn_s`,
+  `xgb_score_s`, `xgb_threshold_s`, `xgb_metrics_s`, `xgb_s`, `silver_core_s`,
+  `crf_knn_s`, `crf_xgb_s`, `crf_s`, `bridge_s`, `shadow_s`, `skeleton_s`,
+  `plot_s`, `xai_prepare_s`, `xai_plot_s`, `xai_write_s`, `xai_total_s`, `total_s`.
 
 ---
 
-## 13) Tuning Tips
-- kNN: Increase k to smooth noise, but watch IoU; adjust `NEG_ALPHA` (lower to reduce neg penalty) and `POS_FRAC_THRESH` (raise to tighten positives, lower to include more).
-- XGB: Reduce `max_depth`/`num_boost_round` if overfitting or slow; increase `colsample_bytree` if underfitting; shrink grid for speed.
-- CRF: Use `downsample_factor=2` for speed; tune `prob_softness` for sharper/softer unary; reduce bilateral weights if over-smoothing colors.
-- Buffer: Tune `BUFFER_M` to balance FP suppression vs missing off-buffer GT; enable `CLIP_GT_TO_BUFFER` when GT outside buffer is sparse/noisy.
-- Shadow: Adjust `SHADOW_WEIGHT_SETS`/`SHADOW_THRESHOLDS` if dark regions are over-removed or under-removed.
+## 11) Opportunity-Cost Summary Schema
+
+File: `timing_opportunity_cost.csv`
+
+Aggregation scopes:
+- Stage-level scopes (`source_training`, `validation_inference`,
+  `holdout_inference`).
+- Composite scopes (`all_inference`, `all`).
+
+Columns:
+- `scope`
+- `phase_name`
+- `count`
+- `total_s`
+- `mean_s`
+- `median_s`
+- `min_s`
+- `max_s`
+- `runtime_share_pct`
+- `optional_phase`
+- `phase_group`
+- `opportunity_rank`
+
+Interpretation:
+- `runtime_share_pct` quantifies opportunity cost within each scope.
+- `opportunity_rank=1` is highest total runtime contributor in scope.
 
 ---
 
-## 14) Failure/Edge Case Handling
-- CRS issues: If IoU ~0, verify CRS logs (vector reproject warning) and SH buffer alignment.
-- Cache corruption: Delete affected tile features in `FEATURE_DIR` and rerun; banks will rebuild.
-- GPU OOM: Switch XGB to CPU (`XGB_USE_GPU=False`), reduce `num_boost_round`/`max_depth`; downsample CRF and reduce `CRF_MAX_CONFIGS`; ensure FP16 matmul is optional.
-- Missing features: If a tile .npy is absent, XGB scorer skips it; recompute features for completeness.
+## 12) Evaluation and Selection Logic
+
+### Primary Metric
+- IoU (with F1/P/R as secondary diagnostics).
+
+### Validation Weighting
+- Tile metrics are weighted by GT-positive pixel count.
+
+### Champion Chain Reporting
+- Reported phase chain includes:
+  - `champion_raw`
+  - `champion_crf`
+  - optional `champion_bridge`
+  - `champion_shadow`
+
+### Why This Matters
+- Best raw model and best final post-processed model can differ materially.
+- Per-phase deltas in `run_summary.yml` and timing CSVs support tradeoff analysis.
 
 ---
 
-## 15) Results Snapshot (fill in with actual runs)
-- Maintain a small table of recent runs (config hash/date):
-  - kNN best IoU/F1, XGB best IoU/F1, CRF IoU/F1, Shadow IoU/F1.
-  - Note key params: BUFFER_M, NEG_ALPHA, K_VALUES range, XGB grid summary, CRF downsample, SHADOW weights.
+## 13) Performance and Scaling Considerations
+
+### Dominant Costs
+- Feature prefetch on large tiles.
+- Score-map resize/aggregation in kNN path.
+- CRF grid search when config ranges are wide.
+
+### Known Runtime Accelerators
+- Batched feature extraction (`FEATURE_BATCH_SIZE`).
+- CPU fallback behavior for unsupported XGB GPU builds.
+- Roads spatial index caching.
+- Resume mode and incremental holdout processing.
+
+### Memory Risk Areas
+- Feature caches and full-size score/probability arrays.
+- Large CRF candidate sets.
 
 ---
 
-## 16) Exports & Schemas
-- Shapefiles: Polygons of predicted FG; schema has a single `id` int field; CRS matches the reference raster of Image B.
-- Inference best settings: Captures tuned configs, shadow/roads/bridge settings, counts, and weighted metrics for each phase.
-- Feature consolidations: `{image_id}_features_full.npy` are (N_patches × C) arrays; useful for offline analysis or alternate classifiers.
+## 14) Failure Atlas (Symptom -> Cause -> Action)
+
+1. **IoU near zero unexpectedly**
+- Cause: CRS mismatch or buffer clipping mismatch.
+- Action: inspect reprojection logs and buffer coverage diagnostics.
+
+2. **CRF degrades IoU sharply**
+- Cause: overly strong unary/pairwise settings.
+- Action: soften CRF grid (higher softness, lower pairwise weights), compare raw vs CRF.
+
+3. **Shadow stage changes nothing**
+- Cause: thresholds/weights too permissive, or little dark-noise in candidate mask.
+- Action: widen/shift shadow threshold set or temporarily disable for ablation.
+
+4. **Run too slow on many tiles**
+- Cause: large holdout count, heavy overlap, broad tuning grids.
+- Action: cap holdout, narrow search spaces, adjust stride.
+
+5. **Resume does not skip expected tiles**
+- Cause: missing/partial `processed_tiles.jsonl` records.
+- Action: verify run dir and processed log integrity.
 
 ---
 
-## 17) Logging & Visualization Conventions
-- Stdout logs timing blocks, kNN eval lines `[eval-raw]`, XGB search logs `[xgb-search-iou]`, CRF evals `[crf-eval]`, and warnings (GPU fallbacks, CRS info).
-- Plot colors: GT overlay uses blue (0,0,255); kNN uses green (0,255,0); XGB uses red (255,0,0); champion pre-CRF uses red overlay; shadow overlay in `save_plot` uses yellow (255,255,0).
-- Plots are saved with `bbox_inches="tight"` to avoid clipping titles.
+## 15) Reproducibility Protocol
+
+### Minimum run manifest to archive per experiment
+- Git revision.
+- Full `config.py` snapshot.
+- `inference_best_setting.yml`.
+- `run_summary.yml`.
+- `tile_phase_timing.csv` + `timing_opportunity_cost.csv`.
+
+### Determinism-related knobs
+- `SPLIT_SEED`
+- `INFERENCE_TILE_CAP_SEED`
+- Any random seeds inside training/tuning utilities.
+
+### Suggested run discipline
+1. Freeze config.
+2. Run a single `run_XXX` experiment.
+3. Archive output folder without post-editing.
+4. Record experiment metadata in thesis table template.
+
+---
+
+## 16) Historical Evolution and Implemented Experiments
+
+This section summarizes implemented changes by version and the experimental intent.
+All entries are implemented history, not proposals.
+
+| Version | What Was Implemented | Primary Intent / Impact |
+|---|---|---|
+| 0.2.25 | Retuned top-p/CRF/shadow ranges | Reduce top-p cap saturation, soften harmful post-processing defaults |
+| 0.2.24 | Incremental per-tile timing CSV + opportunity-cost summary CSV | Structured runtime tradeoff analysis without log parsing |
+| 0.2.23 | Auto-split mode (`gt_to_val_cap_holdout`) + holdout cap | Align workflow: GT validation coverage + bounded inference runtime |
+| 0.2.22 | Tuning preview plots | Earlier qualitative feedback during tuning |
+| 0.2.21 | Debug logs promoted to INFO | Better observability with reduced third-party noise |
+| 0.2.20 | Roads geometry clipping/simplification pre-rasterization | Faster roads mask build |
+| 0.2.19 | Release discipline + file-length checks | Maintainability and per-request version hygiene |
+| 0.2.18 | Run summary YAML with metrics/deltas/timing | Durable experiment summaries |
+| 0.2.17 | Always-on reprojection/coverage logging | Diagnose label alignment failures |
+| 0.2.16 | Adaptive top-p + silver core outputs | Better threshold adaptability and high-precision supervision stream |
+| 0.2.15 | Per-tile roads spatial-index rasterization | Avoid global roads raster OOM |
+| 0.2.14 | Unified plot enrichment (labels/similarity/score maps) | Better diagnosis of score and label alignment |
+| 0.2.13 | Single inference settings YAML after validation | Stable downstream holdout configuration |
+| 0.2.12 | Roads mask path realignment | Fix pathing after data layout changes |
+| 0.2.11 | Roads multiplicative penalty tuning | Controlled suppression of road false positives |
+| 0.2.10 | Weighted IoU tuning objective + phase markers | Better config selection fidelity |
+| 0.2.9 | Continuity bridging + unified phase summaries | Improve topology continuity, compare phase gains |
+| 0.2.8 | KB updates for rolling unions/resume/split | Documentation alignment |
+| 0.2.7 | Holdout-only rolling unions + resume logging | Incremental inference durability |
+| 0.2.6 | Rolling union backups | Crash resilience and recovery |
+| 0.2.5 | Source-label-overlap filter before auto-split | Avoid pointless GT checks on out-of-coverage tiles |
+| 0.2.4 | Batched feature extraction | Better GPU throughput |
+| 0.2.3 | Cached vector intersection GT checks | Faster tile scan for split |
+| 0.2.2 | Parallel GT presence checks | Faster split prep on many tiles |
+| 0.2.1 | Removed split-eval/per-tile shapefile clutter | Simplified main pipeline outputs |
+| 0.2.0 | Phase logging, diskless cache mode, parallel CRF tuning, GT auto split | Core modernization and scaling improvements |
+| 0.1.0 | Package refactor + doctests + smoke E2E | Structural baseline and validation guardrails |
+
+### Reading This Timeline
+- Later versions are cumulative.
+- Not all versions affect model quality; many improve observability, runtime,
+  or reproducibility.
+
+---
+
+## 17) Thesis/Paper Reporting Templates (Strict Placeholders)
+
+### 17.1 Main Results Table (Template)
+| Experiment ID | Split Mode | Source Tiles | Val Tiles | Holdout Tiles | Raw Champion IoU | Final IoU | Runtime (h) | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| EXP-XXX | [mode] | [n] | [n] | [n] | [ ] | [ ] | [ ] | [ ] |
+
+### 17.2 Phase Ablation Table (Template)
+| Experiment ID | Raw IoU | +CRF Delta | +Bridge Delta | +Shadow Delta | Final IoU |
+|---|---:|---:|---:|---:|---:|
+| EXP-XXX | [ ] | [ ] | [ ] | [ ] | [ ] |
+
+### 17.3 Runtime Opportunity-Cost Table (Template)
+| Experiment ID | Scope | Rank 1 Phase | Rank 1 Share % | Rank 2 Phase | Rank 2 Share % |
+|---|---|---|---:|---|---:|
+| EXP-XXX | holdout_inference | [ ] | [ ] | [ ] | [ ] |
+
+### 17.4 Hyperparameter Record (Template)
+| Experiment ID | TOP_P (a,b,min,max) | CRF Grid ID | Shadow Grid ID | Roads Penalty | Bridge Params Snapshot |
+|---|---|---|---|---|---|
+| EXP-XXX | [ ] | [ ] | [ ] | [ ] | [ ] |
+
+---
+
+## 18) Operator Runbook
+
+1. Confirm paths and split mode in `config.py`.
+2. Run `python main.py`.
+3. Track progress in `run.log` and `processed_tiles.jsonl`.
+4. Inspect:
+   - `inference_best_setting.yml`
+   - `run_summary.yml`
+   - `timing_opportunity_cost.csv`
+5. For failures/resume:
+   - set `RESUME_RUN=True`
+   - set `RESUME_RUN_DIR` to interrupted run folder
+   - rerun.
+
+---
+
+## 19) Terminology Glossary
+
+- **Source tile**: Tile used to build banks/XGB dataset.
+- **Validation tile**: Tile used for tuning and metric-driven selection.
+- **Holdout tile**: Final inference tile, usually unlabeled.
+- **Champion**: Better of raw kNN vs raw XGB on validation objective.
+- **Silver core**: Conservative overlap mask from kNN and XGB.
+- **Top-p thresholding**: Keep top `p` fraction of scores within buffer.
+- **Opportunity cost (runtime)**: Phase runtime share within a scope.
+
+---
+
+## 20) Change-Control Notes for This KB
+
+When code changes, update this KB if any of the following change:
+- Config defaults or tuning ranges.
+- Split behavior or resume semantics.
+- Output artifact paths or schemas.
+- Telemetry schema and phase naming.
+- Champion/post-processing ordering.
+
+For thesis usage, treat this KB as the canonical technical appendix seed.
