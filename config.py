@@ -76,6 +76,12 @@ BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
 LOG_LEVEL = logging.INFO
 DEBUG_REPROJECT = True
+# Incremental timing telemetry CSV outputs.
+TIMING_CSV_ENABLED = True
+TIMING_CSV_FILENAME = "tile_phase_timing.csv"
+TIMING_SUMMARY_CSV_FILENAME = "timing_opportunity_cost.csv"
+# Flush cadence for detailed rows (1 updates files after every completed tile).
+TIMING_CSV_FLUSH_EVERY = 1
 # Resume previous run (requires RESUME_RUN_DIR).
 RESUME_RUN = False
 RESUME_RUN_DIR = None
@@ -118,11 +124,11 @@ K_VALUES = [175, 200, 250]
 THRESHOLDS = [float(x) for x in __import__("numpy").linspace(0.01, 0.9, 100)]
 
 # CRF grid search
-PROB_SOFTNESS_VALUES = [0.03, 0.05, 0.08]
-POS_W_VALUES = [3.0, 4.0]
-POS_XY_STD_VALUES = [3.0]
-BILATERAL_W_VALUES = [5.0, 7.0]
-BILATERAL_XY_STD_VALUES = [25.0, 50.0]
+PROB_SOFTNESS_VALUES = [0.08, 0.12, 0.2]
+POS_W_VALUES = [1.0, 2.0, 3.0]
+POS_XY_STD_VALUES = [3.0, 5.0]
+BILATERAL_W_VALUES = [1.0, 3.0, 5.0]
+BILATERAL_XY_STD_VALUES = [25.0]
 BILATERAL_RGB_STD_VALUES = [3.0, 5.0]
 CRF_NUM_WORKERS = 16
 
@@ -130,10 +136,6 @@ CRF_NUM_WORKERS = 16
 SHADOW_WEIGHT_SETS = [
     (1.0, 1.0, 1.0),
     (0.7, 1.0, 1.0),
-    (0.5, 0.8, 1.0),
-    (0.5, 1.0, 0.5),
-    (0.5, 0.5, 1.0),
-    (0.1, 0.5, 0.5),
 ]
 SHADOW_THRESHOLDS = [
     20,
@@ -142,18 +144,8 @@ SHADOW_THRESHOLDS = [
     80,
     100,
     120,
-    160,
-    180,
-    210,
-    240,
-    270,
-    300,
-    330,
-    360,
-    450,
-    500,
 ]
-SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
+SHADOW_PROTECT_SCORES = [0.3, 0.5]
 
 # Roads mask penalty (multiplicative) for kNN/XGB scores
 ROADS_MASK_PATH = "data/roads/roads_mask.shp"
@@ -161,14 +153,14 @@ ROADS_PENALTY_VALUES = [0.8, 0.7, 0.6]
 ROADS_SIMPLIFY_TOLERANCE_M = 0.2
 
 # Adaptive top-p selection inside buffer
-TOP_P_A = 0.0
-TOP_P_B = 0.05
+TOP_P_A = 0.2
+TOP_P_B = 0.04
 TOP_P_MIN = 0.02
-TOP_P_MAX = 0.08
-TOP_P_A_VALUES = [0.0, 0.5, 1.0]
-TOP_P_B_VALUES = [0.02, 0.05, 0.08]
+TOP_P_MAX = 0.12
+TOP_P_A_VALUES = [0.0, 0.2, 0.4]
+TOP_P_B_VALUES = [0.02, 0.04, 0.06]
 TOP_P_MIN_VALUES = [0.02, 0.03]
-TOP_P_MAX_VALUES = [0.08, 0.1]
+TOP_P_MAX_VALUES = [0.06, 0.08, 0.1, 0.12]
 SILVER_CORE_DILATE_PX = 1
 
 # Continuity bridging (post-CRF, pre-shadow)
@@ -176,15 +168,15 @@ ENABLE_GAP_BRIDGING = True
 BRIDGE_MAX_GAP_PX = 500
 BRIDGE_MAX_PAIRS = 3
 BRIDGE_MAX_AVG_COST = 0.5
-BRIDGE_WIDTH_PX = 20
-BRIDGE_MIN_COMPONENT_PX = 300
+BRIDGE_WIDTH_PX = 200
+BRIDGE_MIN_COMPONENT_PX = 100
 BRIDGE_SPUR_PRUNE_ITERS = 15
 
 # XGBoost (patch classifier)
 XGB_USE_GPU = True
 XGB_VAL_FRACTION = 0.2
-XGB_NUM_BOOST_ROUND = 10
-XGB_EARLY_STOP = 40
+XGB_NUM_BOOST_ROUND = 15
+XGB_EARLY_STOP = 100
 XGB_VERBOSE_EVAL = 20
 XGB_PARAM_GRID = [
     # 1) Baseline

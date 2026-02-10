@@ -36,6 +36,12 @@ from ..core.summary_utils import phase_delta_summary as _phase_delta_summary
 from ..core.summary_utils import phase_metrics_summary as _phase_metrics_summary
 from ..core.summary_utils import timing_summary as _timing_summary
 from ..core.summary_utils import weighted_mean as _weighted_mean
+from ..core.timing_csv import (
+    append_tile_timing_csv_rows,
+    build_tile_timing_rows,
+    read_timing_detail_csv,
+    write_timing_summary_csv,
+)
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import build_xgb_dataset, xgb_score_image_b
 from .common import (
@@ -255,12 +261,19 @@ def infer_on_holdout(
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
     )
+    timings["knn_score_s"] = time.perf_counter() - t0
     score_knn_raw = score_knn
+    t0 = time.perf_counter()
     score_knn = _apply_roads_penalty(score_knn, roads_mask, roads_penalty)
     knn_thr, mask_knn = _top_p_threshold(score_knn, sh_buffer_mask, top_p_val)
     mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
+    timings["knn_threshold_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     metrics_knn = compute_metrics(mask_knn, gt_mask_eval)
-    timings["knn_s"] = time.perf_counter() - t0
+    timings["knn_metrics_s"] = time.perf_counter() - t0
+    timings["knn_s"] = (
+        timings["knn_score_s"] + timings["knn_threshold_s"] + timings["knn_metrics_s"]
+    )
 
     bst = tuned["bst"]
     t0 = time.perf_counter()
@@ -275,17 +288,26 @@ def infer_on_holdout(
         prefetched_tiles=prefetched_b,
         context_radius=context_radius,
     )
+    timings["xgb_score_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     score_xgb = _apply_roads_penalty(score_xgb, roads_mask, roads_penalty)
     xgb_thr, mask_xgb = _top_p_threshold(score_xgb, sh_buffer_mask, top_p_val)
     mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+    timings["xgb_threshold_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     metrics_xgb = compute_metrics(mask_xgb, gt_mask_eval)
-    timings["xgb_s"] = time.perf_counter() - t0
+    timings["xgb_metrics_s"] = time.perf_counter() - t0
+    timings["xgb_s"] = (
+        timings["xgb_score_s"] + timings["xgb_threshold_s"] + timings["xgb_metrics_s"]
+    )
 
+    t0 = time.perf_counter()
     core_mask = np.logical_and(mask_knn, mask_xgb)
     dilate_px = int(getattr(cfg, "SILVER_CORE_DILATE_PX", 1))
     if dilate_px > 0:
         core_mask = binary_dilation(core_mask, disk(dilate_px))
     metrics_core = compute_metrics(core_mask, gt_mask_eval)
+    timings["silver_core_s"] = time.perf_counter() - t0
 
     champion_source = tuned["champion_source"]
     if champion_source == "raw":
@@ -516,6 +538,19 @@ def main():
     log_level = getattr(cfg, "LOG_LEVEL", logging.INFO)
     setup_logging(getattr(cfg, "LOG_PATH", None), level=log_level)
     logger.info("logging configured: level=%s", log_level)
+    timing_csv_enabled = bool(getattr(cfg, "TIMING_CSV_ENABLED", True))
+    timing_csv_path = os.path.join(
+        run_dir, str(getattr(cfg, "TIMING_CSV_FILENAME", "tile_phase_timing.csv"))
+    )
+    timing_summary_csv_path = os.path.join(
+        run_dir,
+        str(getattr(cfg, "TIMING_SUMMARY_CSV_FILENAME", "timing_opportunity_cost.csv")),
+    )
+    timing_flush_every = max(1, int(getattr(cfg, "TIMING_CSV_FLUSH_EVERY", 1) or 1))
+    timing_rows: list[dict[str, object]] = []
+    pending_timing_rows: list[dict[str, object]] = []
+    if resume_run and timing_csv_enabled:
+        timing_rows = read_timing_detail_csv(timing_csv_path)
     processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
     processed_tiles: set[str] = set()
     if resume_run and os.path.exists(processed_log_path):
@@ -598,6 +633,8 @@ def main():
     source_label_raster = cfg.SOURCE_LABEL_RASTER
     gt_vector_paths = cfg.EVAL_GT_VECTORS
     auto_split_tiles = getattr(cfg, "AUTO_SPLIT_TILES", False)
+    auto_split_mode_runtime = "disabled"
+    source_mode = "manual"
 
     # ------------------------------------------------------------
     # Resolve one or more labeled source images (Image A list)
@@ -608,6 +645,7 @@ def main():
         split_mode = str(
             getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)
         ).strip()
+        auto_split_mode_runtime = split_mode
         val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
         seed = int(getattr(cfg, "SPLIT_SEED", 42))
         downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
@@ -629,6 +667,7 @@ def main():
         )
         if split_mode == AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT:
             img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
+            source_mode = "manual"
             if not img_a_paths:
                 raise ValueError(
                     "SOURCE_TILES must be set when "
@@ -643,6 +682,7 @@ def main():
             )
         else:
             img_a_paths = split_source_tiles
+            source_mode = "auto"
             logger.info(
                 "auto split tiles mode=%s: source=%s val=%s holdout=%s",
                 split_mode,
@@ -657,6 +697,48 @@ def main():
     lab_a_paths = [source_label_raster] * len(img_a_paths)
 
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
+
+    def _flush_timing_rows(force: bool = False) -> None:
+        if not timing_csv_enabled:
+            return
+        if not pending_timing_rows:
+            return
+        if not force and len(pending_timing_rows) < timing_flush_every:
+            return
+        append_tile_timing_csv_rows(timing_csv_path, pending_timing_rows)
+        timing_rows.extend(pending_timing_rows)
+        pending_timing_rows.clear()
+        write_timing_summary_csv(timing_summary_csv_path, timing_rows)
+
+    def _record_tile_timings(
+        stage: str,
+        tile_role: str,
+        tile_path: str,
+        image_id: str,
+        timings: dict[str, float],
+        gt_available: bool,
+        status: str = "done",
+    ) -> None:
+        if not timing_csv_enabled or not timings:
+            return
+        rows = build_tile_timing_rows(
+            run_dir=run_dir,
+            stage=stage,
+            tile_role=tile_role,
+            tile_path=tile_path,
+            image_id=image_id,
+            timings=timings,
+            gt_available=gt_available,
+            source_mode=source_mode,
+            auto_split_mode=auto_split_mode_runtime,
+            resample_factor=int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1),
+            tile_size=int(tile_size),
+            stride=int(stride),
+            status=status,
+            timestamp_utc=datetime.utcnow().isoformat(),
+        )
+        pending_timing_rows.extend(rows)
+        _flush_timing_rows(force=False)
 
     # ------------------------------------------------------------
     # Resolve validation + holdout tiles (required)
@@ -692,15 +774,22 @@ def main():
     for img_a_path, lab_a_path, image_id_a in zip(
         img_a_paths, lab_a_paths, image_id_a_list, strict=True
     ):
+        source_timings: dict[str, float] = {}
+        t0_source_total = time.perf_counter()
         logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
         ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        t0 = time.perf_counter()
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
+        source_timings["load_source_image_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         labels_A = reproject_labels_to_image(
             img_a_path, lab_a_path, downsample_factor=ds
         )
+        source_timings["reproject_source_labels_s"] = time.perf_counter() - t0
         prefetched_a = None
         if feature_cache_mode == "memory":
             logger.info("prefetch: Image A %s", image_id_a)
+            t0 = time.perf_counter()
             prefetched_a = prefetch_features_single_scale_image(
                 img_a,
                 model,
@@ -713,7 +802,9 @@ def main():
                 None,
                 image_id_a,
             )
+            source_timings["prefetch_source_features_s"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         pos_bank_i, neg_bank_i = build_banks_single_scale(
             img_a,
             labels_A,
@@ -731,11 +822,13 @@ def main():
             context_radius=context_radius,
             prefetched_tiles=prefetched_a,
         )
+        source_timings["build_banks_s"] = time.perf_counter() - t0
         if pos_bank_i.size > 0:
             pos_banks.append(pos_bank_i)
         if neg_bank_i is not None and len(neg_bank_i) > 0:
             neg_banks.append(neg_bank_i)
 
+        t0 = time.perf_counter()
         X_i, y_i = build_xgb_dataset(
             img_a,
             labels_A,
@@ -748,6 +841,17 @@ def main():
             max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
             context_radius=context_radius,
             prefetched_tiles=prefetched_a,
+        )
+        source_timings["build_xgb_dataset_s"] = time.perf_counter() - t0
+        source_timings["source_tile_total_s"] = time.perf_counter() - t0_source_total
+        _record_tile_timings(
+            stage="source_training",
+            tile_role="source",
+            tile_path=img_a_path,
+            image_id=image_id_a,
+            timings=source_timings,
+            gt_available=True,
+            status="done",
         )
         if X_i.size > 0 and y_i.size > 0:
             X_list.append(X_i)
@@ -822,6 +926,15 @@ def main():
             _update_phase_metrics(val_phase_metrics, result["metrics"])
         if isinstance(result.get("timings"), dict):
             val_timings.append(result["timings"])
+            _record_tile_timings(
+                stage="validation_inference",
+                tile_role="validation",
+                tile_path=val_path,
+                image_id=result["image_id"],
+                timings=result["timings"],
+                gt_available=bool(result["gt_available"]),
+                status="done",
+            )
         if val_buffer_m is None:
             val_buffer_m = result["buffer_m"]
             val_pixel_size_m = result["pixel_size_m"]
@@ -877,6 +990,15 @@ def main():
                 getattr(cfg, "INFERENCE_TILE_CAP_ENABLED", False)
             ),
             "inference_tile_cap": getattr(cfg, "INFERENCE_TILE_CAP", None),
+            "timing_csv_enabled": timing_csv_enabled,
+            "timing_csv_filename": str(
+                getattr(cfg, "TIMING_CSV_FILENAME", "tile_phase_timing.csv")
+            ),
+            "timing_summary_csv_filename": str(
+                getattr(
+                    cfg, "TIMING_SUMMARY_CSV_FILENAME", "timing_opportunity_cost.csv"
+                )
+            ),
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,
@@ -912,6 +1034,15 @@ def main():
             _update_phase_metrics(holdout_phase_metrics, result["metrics"])
         if isinstance(result.get("timings"), dict):
             holdout_timings.append(result["timings"])
+            _record_tile_timings(
+                stage="holdout_inference",
+                tile_role="holdout",
+                tile_path=b_path,
+                image_id=result["image_id"],
+                timings=result["timings"],
+                gt_available=bool(result["gt_available"]),
+                status="done",
+            )
         holdout_tiles_processed += 1
         ref_path = result["ref_path"]
         masks = result["masks"]
@@ -956,6 +1087,11 @@ def main():
             consolidate_features_for_image(feature_dir, image_id_b)
         _log_phase("END", "feature_consolidation")
 
+    _flush_timing_rows(force=True)
+    if timing_csv_enabled:
+        logger.info("timing detail csv: %s", timing_csv_path)
+        logger.info("timing summary csv: %s", timing_summary_csv_path)
+
     run_total_s = time.perf_counter() - run_start
     phase_summary_val = _phase_metrics_summary(val_phase_metrics, bridge_enabled)
     phase_deltas_val = _phase_delta_summary(phase_summary_val, bridge_enabled)
@@ -974,6 +1110,10 @@ def main():
             "val_tiles_count": int(len(val_tiles)),
             "holdout_tiles_count": int(len(holdout_tiles)),
             "runtime_s": float(run_total_s),
+            "timing_csv_path": timing_csv_path if timing_csv_enabled else None,
+            "timing_summary_csv_path": (
+                timing_summary_csv_path if timing_csv_enabled else None
+            ),
         },
         "validation": {
             "metrics": phase_summary_val,

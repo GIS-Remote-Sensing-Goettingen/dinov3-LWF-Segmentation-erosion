@@ -5,7 +5,7 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 
 ## Folder Structure
 - `config.py`: Pipeline configuration and data paths.
-- `segedge/core/`: Core modules (features, banks, kNN, XGB, CRF, I/O, metrics).
+- `segedge/core/`: Core modules (features, banks, kNN, XGB, CRF, I/O, metrics, timing CSV helpers).
 - `segedge/pipeline/`: Orchestration entrypoints and shared helpers.
 - `main.py`: CLI wrapper for the full pipeline.
 - `tests/`: Smoke and end-to-end tests.
@@ -24,3 +24,6 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    - `legacy_gt_source_val_holdout`: GT-overlap tiles are split into source/validation,
      and non-GT tiles become holdout.
 3. Run `python main.py` for the full pipeline.
+4. Per-tile timing telemetry is appended during source training and inference to:
+   - `output/run_*/tile_phase_timing.csv` (detailed phase rows)
+   - `output/run_*/timing_opportunity_cost.csv` (aggregated phase opportunity-cost table)

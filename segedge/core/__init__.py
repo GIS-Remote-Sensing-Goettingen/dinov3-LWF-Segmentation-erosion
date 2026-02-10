@@ -19,5 +19,6 @@ __all__ = [
     "plotting",
     "shadow_filter",
     "timing_utils",
+    "timing_csv",
     "xdboost",
 ]

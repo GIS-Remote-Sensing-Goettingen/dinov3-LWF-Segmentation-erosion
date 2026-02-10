@@ -3,6 +3,18 @@
 
 ## [Unreleased]
 
+## [0.2.25]
+- Description: Retune top-p/CRF/shadow search ranges in config for less top-p cap saturation and safer post-processing defaults.
+- file touched: `config.py`, `CHANGELOG.md`
+- reason: Align default tuning space with recent results where XGB raw outperformed CRF-heavy settings.
+- problems fixed: Reduces likelihood of CRF over-pruning and avoids overly aggressive adaptive top-p hitting max across tiles.
+
+## [0.2.24]
+- Description: Add incremental per-tile timing CSV telemetry and an opportunity-cost runtime summary CSV.
+- file touched: `config.py`, `segedge/core/timing_csv.py`, `segedge/core/__init__.py`, `segedge/pipeline/run.py`, `tests/test_timing_csv.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Persist tile-level runtime phase data as the run progresses and quantify each phase's runtime opportunity cost.
+- problems fixed: Avoids relying on large text logs for timing analysis and provides incremental, structured timing artifacts for long runs.
+
 ## [0.2.23]
 - Description: Add auto-split mode for GT-to-validation workflow with deterministic holdout tile cap.
 - file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
