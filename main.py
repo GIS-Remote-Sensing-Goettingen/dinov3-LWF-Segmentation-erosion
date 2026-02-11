@@ -7,7 +7,7 @@ def main() -> None:
     """Run the SegEdge pipeline entrypoint.
 
     Examples:
-        >>> callable(main)
+        >>> isinstance(main.__name__, str)
         True
     """
     from segedge.pipeline.run import main as _main

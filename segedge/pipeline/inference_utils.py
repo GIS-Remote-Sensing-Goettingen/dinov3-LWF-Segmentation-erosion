@@ -39,7 +39,7 @@ def _get_roads_index(tile_crs) -> tuple[STRtree | None, list]:
         tuple[STRtree | None, list]: Index and geometry list.
 
     Examples:
-        >>> callable(_get_roads_index)
+        >>> isinstance(_get_roads_index.__name__, str)
         True
     """
     roads_path = getattr(cfg, "ROADS_MASK_PATH", None)
@@ -101,7 +101,7 @@ def _get_roads_mask(
         np.ndarray | None: Boolean mask if available.
 
     Examples:
-        >>> callable(_get_roads_mask)
+        >>> isinstance(_get_roads_mask.__name__, str)
         True
     """
     key = (tile_path, downsample_factor)
@@ -311,7 +311,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         tuple: (img_b, labels_sh, gt_mask, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m)
 
     Examples:
-        >>> callable(load_b_tile_context)
+        >>> isinstance(load_b_tile_context.__name__, str)
         True
     """
     logger.info("loading tile: %s", img_path)

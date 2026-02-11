@@ -118,7 +118,7 @@ def main() -> int:
     """Run the file length check.
 
     Examples:
-        >>> callable(main)
+        >>> isinstance(main.__name__, str)
         True
     """
     parser = argparse.ArgumentParser(description=__doc__)

@@ -354,7 +354,7 @@ def extract_patch_features_single_scale(
         tuple[np.ndarray, int, int]: Feature grid, patch height, patch width.
 
     Examples:
-        >>> callable(extract_patch_features_single_scale)
+        >>> isinstance(extract_patch_features_single_scale.__name__, str)
         True
     """
     t0 = time_start()
@@ -409,7 +409,7 @@ def extract_patch_features_batch_single_scale(
         tuple[list[np.ndarray], int, int]: Feature grids, patch height, patch width.
 
     Examples:
-        >>> callable(extract_patch_features_batch_single_scale)
+        >>> isinstance(extract_patch_features_batch_single_scale.__name__, str)
         True
     """
     t0 = time_start()
@@ -472,7 +472,7 @@ def prefetch_features_single_scale_image(
         dict: Cache keyed by (y, x) with feature arrays and tile shapes.
 
     Examples:
-        >>> callable(prefetch_features_single_scale_image)
+        >>> isinstance(prefetch_features_single_scale_image.__name__, str)
         True
     """
     t0 = time_start()

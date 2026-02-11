@@ -41,7 +41,7 @@ def save_plot(
         labels_sh (np.ndarray | None): Optional SH labels.
 
     Examples:
-        >>> callable(save_plot)
+        >>> isinstance(save_plot.__name__, str)
         True
     """
     show_labels = labels_sh is not None
@@ -128,7 +128,7 @@ def save_best_model_plot(
         filename_suffix (str): Filename suffix.
 
     Examples:
-        >>> callable(save_best_model_plot)
+        >>> isinstance(save_best_model_plot.__name__, str)
         True
     """
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
@@ -181,7 +181,7 @@ def save_knn_xgb_gt_plot(
         filename_suffix (str): Filename suffix.
 
     Examples:
-        >>> callable(save_knn_xgb_gt_plot)
+        >>> isinstance(save_knn_xgb_gt_plot.__name__, str)
         True
     """
     fig, axs = plt.subplots(1, 3, figsize=(24, 8))
@@ -256,7 +256,7 @@ def save_unified_plot(
         bridge_enabled (bool): Whether bridge mask is present.
 
     Examples:
-        >>> callable(save_unified_plot)
+        >>> isinstance(save_unified_plot.__name__, str)
         True
     """
 

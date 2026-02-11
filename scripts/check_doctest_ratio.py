@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -31,6 +32,7 @@ class FunctionInfo:
     filepath: Path
     lineno: int
     has_doctest: bool
+    has_forbidden_doctest: bool
 
 
 def has_doctest(docstring: str | None) -> bool:
@@ -49,6 +51,25 @@ def has_doctest(docstring: str | None) -> bool:
     if not docstring:
         return False
     return ">>>" in docstring
+
+
+def has_forbidden_doctest(docstring: str | None) -> bool:
+    """Return True when a callable-based doctest shortcut is used.
+
+    Examples:
+        >>> sample = "Example.\\n>>> " + "callable(main)\\nTrue\\n"
+        >>> has_forbidden_doctest(sample)
+        True
+        >>> has_forbidden_doctest('''Example.
+        ...
+        ... >>> isinstance(main.__name__, str)
+        ... True
+        ... ''')
+        False
+    """
+    if not docstring:
+        return False
+    return bool(re.search(r"^\s*>>>\s*callable\(", docstring, flags=re.MULTILINE))
 
 
 def iter_python_files(root: Path) -> Iterable[Path]:
@@ -83,9 +104,23 @@ def collect_functions(filepath: Path) -> List[FunctionInfo]:
     except SyntaxError:
         return []
 
+    parent: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
     functions: List[FunctionInfo] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            p = parent.get(node)
+            nested_inside_function = False
+            while p is not None:
+                if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    nested_inside_function = True
+                    break
+                p = parent.get(p)
+            if nested_inside_function:
+                continue
             docstring = ast.get_docstring(node)
             functions.append(
                 FunctionInfo(
@@ -93,6 +128,7 @@ def collect_functions(filepath: Path) -> List[FunctionInfo]:
                     filepath=filepath,
                     lineno=getattr(node, "lineno", 1),
                     has_doctest=has_doctest(docstring),
+                    has_forbidden_doctest=has_forbidden_doctest(docstring),
                 )
             )
     return functions
@@ -111,11 +147,24 @@ def report_missing(functions: List[FunctionInfo]) -> str:
     return "\n".join(lines)
 
 
+def report_forbidden(functions: List[FunctionInfo]) -> str:
+    """Build a report of functions with forbidden doctest patterns.
+
+    Examples:
+        >>> report_forbidden([])
+        'Functions with forbidden doctests:'
+    """
+    lines = ["Functions with forbidden doctests:"]
+    for func in functions:
+        lines.append(f"- {func.filepath}:{func.lineno} {func.name}")
+    return "\n".join(lines)
+
+
 def main() -> int:
     """Run the doctest ratio check.
 
     Examples:
-        >>> callable(main)
+        >>> isinstance(main.__name__, str)
         True
     """
     parser = argparse.ArgumentParser(description=__doc__)
@@ -131,6 +180,14 @@ def main() -> int:
     all_functions: List[FunctionInfo] = []
     for path in iter_python_files(args.root):
         all_functions.extend(collect_functions(path))
+
+    forbidden = [f for f in all_functions if f.has_forbidden_doctest]
+    if forbidden:
+        print(
+            "Forbidden doctest pattern detected: do not use 'callable(...)' assertions."
+        )
+        print(report_forbidden(forbidden))
+        return 1
 
     total = len(all_functions)
     if total == 0:

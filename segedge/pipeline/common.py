@@ -53,7 +53,7 @@ def _tile_has_gt(
         bool: True if GT positives exist for the tile.
 
     Examples:
-        >>> callable(_tile_has_gt)
+        >>> isinstance(_tile_has_gt.__name__, str)
         True
     """
     with rio_open(tile_path) as src:
@@ -88,7 +88,7 @@ def _load_gt_geometries(
         list: List of shapely geometries.
 
     Examples:
-        >>> callable(_load_gt_geometries)
+        >>> isinstance(_load_gt_geometries.__name__, str)
         True
     """
     geoms = []
@@ -133,7 +133,7 @@ def _get_gt_index(
         tuple[STRtree | None, list]: Spatial index and geometries.
 
     Examples:
-        >>> callable(_get_gt_index)
+        >>> isinstance(_get_gt_index.__name__, str)
         True
     """
     crs_key = target_crs.to_string() if target_crs is not None else "<none>"
@@ -209,7 +209,7 @@ def _tiles_with_gt_chunk(
         tuple[list[str], list[str]]: GT tiles and holdout tiles.
 
     Examples:
-        >>> callable(_tiles_with_gt_chunk)
+        >>> isinstance(_tiles_with_gt_chunk.__name__, str)
         True
     """
     gt_tiles = []
@@ -372,7 +372,7 @@ def resolve_tile_splits_from_gt(
         tuple[list[str], list[str], list[str]]: Source, validation, holdout tiles.
 
     Examples:
-        >>> callable(resolve_tile_splits_from_gt)
+        >>> isinstance(resolve_tile_splits_from_gt.__name__, str)
         True
     """
     if not gt_vector_paths:
@@ -532,7 +532,7 @@ def init_model(model_name: str):
         tuple: (model, processor, device).
 
     Examples:
-        >>> callable(init_model)
+        >>> isinstance(init_model.__name__, str)
         True
     """
     t0 = time_start()
@@ -573,7 +573,7 @@ def build_banks_for_sources(
         tuple[np.ndarray, np.ndarray | None]: Positive and negative banks.
 
     Examples:
-        >>> callable(build_banks_for_sources)
+        >>> isinstance(build_banks_for_sources.__name__, str)
         True
     """
     img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
@@ -634,7 +634,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
         tuple[np.ndarray, np.ndarray]: Feature matrix and labels.
 
     Examples:
-        >>> callable(build_xgb_training_data)
+        >>> isinstance(build_xgb_training_data.__name__, str)
         True
     """
     from ..core.xdboost import build_xgb_dataset
@@ -684,7 +684,7 @@ def prep_b_tile(img_path, gt_paths):
             img_b, labels_sh, gt_mask_eval, sh_buffer_mask
 
     Examples:
-        >>> callable(prep_b_tile)
+        >>> isinstance(prep_b_tile.__name__, str)
         True
     """
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)

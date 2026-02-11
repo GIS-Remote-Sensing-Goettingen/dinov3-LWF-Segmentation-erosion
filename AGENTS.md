@@ -40,6 +40,12 @@ WARNING THE FOLLOWING IS MANDATORY YOU MUST FOLLOW THESE STEPS BEFORE COMING BAC
    - Any follow-ups or risks
 @@@@@@
 
+## Test integrity (mandatory)
+- Do not "game" doctest coverage with trivial assertions like `callable(...) == True`.
+- Doctests must validate real behavior (inputs/outputs, edge cases, or invariants).
+- The repository checker treats `>>> callable(...)` doctests as forbidden and failing.
+- If a function cannot have a meaningful doctest, add normal tests instead of placeholder doctests.
+
 
 
 ## Project map

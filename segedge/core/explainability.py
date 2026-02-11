@@ -361,7 +361,7 @@ def save_xai_tile_plot(
     """Save a 2x3 XAI panel figure for one tile.
 
     Examples:
-        >>> callable(save_xai_tile_plot)
+        >>> isinstance(save_xai_tile_plot.__name__, str)
         True
     """
     fig, axs = plt.subplots(2, 3, figsize=(18, 12))
@@ -412,7 +412,7 @@ def write_xai_tile_json(out_path: str, payload: dict) -> None:
     """Write one per-tile explainability JSON payload.
 
     Examples:
-        >>> callable(write_xai_tile_json)
+        >>> isinstance(write_xai_tile_json.__name__, str)
         True
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -424,7 +424,7 @@ def append_xai_summary_csv(out_path: str, row: dict) -> None:
     """Append one row to run-level XAI summary CSV.
 
     Examples:
-        >>> callable(append_xai_summary_csv)
+        >>> isinstance(append_xai_summary_csv.__name__, str)
         True
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

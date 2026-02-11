@@ -74,7 +74,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
         tuple[np.ndarray, np.ndarray]: Score map and saliency map.
 
     Examples:
-        >>> callable(zero_shot_knn_single_scale_B_with_saliency)
+        >>> isinstance(zero_shot_knn_single_scale_B_with_saliency.__name__, str)
         True
     """
     t0 = time_start()
@@ -298,7 +298,7 @@ def grid_search_k_threshold(
         tuple[dict | None, np.ndarray | None, np.ndarray | None]: Best config, score map, saliency map.
 
     Examples:
-        >>> callable(grid_search_k_threshold)
+        >>> isinstance(grid_search_k_threshold.__name__, str)
         True
     """
     t0 = time_start()

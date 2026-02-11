@@ -15,7 +15,8 @@ interfaces, and run artifacts.
   - Runtime controls: data paths, split mode, tuning ranges, output telemetry.
 - `segedge/pipeline/`
   - `run.py`: orchestration of end-to-end run lifecycle.
-  - `tuning.py`: validation tuning for kNN/XGB/CRF/shadow/top-p/roads.
+  - `tuning.py`: validation tuning orchestration (grid and Bayesian modes).
+  - `tuning_bayes.py`: staged Optuna search for raw, CRF/shadow, and bridge params.
   - `common.py`: split resolution, model init, shared prep logic.
   - `inference_utils.py`: tile context load and score-threshold helpers.
 - `segedge/core/`
@@ -38,7 +39,15 @@ interfaces, and run artifacts.
 2. Configure logging and initialize run-scoped artifact paths.
 3. Resolve source/validation/holdout tile sets.
 4. Build source-derived banks and XGB dataset from source tiles.
-5. Tune on validation tiles (roads/top-p/kNN/XGB/CRF/shadow).
+5. Tune on validation tiles.
+   - `TUNING_MODE="grid"`: exhaustive Cartesian search (legacy).
+   - `TUNING_MODE="bayes"`: staged Bayesian search:
+     - Stage 1: roads/top-p/kNN/XGB + silver-core dilation.
+     - Stage 2: CRF + shadow parameters with broad-then-refine flow.
+       - Refinement runs in a fresh study and seeds top trials with
+         `enqueue_trial(...)`.
+     - Stage 3: bridge/skeleton continuity parameters with frozen upstream maps.
+     - Sampler: configurable (`BO_SAMPLER`), default TPE.
 6. Run fixed-setting inference on validation tiles (metrics + plots).
 7. Run fixed-setting inference on holdout tiles (plots + union exports + resume log).
 8. Emit per-tile explainability artifacts (XGB+kNN) during validation and capped holdout.
@@ -110,6 +119,12 @@ Run outputs are rooted at `output/run_XXX/`:
 ## Key Data/Algorithm Contracts
 - Adaptive thresholding: top-p within SH buffer using
   `p = clip(a * buffer_density + b, p_min, p_max)`.
+- Robust tuning objective (Bayesian mode):
+  `score = w_gt * IoU_GT + w_sh * IoU_SH`, with optional light image perturbations.
+- Parameter-space precedence:
+  range keys (`BO_*_RANGE`) override legacy list keys (`*_VALUES`).
+- Bayesian diagnostics artifact:
+  run-level hyperparameter importances JSON (`BO_IMPORTANCE_FILENAME`).
 - Champion selection: choose better of `knn_raw` and `xgb_raw` by weighted validation IoU.
 - Post-processing chain: champion raw -> CRF -> optional bridge -> shadow.
 - Silver core: `kNN ∩ XGB` (optional dilation) exported as auxiliary stream.
@@ -119,4 +134,5 @@ Run outputs are rooted at `output/run_XXX/`:
 - Phase timing and telemetry schema: `segedge/core/timing_csv.py`.
 - Post-processing behavior: `segedge/core/crf_utils.py`, `segedge/core/continuity.py`,
   `segedge/core/shadow_filter.py`.
-- Tuning search spaces: `config.py` and `segedge/pipeline/tuning.py`.
+- Tuning search spaces and strategy: `config.py`, `segedge/pipeline/tuning.py`,
+  `segedge/pipeline/tuning_bayes.py`.

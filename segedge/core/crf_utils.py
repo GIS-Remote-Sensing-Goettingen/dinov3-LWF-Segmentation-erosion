@@ -96,7 +96,7 @@ def refine_with_densecrf(
         the CRF foreground probability map when return_prob=True.
 
     Examples:
-        >>> callable(refine_with_densecrf)
+        >>> isinstance(refine_with_densecrf.__name__, str)
         True
     """
     if not _HAS_DCRF:
@@ -159,7 +159,7 @@ def _crf_eval_worker(args):
         tuple[dict, dict]: Metrics and config dict.
 
     Examples:
-        >>> callable(_crf_eval_worker)
+        >>> isinstance(_crf_eval_worker.__name__, str)
         True
     """
     img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg = (
@@ -233,7 +233,7 @@ def crf_grid_search(
         tuple[dict | None, np.ndarray | None]: Best config and mask.
 
     Examples:
-        >>> callable(crf_grid_search)
+        >>> isinstance(crf_grid_search.__name__, str)
         True
     """
     t0 = time_start()

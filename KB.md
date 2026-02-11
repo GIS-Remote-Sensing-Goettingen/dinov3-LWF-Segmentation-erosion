@@ -61,6 +61,9 @@ post-processing.
 1. Resolve source/validation/holdout tiles.
 2. Build source feature banks and XGB dataset.
 3. Tune settings on validation set.
+   - `TUNING_MODE="grid"`: exhaustive Cartesian search.
+   - `TUNING_MODE="bayes"`: staged Bayesian search
+     (Stage 1 raw, Stage 2 CRF/shadow broad+refine, Stage 3 bridge with frozen upstream maps).
 4. Infer on validation with frozen settings.
 5. Infer on holdout with frozen settings.
 6. Export unions, settings, summaries, and telemetry.
@@ -162,6 +165,18 @@ This section reflects current `config.py` defaults.
 - `PATCH_SIZE = 16`
 - `BUFFER_M = 5.0`
 
+### Tuning Mode Defaults
+- `TUNING_MODE = "bayes"`
+- `BO_SAMPLER = "tpe"` (`multivariate=True`, `group=True`)
+- `BO_STAGE1_TRIALS = 400`
+- `BO_STAGE2_TRIALS = 400`
+- `BO_STAGE3_TRIALS = 200`
+- `BO_OBJECTIVE_W_GT = 0.8`
+- `BO_OBJECTIVE_W_SH = 0.2`
+- `BO_PERTURBATIONS_PER_TILE = 1`
+- `BO_IMPORTANCE_FILENAME = "bayes_hyperparam_importances.json"`
+- `BO_*_RANGE` keys override `*_VALUES` keys when present.
+
 ### Split Defaults
 - `AUTO_SPLIT_TILES = True`
 - `AUTO_SPLIT_MODE = "gt_to_val_cap_holdout"`
@@ -186,6 +201,10 @@ Top-p candidate grids:
 - Shadow tuned over `SHADOW_WEIGHT_SETS`, `SHADOW_THRESHOLDS`,
   `SHADOW_PROTECT_SCORES`.
 - Bridge enabled (`ENABLE_GAP_BRIDGING=True`) with large-gap settings.
+- Bayesian bridge search uses `BRIDGE_*_VALUES` grids.
+- Silver-core dilation can be tuned through `SILVER_CORE_DILATE_PX_VALUES`.
+- Stage 2 can refine around top broad-trial regions with seeded trials.
+- Stage 3 reuses frozen upstream outputs to avoid repeated classifier recomputation.
 
 ### Timing Telemetry Defaults
 - `TIMING_CSV_ENABLED = True`
@@ -209,7 +228,8 @@ Top-p candidate grids:
 
 ### Orchestration
 - `segedge/pipeline/run.py`: full run lifecycle, exports, telemetry integration.
-- `segedge/pipeline/tuning.py`: validation tuning and selection logic.
+- `segedge/pipeline/tuning.py`: validation tuning orchestration.
+- `segedge/pipeline/tuning_bayes.py`: staged Bayesian optimization helpers.
 - `segedge/pipeline/common.py`: split logic, model init, utility flow.
 - `segedge/pipeline/inference_utils.py`: context load and inference helpers.
 
@@ -227,6 +247,7 @@ Top-p candidate grids:
 - `segedge/core/io_utils.py`: image/vector I/O, shapefile/YAML exports.
 - `segedge/core/timing_csv.py`: detailed and summary timing CSV generation.
 - `segedge/core/summary_utils.py`: phase/timing aggregation for YAML.
+- Bayesian tuning writes stage-wise hyperparameter importances to run root JSON.
 
 ---
 

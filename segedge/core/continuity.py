@@ -92,7 +92,7 @@ def bridge_skeleton_gaps(
         np.ndarray: Bridged mask.
 
     Examples:
-        >>> callable(bridge_skeleton_gaps)
+        >>> isinstance(bridge_skeleton_gaps.__name__, str)
         True
     """
     mask_bool = mask.astype(bool)

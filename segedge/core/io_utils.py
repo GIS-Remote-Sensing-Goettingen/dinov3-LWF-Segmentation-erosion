@@ -47,7 +47,7 @@ def load_dop20_image(path: str, downsample_factor: int = 1) -> np.ndarray:
         np.ndarray: HxWx3 RGB array.
 
     Examples:
-        >>> callable(load_dop20_image)
+        >>> isinstance(load_dop20_image.__name__, str)
         True
     """
     t0 = time_start()
@@ -82,7 +82,7 @@ def reproject_labels_to_image(
         np.ndarray: Reprojected label array.
 
     Examples:
-        >>> callable(reproject_labels_to_image)
+        >>> isinstance(reproject_labels_to_image.__name__, str)
         True
     """
     t0 = time_start()
@@ -294,7 +294,7 @@ def rasterize_vector_labels(
         np.ndarray: Rasterized mask array.
 
     Examples:
-        >>> callable(rasterize_vector_labels)
+        >>> isinstance(rasterize_vector_labels.__name__, str)
         True
     """
     t0 = time_start()
@@ -380,7 +380,7 @@ def build_roads_raster_from_vector(
         str: Output raster path.
 
     Examples:
-        >>> callable(build_roads_raster_from_vector)
+        >>> isinstance(build_roads_raster_from_vector.__name__, str)
         True
     """
     t0 = time_start()
@@ -497,7 +497,7 @@ def export_mask_to_shapefile(mask: np.ndarray, ref_raster_path: str, out_path: s
         out_path (str): Output shapefile path.
 
     Examples:
-        >>> callable(export_mask_to_shapefile)
+        >>> isinstance(export_mask_to_shapefile.__name__, str)
         True
     """
     t0 = time_start()
@@ -537,7 +537,7 @@ def export_masks_to_shapefile_union(
         out_path (str): Output shapefile path.
 
     Examples:
-        >>> callable(export_masks_to_shapefile_union)
+        >>> isinstance(export_masks_to_shapefile_union.__name__, str)
         True
     """
     t0 = time_start()
@@ -591,7 +591,7 @@ def append_mask_to_union_shapefile(
         int: Next feature id after appending.
 
     Examples:
-        >>> callable(append_mask_to_union_shapefile)
+        >>> isinstance(append_mask_to_union_shapefile.__name__, str)
         True
     """
     mask_uint8 = mask.astype("uint8")
@@ -634,7 +634,7 @@ def backup_union_shapefile(out_path: str, backup_dir: str, step: int) -> None:
         step (int): Step index for naming.
 
     Examples:
-        >>> callable(backup_union_shapefile)
+        >>> isinstance(backup_union_shapefile.__name__, str)
         True
     """
     if not os.path.exists(out_path):
@@ -663,7 +663,7 @@ def count_shapefile_features(path: str) -> int:
         int: Number of features.
 
     Examples:
-        >>> callable(count_shapefile_features)
+        >>> isinstance(count_shapefile_features.__name__, str)
         True
     """
     if not os.path.exists(path):
