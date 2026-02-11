@@ -65,7 +65,9 @@ def _study_trials_to_rows(
         >>> isinstance(_study_trials_to_rows.__name__, str)
         True
     """
-    trials = sorted(list(getattr(study, "trials", []) or []), key=lambda t: int(t.number))
+    trials = sorted(
+        list(getattr(study, "trials", []) or []), key=lambda t: int(t.number)
+    )
     if max_recent_trials is not None and max_recent_trials > 0:
         trials = trials[-int(max_recent_trials) :]
 
@@ -170,12 +172,7 @@ def write_optuna_trials_csv(output_path: str, rows: list[dict[str, object]]) -> 
         "is_best_so_far",
     ]
     dynamic_cols = sorted(
-        {
-            str(k)
-            for row in rows
-            for k in row.keys()
-            if str(k) not in set(base_cols)
-        }
+        {str(k) for row in rows for k in row.keys() if str(k) not in set(base_cols)}
     )
     fieldnames = base_cols + dynamic_cols
     with open(output_path, "w", encoding="utf-8", newline="") as fh:
@@ -196,7 +193,9 @@ def write_optuna_importance_csv(output_path: str, payload: dict) -> None:
     rows: list[dict[str, object]] = []
     for stage_key in ("stage1", "stage2", "stage3"):
         stage_obj = payload.get(stage_key, {})
-        importances = stage_obj.get("importances", {}) if isinstance(stage_obj, dict) else {}
+        importances = (
+            stage_obj.get("importances", {}) if isinstance(stage_obj, dict) else {}
+        )
         rank = 1
         for param_name, score in sorted(
             ((str(k), float(v)) for k, v in importances.items()),
