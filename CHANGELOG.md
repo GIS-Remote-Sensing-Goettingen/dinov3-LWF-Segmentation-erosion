@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.34]
+- Description: Fix black formatting and add Python cache/build artifacts to .gitignore.
+- file touched: `.gitignore`, `segedge/core/optuna_csv.py`, `CHANGELOG.md`
+- reason: Ensure code formatting consistency and prevent accidental commit of Python cache and build artifacts.
+- problems fixed: Applies black formatting to optuna_csv.py and excludes __pycache__, *.egg-info, and related build artifacts from version control.
+
 ## [0.2.33]
 - Description: Add Bayesian Optuna CSV telemetry artifacts for trial time series and parameter importances.
 - file touched: `config.py`, `segedge/core/optuna_csv.py`, `segedge/pipeline/tuning.py`, `tests/test_optuna_csv.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
