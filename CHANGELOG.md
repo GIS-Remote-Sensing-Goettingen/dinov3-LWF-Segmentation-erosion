@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.36]
+- Description: Add a comprehensive repository `README.md` that documents purpose, runtime flow, tuning strategy, outputs, telemetry, and operating guidance.
+- file touched: `README.md`, `CHANGELOG.md`
+- reason: Provide a clear top-level entrypoint for onboarding, operation, and artifact interpretation without requiring readers to jump directly into architecture internals.
+- problems fixed: Repository lacked a dedicated root README describing how to run the pipeline and how to interpret generated outputs and CSV telemetry.
+
 ## [0.2.35]
 - Description: Add Bayesian stagnation early-stop callbacks with configurable patience/delta.
 - file touched: `config.py`, `segedge/core/optuna_stop.py`, `segedge/pipeline/tuning_bayes.py`, `tests/test_optuna_stop.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
