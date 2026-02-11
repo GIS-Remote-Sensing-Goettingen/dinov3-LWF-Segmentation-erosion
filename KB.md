@@ -174,6 +174,8 @@ This section reflects current `config.py` defaults.
 - `BO_OBJECTIVE_W_GT = 0.8`
 - `BO_OBJECTIVE_W_SH = 0.2`
 - `BO_PERTURBATIONS_PER_TILE = 1`
+- `BO_EARLY_STOP_PATIENCE = 20`
+- `BO_EARLY_STOP_MIN_DELTA = 0.0`
 - `BO_IMPORTANCE_FILENAME = "bayes_hyperparam_importances.json"`
 - `BO_IMPORTANCE_CSV_FILENAME = "bayes_hyperparam_importances.csv"`
 - `BO_TRIALS_CSV_FILENAME = "bayes_trials_timeseries.csv"`

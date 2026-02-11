@@ -123,6 +123,9 @@ Run outputs are rooted at `output/run_XXX/`:
   `p = clip(a * buffer_density + b, p_min, p_max)`.
 - Robust tuning objective (Bayesian mode):
   `score = w_gt * IoU_GT + w_sh * IoU_SH`, with optional light image perturbations.
+- Bayesian stagnation guard:
+  Optuna studies can stop early after `BO_EARLY_STOP_PATIENCE` non-improving trials
+  (with tolerance `BO_EARLY_STOP_MIN_DELTA`).
 - Parameter-space precedence:
   range keys (`BO_*_RANGE`) override legacy list keys (`*_VALUES`).
 - Bayesian diagnostics artifact:

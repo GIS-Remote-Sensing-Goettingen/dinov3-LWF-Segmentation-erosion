@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.34]
+- Description: Add Bayesian stagnation early-stop callbacks with configurable patience/delta.
+- file touched: `config.py`, `segedge/core/optuna_stop.py`, `segedge/pipeline/tuning_bayes.py`, `tests/test_optuna_stop.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Stop long Bayesian runs earlier when trials plateau and no meaningful objective gains are found.
+- problems fixed: Adds `BO_EARLY_STOP_PATIENCE` (default `20`) and `BO_EARLY_STOP_MIN_DELTA`, wiring callbacks into stage1/stage2/stage3 Optuna optimize loops.
+
 ## [0.2.33]
 - Description: Add Bayesian Optuna CSV telemetry artifacts for trial time series and parameter importances.
 - file touched: `config.py`, `segedge/core/optuna_csv.py`, `segedge/pipeline/tuning.py`, `tests/test_optuna_csv.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`

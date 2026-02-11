@@ -14,6 +14,7 @@ from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.metrics_utils import compute_metrics
+from ..core.optuna_stop import build_no_improvement_callbacks_from_config
 from ..core.summary_utils import weighted_mean
 from ..core.xdboost import xgb_score_image_b
 from .inference_utils import (
@@ -27,13 +28,7 @@ USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
 
 
 def get_optuna_module():
-    """Return the optuna module when available, else None.
-
-    Examples:
-        >>> mod = get_optuna_module()
-        >>> mod is None or hasattr(mod, "create_study")
-        True
-    """
+    """Return the optuna module when available, else None."""
     try:
         import optuna  # type: ignore
 
@@ -66,12 +61,7 @@ def mask_iou(
 
 
 def robust_objective(iou_gt: float, iou_sh: float, w_gt: float, w_sh: float) -> float:
-    """Combine GT and SH IoU into one robustness-aware objective.
-
-    Examples:
-        >>> isinstance(robust_objective.__name__, str)
-        True
-    """
+    """Combine GT and SH IoU into one robustness-aware objective."""
     return float(w_gt * iou_gt + w_sh * iou_sh)
 
 
@@ -768,6 +758,7 @@ def run_stage1_bayes(
         objective,
         n_trials=int(getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50),
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
+        callbacks=build_no_improvement_callbacks_from_config(cfg, default_patience=20),
     )
     best = study.best_trial
     xgb_idx = int(
@@ -1058,10 +1049,14 @@ def run_stage2_bayes(
         "stage2_crf_shadow_broad",
         seed=int(getattr(cfg, "BO_SEED", 42) or 42) + 101,
     )
+    stagnation_callbacks = build_no_improvement_callbacks_from_config(
+        cfg, default_patience=20
+    )
     stage2_broad.optimize(
         lambda tr: _objective_with_refine(tr, refine=None),
         n_trials=broad_trials,
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
+        callbacks=stagnation_callbacks,
     )
 
     completed = [t for t in stage2_broad.trials if t.value is not None]
@@ -1131,6 +1126,7 @@ def run_stage2_bayes(
             lambda tr: _objective_with_refine(tr, refine=refine_spec),
             n_trials=refine_trials,
             timeout=getattr(cfg, "BO_TIMEOUT_S", None),
+            callbacks=stagnation_callbacks,
         )
         final_study = stage2_refine
     else:
@@ -1459,6 +1455,7 @@ def run_stage3_bayes(
         objective,
         n_trials=int(getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30),
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
+        callbacks=build_no_improvement_callbacks_from_config(cfg, default_patience=20),
     )
     best = study.best_trial
     return {
