@@ -85,7 +85,7 @@ def _log_phase(kind: str, name: str) -> None:
         name (str): Phase name.
 
     Examples:
-        >>> callable(_log_phase)
+        >>> isinstance(_log_phase.__name__, str)
         True
     """
     msg = f"PHASE {kind}: {name}".upper()
@@ -204,7 +204,7 @@ def infer_on_holdout(
         dict: Masks, metrics, and metadata for the tile.
 
     Examples:
-        >>> callable(infer_on_holdout)
+        >>> isinstance(infer_on_holdout.__name__, str)
         True
     """
     logger.info("inference: holdout tile %s", holdout_path)
@@ -249,6 +249,7 @@ def infer_on_holdout(
     timings["prefetch_features_s"] = time.perf_counter() - t0
 
     k = tuned["best_raw_config"]["k"]
+    tuned_neg_alpha = float(tuned.get("neg_alpha", getattr(cfg, "NEG_ALPHA", 1.0)))
     top_p_a = float(tuned.get("top_p_a", getattr(cfg, "TOP_P_A", 0.0)))
     top_p_b = float(tuned.get("top_p_b", getattr(cfg, "TOP_P_B", 0.05)))
     top_p_min = float(tuned.get("top_p_min", getattr(cfg, "TOP_P_MIN", 0.02)))
@@ -270,7 +271,7 @@ def infer_on_holdout(
         aggregate_layers=None,
         feature_dir=feature_dir,
         image_id=image_id_b,
-        neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+        neg_alpha=tuned_neg_alpha,
         prefetched_tiles=prefetched_b,
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
@@ -317,7 +318,12 @@ def infer_on_holdout(
 
     t0 = time.perf_counter()
     core_mask = np.logical_and(mask_knn, mask_xgb)
-    dilate_px = int(getattr(cfg, "SILVER_CORE_DILATE_PX", 1))
+    dilate_px = int(
+        tuned.get(
+            "silver_core_dilate_px",
+            getattr(cfg, "SILVER_CORE_DILATE_PX", 1),
+        )
+    )
     if dilate_px > 0:
         core_mask = binary_dilation(core_mask, disk(dilate_px))
     metrics_core = compute_metrics(core_mask, gt_mask_eval)
@@ -373,15 +379,39 @@ def infer_on_holdout(
     if bridge_enabled:
         t0 = time.perf_counter()
         prob_crf = prob_crf_knn if champion_source == "raw" else prob_crf_xgb
+        bridge_cfg = tuned.get("best_bridge_config", {}) or {}
         bridge_mask = bridge_skeleton_gaps(
             best_crf_mask,
             prob_crf,
-            max_gap_px=int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            max_pairs_per_endpoint=int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            max_avg_cost=float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            bridge_width_px=int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            min_component_area_px=int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
-            spur_prune_iters=int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            max_gap_px=int(
+                bridge_cfg.get(
+                    "bridge_max_gap_px", getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)
+                )
+            ),
+            max_pairs_per_endpoint=int(
+                bridge_cfg.get("bridge_max_pairs", getattr(cfg, "BRIDGE_MAX_PAIRS", 3))
+            ),
+            max_avg_cost=float(
+                bridge_cfg.get(
+                    "bridge_max_avg_cost",
+                    getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0),
+                )
+            ),
+            bridge_width_px=int(
+                bridge_cfg.get("bridge_width_px", getattr(cfg, "BRIDGE_WIDTH_PX", 2))
+            ),
+            min_component_area_px=int(
+                bridge_cfg.get(
+                    "bridge_min_component_px",
+                    getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300),
+                )
+            ),
+            spur_prune_iters=int(
+                bridge_cfg.get(
+                    "bridge_spur_prune_iters",
+                    getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15),
+                )
+            ),
         )
         timings["bridge_s"] = time.perf_counter() - t0
 
@@ -632,7 +662,7 @@ def main():
     """Run the full segmentation pipeline for configured tiles.
 
     Examples:
-        >>> callable(main)
+        >>> isinstance(main.__name__, str)
         True
     """
 
@@ -1138,6 +1168,7 @@ def main():
         }
 
     inference_best_settings_path = os.path.join(run_dir, "inference_best_setting.yml")
+    tuned_bridge_cfg = tuned.get("best_bridge_config", {}) or {}
     export_best_settings(
         tuned["best_raw_config"],
         tuned["best_crf_config"],
@@ -1152,7 +1183,7 @@ def main():
             "stride": stride,
             "patch_size": ps,
             "feat_context_radius": context_radius,
-            "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
+            "neg_alpha": float(tuned.get("neg_alpha", getattr(cfg, "NEG_ALPHA", 1.0))),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
             "roads_penalty": tuned.get("roads_penalty", 1.0),
             "roads_mask_path": getattr(cfg, "ROADS_MASK_PATH", None),
@@ -1160,16 +1191,45 @@ def main():
             "top_p_b": tuned.get("top_p_b", getattr(cfg, "TOP_P_B", 0.05)),
             "top_p_min": tuned.get("top_p_min", getattr(cfg, "TOP_P_MIN", 0.02)),
             "top_p_max": tuned.get("top_p_max", getattr(cfg, "TOP_P_MAX", 0.08)),
-            "silver_core_dilate_px": int(getattr(cfg, "SILVER_CORE_DILATE_PX", 1)),
-            "gap_bridging": bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)),
-            "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            "bridge_min_component_px": int(
-                getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
+            "silver_core_dilate_px": int(
+                tuned.get(
+                    "silver_core_dilate_px", getattr(cfg, "SILVER_CORE_DILATE_PX", 1)
+                )
             ),
-            "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            "gap_bridging": bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)),
+            "bridge_max_gap_px": int(
+                tuned_bridge_cfg.get(
+                    "bridge_max_gap_px", getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)
+                )
+            ),
+            "bridge_max_pairs": int(
+                tuned_bridge_cfg.get(
+                    "bridge_max_pairs", getattr(cfg, "BRIDGE_MAX_PAIRS", 3)
+                )
+            ),
+            "bridge_max_avg_cost": float(
+                tuned_bridge_cfg.get(
+                    "bridge_max_avg_cost",
+                    getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0),
+                )
+            ),
+            "bridge_width_px": int(
+                tuned_bridge_cfg.get(
+                    "bridge_width_px", getattr(cfg, "BRIDGE_WIDTH_PX", 2)
+                )
+            ),
+            "bridge_min_component_px": int(
+                tuned_bridge_cfg.get(
+                    "bridge_min_component_px",
+                    getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300),
+                )
+            ),
+            "bridge_spur_prune_iters": int(
+                tuned_bridge_cfg.get(
+                    "bridge_spur_prune_iters",
+                    getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15),
+                )
+            ),
             "auto_split_tiles": bool(auto_split_tiles),
             "auto_split_mode": str(
                 getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)

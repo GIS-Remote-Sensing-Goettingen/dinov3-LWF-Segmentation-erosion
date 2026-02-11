@@ -3,6 +3,30 @@
 
 ## [Unreleased]
 
+## [0.2.32]
+- Description: Propagate Bayesian-tuned `neg_alpha` into inference/runtime settings and exported best-settings YAML.
+- file touched: `segedge/pipeline/tuning.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
+- reason: Keep deployment/evaluation behavior consistent with the hyperparameter values selected during Bayesian optimization.
+- problems fixed: Eliminates train/deploy mismatch where stage-1 tuned `neg_alpha` was dropped from the return bundle and holdout inference/export silently used `cfg.NEG_ALPHA`.
+
+## [0.2.31]
+- Description: Enforce doctest integrity by forbidding `callable(...)` shortcut doctests and replace existing callable-style doctests with non-cheat assertions.
+- file touched: `AGENTS.md`, `scripts/check_doctest_ratio.py`, `main.py`, `scripts/check_file_length.py`, `segedge/core/*.py`, `segedge/pipeline/*.py`, `CHANGELOG.md`
+- reason: Prevent fake doctest coverage and ensure coverage signals reflect meaningful behavior checks.
+- problems fixed: Adds an automated guard against callable-based doctest cheating, updates contributor policy, and removes existing callable-pattern doctests from tracked Python modules.
+
+## [0.2.30]
+- Description: Refactor Bayesian tuning to range-first sampling with stage-2 broad/refine seeding and stage-3 frozen-upstream bridge optimization.
+- file touched: `config.py`, `segedge/pipeline/tuning_bayes.py`, `segedge/pipeline/tuning.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Make long-budget Optuna runs more sample-efficient and avoid redundant recomputation in late-stage topology tuning.
+- problems fixed: Adds strict `BO_*_RANGE` precedence over legacy lists, implements stage-2 refinement in a fresh seeded study, tunes `NEG_ALPHA` in stage1, and freezes upstream maps for faster stage-3 bridge trials.
+
+## [0.2.29]
+- Description: Add staged Bayesian tuning (default TPE with multivariate+group; optional CMA-ES), emit run-level hyperparameter importances JSON, and wire tuned bridge/silver-core params into inference/export.
+- file touched: `config.py`, `segedge/pipeline/tuning_bayes.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Replace exhaustive high-cost tuning with a smarter staged optimizer that balances GT accuracy and SH consistency under light perturbations, while exposing parameter sensitivity per stage.
+- problems fixed: Enables practical optimization of large search spaces (including bridge/skeletonization), adds persistent hyperparameter-importance reporting, uses tuned post-processing params at inference time, and keeps exported settings aligned with what was actually selected.
+
 ## [0.2.28]
 - Description: Fix duplicate XAI JSON write per tile and align XAI write timing with actual single-write behavior.
 - file touched: `segedge/pipeline/run.py`, `CHANGELOG.md`

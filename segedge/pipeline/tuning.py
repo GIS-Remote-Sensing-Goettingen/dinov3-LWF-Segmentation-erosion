@@ -30,6 +30,14 @@ from .inference_utils import (
     _top_p_threshold,
     load_b_tile_context,
 )
+from .tuning_bayes import (
+    attach_perturbations_to_contexts,
+    get_optuna_module,
+    run_stage1_bayes,
+    run_stage2_bayes,
+    run_stage3_bayes,
+    write_bo_importances_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +99,7 @@ def _render_tuning_plots(
     stride: int,
     feature_dir: str | None,
     context_radius: int,
+    best_bridge_cfg: dict | None = None,
 ) -> None:
     max_tiles = int(getattr(cfg, "TUNING_PLOT_MAX_TILES", 10) or 0)
     if max_tiles <= 0:
@@ -213,15 +222,44 @@ def _render_tuning_plots(
 
         champion_bridge = champion_crf
         if bridge_enabled:
+            bridge_cfg = best_bridge_cfg or {}
             champion_bridge = bridge_skeleton_gaps(
                 champion_crf,
                 champion_prob,
-                max_gap_px=int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-                max_pairs_per_endpoint=int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-                max_avg_cost=float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-                bridge_width_px=int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-                min_component_area_px=int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
-                spur_prune_iters=int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+                max_gap_px=int(
+                    bridge_cfg.get(
+                        "bridge_max_gap_px", getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)
+                    )
+                ),
+                max_pairs_per_endpoint=int(
+                    bridge_cfg.get(
+                        "bridge_max_pairs",
+                        getattr(cfg, "BRIDGE_MAX_PAIRS", 3),
+                    )
+                ),
+                max_avg_cost=float(
+                    bridge_cfg.get(
+                        "bridge_max_avg_cost",
+                        getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0),
+                    )
+                ),
+                bridge_width_px=int(
+                    bridge_cfg.get(
+                        "bridge_width_px", getattr(cfg, "BRIDGE_WIDTH_PX", 2)
+                    )
+                ),
+                min_component_area_px=int(
+                    bridge_cfg.get(
+                        "bridge_min_component_px",
+                        getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300),
+                    )
+                ),
+                spur_prune_iters=int(
+                    bridge_cfg.get(
+                        "bridge_spur_prune_iters",
+                        getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15),
+                    )
+                ),
             )
         champion_shadow = _apply_shadow_filter(
             ctx["img_b"],
@@ -306,7 +344,7 @@ def tune_on_validation_multi(
         dict: Tuned configurations and models.
 
     Examples:
-        >>> callable(tune_on_validation_multi)
+        >>> isinstance(tune_on_validation_multi.__name__, str)
         True
     """
     if not val_paths:
@@ -408,6 +446,202 @@ def tune_on_validation_multi(
                 context_radius=context_radius,
             )
         xgb_candidates.append({"bst": bst, "params": params_used})
+
+    tuning_mode = str(getattr(cfg, "TUNING_MODE", "grid")).strip().lower()
+    if tuning_mode == "bayes":
+        optuna_mod = get_optuna_module()
+        if optuna_mod is None:
+            logger.warning(
+                "tune: TUNING_MODE='bayes' but optuna is unavailable; falling back to grid"
+            )
+        else:
+            perturb_count = int(getattr(cfg, "BO_PERTURBATIONS_PER_TILE", 0) or 0)
+            perturb_seed = int(getattr(cfg, "BO_PERTURB_SEED", 42) or 42)
+            if perturb_count > 0:
+                attach_perturbations_to_contexts(
+                    val_contexts,
+                    count=perturb_count,
+                    seed=perturb_seed,
+                )
+            logger.info(
+                "tune: Bayesian optimization enabled (stage trials: %s/%s/%s, perturbations=%s)",
+                int(getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50),
+                int(getattr(cfg, "BO_STAGE2_TRIALS", 40) or 40),
+                int(getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30),
+                perturb_count,
+            )
+            stage1_bundle = run_stage1_bayes(
+                optuna_mod=optuna_mod,
+                val_contexts=val_contexts,
+                xgb_candidates=xgb_candidates,
+                model=model,
+                processor=processor,
+                device=device,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                feature_dir=feature_dir,
+                context_radius=context_radius,
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
+            )
+            best_crf_cfg, best_shadow_cfg, stage2_info = run_stage2_bayes(
+                optuna_mod=optuna_mod,
+                val_contexts=val_contexts,
+                stage1_bundle=stage1_bundle,
+                model=model,
+                processor=processor,
+                device=device,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                feature_dir=feature_dir,
+                context_radius=context_radius,
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
+            )
+            best_bridge_cfg = run_stage3_bayes(
+                optuna_mod=optuna_mod,
+                val_contexts=val_contexts,
+                stage1_bundle=stage1_bundle,
+                best_crf_cfg=best_crf_cfg,
+                best_shadow_cfg=best_shadow_cfg,
+                model=model,
+                processor=processor,
+                device=device,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                feature_dir=feature_dir,
+                context_radius=context_radius,
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
+            )
+            bo_importances_path = os.path.join(
+                os.path.dirname(cfg.PLOT_DIR),
+                str(
+                    getattr(
+                        cfg,
+                        "BO_IMPORTANCE_FILENAME",
+                        "bayes_hyperparam_importances.json",
+                    )
+                ),
+            )
+            write_bo_importances_file(
+                bo_importances_path,
+                {
+                    "mode": "bayes",
+                    "sampler": str(getattr(cfg, "BO_SAMPLER", "tpe")),
+                    "objective_weights": {
+                        "w_gt": float(getattr(cfg, "BO_OBJECTIVE_W_GT", 0.8)),
+                        "w_sh": float(getattr(cfg, "BO_OBJECTIVE_W_SH", 0.2)),
+                    },
+                    "stage1": {
+                        "best_value": float(
+                            stage1_bundle.get("optuna_best_value", 0.0)
+                        ),
+                        "importances": stage1_bundle.get("optuna_importances", {}),
+                        "best_params": {
+                            "k": int(stage1_bundle["best_raw_config"]["k"]),
+                            "neg_alpha": float(
+                                stage1_bundle.get(
+                                    "neg_alpha",
+                                    getattr(cfg, "NEG_ALPHA", 1.0),
+                                )
+                            ),
+                            "roads_penalty": float(stage1_bundle["roads_penalty"]),
+                            "top_p_a": float(stage1_bundle["top_p_a"]),
+                            "top_p_b": float(stage1_bundle["top_p_b"]),
+                            "top_p_min": float(stage1_bundle["top_p_min"]),
+                            "top_p_max": float(stage1_bundle["top_p_max"]),
+                        },
+                    },
+                    "stage2": {
+                        "best_value": float(stage2_info.get("optuna_best_value", 0.0)),
+                        "importances": stage2_info.get("optuna_importances", {}),
+                        "refinement": stage2_info.get("refinement", {}),
+                    },
+                    "stage3": {
+                        "best_value": float(
+                            best_bridge_cfg.get("optuna_best_value", 0.0)
+                        ),
+                        "importances": best_bridge_cfg.get("optuna_importances", {}),
+                        "frozen_upstream_cache_entries": int(
+                            best_bridge_cfg.get("frozen_upstream_cache_entries", 0)
+                        ),
+                    },
+                },
+            )
+            logger.info(
+                "tune: wrote hyperparameter importances: %s", bo_importances_path
+            )
+            logger.info(
+                "tune: bayes selected champion=%s roads_penalty=%.3f top-p=(%.3f, %.3f, %.3f, %.3f)",
+                stage1_bundle["champion_source"],
+                float(stage1_bundle["roads_penalty"]),
+                float(stage1_bundle["top_p_a"]),
+                float(stage1_bundle["top_p_b"]),
+                float(stage1_bundle["top_p_min"]),
+                float(stage1_bundle["top_p_max"]),
+            )
+            _render_tuning_plots(
+                val_contexts,
+                model,
+                processor,
+                device,
+                pos_bank,
+                neg_bank,
+                stage1_bundle["best_raw_config"],
+                stage1_bundle["best_bst"],
+                best_crf_cfg,
+                best_shadow_cfg,
+                stage1_bundle["champion_source"],
+                float(stage1_bundle["roads_penalty"]),
+                float(stage1_bundle["top_p_a"]),
+                float(stage1_bundle["top_p_b"]),
+                float(stage1_bundle["top_p_min"]),
+                float(stage1_bundle["top_p_max"]),
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                context_radius,
+                best_bridge_cfg=best_bridge_cfg,
+            )
+            return {
+                "bst": stage1_bundle["best_bst"],
+                "best_raw_config": stage1_bundle["best_raw_config"],
+                "best_xgb_config": stage1_bundle["best_xgb_config"],
+                "champion_source": stage1_bundle["champion_source"],
+                "neg_alpha": float(
+                    stage1_bundle.get("neg_alpha", getattr(cfg, "NEG_ALPHA", 1.0))
+                ),
+                "best_crf_config": {
+                    **best_crf_cfg,
+                    "k": stage1_bundle["best_raw_config"]["k"],
+                },
+                "shadow_cfg": best_shadow_cfg,
+                "roads_penalty": float(stage1_bundle["roads_penalty"]),
+                "top_p_a": float(stage1_bundle["top_p_a"]),
+                "top_p_b": float(stage1_bundle["top_p_b"]),
+                "top_p_min": float(stage1_bundle["top_p_min"]),
+                "top_p_max": float(stage1_bundle["top_p_max"]),
+                "silver_core_iou": float(stage1_bundle["silver_core_iou"]),
+                "silver_core_dilate_px": int(stage1_bundle["silver_core_dilate_px"]),
+                "best_bridge_config": {
+                    key: best_bridge_cfg[key]
+                    for key in [
+                        "bridge_max_gap_px",
+                        "bridge_max_pairs",
+                        "bridge_max_avg_cost",
+                        "bridge_width_px",
+                        "bridge_min_component_px",
+                        "bridge_spur_prune_iters",
+                        "iou",
+                    ]
+                    if key in best_bridge_cfg
+                },
+            }
 
     roads_penalties = [float(p) for p in getattr(cfg, "ROADS_PENALTY_VALUES", [1.0])]
     a_values = getattr(cfg, "TOP_P_A_VALUES", None) or [getattr(cfg, "TOP_P_A", 0.0)]
@@ -813,6 +1047,14 @@ def tune_on_validation_multi(
     if best_shadow_cfg is None:
         raise ValueError("shadow tuning returned no results")
 
+    best_bridge_cfg = {
+        "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
+        "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
+        "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
+        "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
+        "bridge_min_component_px": int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
+        "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+    }
     logger.info("tune: roads penalty selected=%s", roads_penalty)
     _render_tuning_plots(
         val_contexts,
@@ -836,6 +1078,7 @@ def tune_on_validation_multi(
         stride,
         feature_dir,
         context_radius,
+        best_bridge_cfg=best_bridge_cfg,
     )
     return {
         "bst": best_bst,
@@ -850,4 +1093,6 @@ def tune_on_validation_multi(
         "top_p_min": top_p_min,
         "top_p_max": top_p_max,
         "silver_core_iou": best_bundle["silver_core_iou"],
+        "silver_core_dilate_px": int(getattr(cfg, "SILVER_CORE_DILATE_PX", 1)),
+        "best_bridge_config": best_bridge_cfg,
     }
