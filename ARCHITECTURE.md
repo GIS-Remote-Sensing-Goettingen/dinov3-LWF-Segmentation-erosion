@@ -115,6 +115,8 @@ Run outputs are rooted at `output/run_XXX/`:
 - `shapes/unions/.../union.shp`: stream/variant union shapefiles + backups.
 - `tile_phase_timing.csv`, `timing_opportunity_cost.csv`: runtime telemetry.
 - `xai/` and `xai_summary.csv`: per-tile explainability artifacts.
+- `bayes_trials_timeseries.csv`: Optuna per-trial time series with params/attrs.
+- `bayes_hyperparam_importances.csv`: stage-wise Optuna importance table.
 
 ## Key Data/Algorithm Contracts
 - Adaptive thresholding: top-p within SH buffer using
@@ -124,7 +126,9 @@ Run outputs are rooted at `output/run_XXX/`:
 - Parameter-space precedence:
   range keys (`BO_*_RANGE`) override legacy list keys (`*_VALUES`).
 - Bayesian diagnostics artifact:
-  run-level hyperparameter importances JSON (`BO_IMPORTANCE_FILENAME`).
+  run-level hyperparameter importances JSON (`BO_IMPORTANCE_FILENAME`) and CSV
+  (`BO_IMPORTANCE_CSV_FILENAME`), plus trial time series CSV
+  (`BO_TRIALS_CSV_FILENAME`) from Optuna storage.
 - Champion selection: choose better of `knn_raw` and `xgb_raw` by weighted validation IoU.
 - Post-processing chain: champion raw -> CRF -> optional bridge -> shadow.
 - Silver core: `kNN ∩ XGB` (optional dilation) exported as auxiliary stream.

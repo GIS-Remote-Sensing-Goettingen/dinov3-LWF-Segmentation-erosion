@@ -15,6 +15,11 @@ from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.metrics_utils import compute_metrics, compute_oracle_upper_bound
+from ..core.optuna_csv import (
+    collect_optuna_trials_from_storage,
+    write_optuna_importance_csv,
+    write_optuna_trials_csv,
+)
 from ..core.plotting import save_unified_plot
 from ..core.summary_utils import weighted_mean
 from ..core.xdboost import (
@@ -527,54 +532,127 @@ def tune_on_validation_multi(
                     )
                 ),
             )
-            write_bo_importances_file(
-                bo_importances_path,
-                {
-                    "mode": "bayes",
-                    "sampler": str(getattr(cfg, "BO_SAMPLER", "tpe")),
-                    "objective_weights": {
-                        "w_gt": float(getattr(cfg, "BO_OBJECTIVE_W_GT", 0.8)),
-                        "w_sh": float(getattr(cfg, "BO_OBJECTIVE_W_SH", 0.2)),
-                    },
-                    "stage1": {
-                        "best_value": float(
-                            stage1_bundle.get("optuna_best_value", 0.0)
+            bo_payload = {
+                "mode": "bayes",
+                "sampler": str(getattr(cfg, "BO_SAMPLER", "tpe")),
+                "objective_weights": {
+                    "w_gt": float(getattr(cfg, "BO_OBJECTIVE_W_GT", 0.8)),
+                    "w_sh": float(getattr(cfg, "BO_OBJECTIVE_W_SH", 0.2)),
+                },
+                "stage1": {
+                    "best_value": float(stage1_bundle.get("optuna_best_value", 0.0)),
+                    "importances": stage1_bundle.get("optuna_importances", {}),
+                    "best_params": {
+                        "k": int(stage1_bundle["best_raw_config"]["k"]),
+                        "neg_alpha": float(
+                            stage1_bundle.get(
+                                "neg_alpha",
+                                getattr(cfg, "NEG_ALPHA", 1.0),
+                            )
                         ),
-                        "importances": stage1_bundle.get("optuna_importances", {}),
-                        "best_params": {
-                            "k": int(stage1_bundle["best_raw_config"]["k"]),
-                            "neg_alpha": float(
-                                stage1_bundle.get(
-                                    "neg_alpha",
-                                    getattr(cfg, "NEG_ALPHA", 1.0),
-                                )
-                            ),
-                            "roads_penalty": float(stage1_bundle["roads_penalty"]),
-                            "top_p_a": float(stage1_bundle["top_p_a"]),
-                            "top_p_b": float(stage1_bundle["top_p_b"]),
-                            "top_p_min": float(stage1_bundle["top_p_min"]),
-                            "top_p_max": float(stage1_bundle["top_p_max"]),
-                        },
-                    },
-                    "stage2": {
-                        "best_value": float(stage2_info.get("optuna_best_value", 0.0)),
-                        "importances": stage2_info.get("optuna_importances", {}),
-                        "refinement": stage2_info.get("refinement", {}),
-                    },
-                    "stage3": {
-                        "best_value": float(
-                            best_bridge_cfg.get("optuna_best_value", 0.0)
-                        ),
-                        "importances": best_bridge_cfg.get("optuna_importances", {}),
-                        "frozen_upstream_cache_entries": int(
-                            best_bridge_cfg.get("frozen_upstream_cache_entries", 0)
-                        ),
+                        "roads_penalty": float(stage1_bundle["roads_penalty"]),
+                        "top_p_a": float(stage1_bundle["top_p_a"]),
+                        "top_p_b": float(stage1_bundle["top_p_b"]),
+                        "top_p_min": float(stage1_bundle["top_p_min"]),
+                        "top_p_max": float(stage1_bundle["top_p_max"]),
                     },
                 },
-            )
+                "stage2": {
+                    "best_value": float(stage2_info.get("optuna_best_value", 0.0)),
+                    "importances": stage2_info.get("optuna_importances", {}),
+                    "refinement": stage2_info.get("refinement", {}),
+                },
+                "stage3": {
+                    "best_value": float(best_bridge_cfg.get("optuna_best_value", 0.0)),
+                    "importances": best_bridge_cfg.get("optuna_importances", {}),
+                    "frozen_upstream_cache_entries": int(
+                        best_bridge_cfg.get("frozen_upstream_cache_entries", 0)
+                    ),
+                },
+            }
+            write_bo_importances_file(bo_importances_path, bo_payload)
             logger.info(
                 "tune: wrote hyperparameter importances: %s", bo_importances_path
             )
+            run_root = os.path.dirname(cfg.PLOT_DIR)
+            bo_importances_csv_path = os.path.join(
+                run_root,
+                str(
+                    getattr(
+                        cfg,
+                        "BO_IMPORTANCE_CSV_FILENAME",
+                        "bayes_hyperparam_importances.csv",
+                    )
+                ),
+            )
+            write_optuna_importance_csv(bo_importances_csv_path, bo_payload)
+            logger.info(
+                "tune: wrote hyperparameter importances csv: %s",
+                bo_importances_csv_path,
+            )
+            storage_path = str(getattr(cfg, "BO_STORAGE_PATH", "") or "").strip()
+            if storage_path:
+                study_tag = str(getattr(cfg, "BO_STUDY_TAG", "") or "").strip()
+                base_study_name = str(getattr(cfg, "BO_STUDY_NAME", "segedge_tuning"))
+
+                def _study_name(suffix: str) -> str:
+                    stem = f"{base_study_name}_{suffix}"
+                    return f"{stem}_{study_tag}" if study_tag else stem
+
+                refinement = (
+                    stage2_info.get("refinement", {})
+                    if isinstance(stage2_info.get("refinement"), dict)
+                    else {}
+                )
+                trial_specs = [
+                    {
+                        "study_name": _study_name("stage1_raw"),
+                        "stage": "stage1_raw",
+                        "max_recent_trials": int(
+                            getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50
+                        ),
+                    },
+                    {
+                        "study_name": _study_name("stage2_crf_shadow_broad"),
+                        "stage": "stage2_crf_shadow_broad",
+                        "max_recent_trials": int(
+                            refinement.get("broad_trials", 0) or 0
+                        ),
+                    },
+                    {
+                        "study_name": _study_name("stage2_crf_shadow_refine"),
+                        "stage": "stage2_crf_shadow_refine",
+                        "max_recent_trials": int(
+                            refinement.get("refine_trials", 0) or 0
+                        ),
+                    },
+                    {
+                        "study_name": _study_name("stage3_bridge"),
+                        "stage": "stage3_bridge",
+                        "max_recent_trials": int(
+                            getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30
+                        ),
+                    },
+                ]
+                bo_trials_csv_path = os.path.join(
+                    run_root,
+                    str(
+                        getattr(
+                            cfg,
+                            "BO_TRIALS_CSV_FILENAME",
+                            "bayes_trials_timeseries.csv",
+                        )
+                    ),
+                )
+                trial_rows = collect_optuna_trials_from_storage(
+                    optuna_mod=optuna_mod,
+                    storage_path=storage_path,
+                    study_specs=trial_specs,
+                )
+                write_optuna_trials_csv(bo_trials_csv_path, trial_rows)
+                logger.info(
+                    "tune: wrote bayes trial time-series csv: %s", bo_trials_csv_path
+                )
             logger.info(
                 "tune: bayes selected champion=%s roads_penalty=%.3f top-p=(%.3f, %.3f, %.3f, %.3f)",
                 stage1_bundle["champion_source"],

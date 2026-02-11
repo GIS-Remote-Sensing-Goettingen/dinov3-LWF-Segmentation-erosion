@@ -175,6 +175,8 @@ This section reflects current `config.py` defaults.
 - `BO_OBJECTIVE_W_SH = 0.2`
 - `BO_PERTURBATIONS_PER_TILE = 1`
 - `BO_IMPORTANCE_FILENAME = "bayes_hyperparam_importances.json"`
+- `BO_IMPORTANCE_CSV_FILENAME = "bayes_hyperparam_importances.csv"`
+- `BO_TRIALS_CSV_FILENAME = "bayes_trials_timeseries.csv"`
 - `BO_*_RANGE` keys override `*_VALUES` keys when present.
 
 ### Split Defaults
@@ -246,8 +248,10 @@ Top-p candidate grids:
 ### I/O and Telemetry
 - `segedge/core/io_utils.py`: image/vector I/O, shapefile/YAML exports.
 - `segedge/core/timing_csv.py`: detailed and summary timing CSV generation.
+- `segedge/core/optuna_csv.py`: Optuna trial/importances CSV export helpers.
 - `segedge/core/summary_utils.py`: phase/timing aggregation for YAML.
-- Bayesian tuning writes stage-wise hyperparameter importances to run root JSON.
+- Bayesian tuning writes stage-wise hyperparameter importances (JSON + CSV) and
+  per-trial Optuna time-series CSV to run root.
 
 ---
 
@@ -267,6 +271,11 @@ Each run writes to `output/run_XXX/`:
 ### Timing Telemetry
 - `tile_phase_timing.csv`
 - `timing_opportunity_cost.csv`
+
+### Bayesian Telemetry
+- `bayes_hyperparam_importances.json`
+- `bayes_hyperparam_importances.csv`
+- `bayes_trials_timeseries.csv`
 
 ### Explainability
 - `xai/{validation|holdout}/{image_id}.json`
@@ -416,6 +425,7 @@ Interpretation:
 - `inference_best_setting.yml`.
 - `run_summary.yml`.
 - `tile_phase_timing.csv` + `timing_opportunity_cost.csv`.
+- `bayes_hyperparam_importances.csv` + `bayes_trials_timeseries.csv` (when bayes mode is used).
 
 ### Determinism-related knobs
 - `SPLIT_SEED`

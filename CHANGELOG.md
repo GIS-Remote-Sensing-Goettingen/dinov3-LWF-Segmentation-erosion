@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.33]
+- Description: Add Bayesian Optuna CSV telemetry artifacts for trial time series and parameter importances.
+- file touched: `config.py`, `segedge/core/optuna_csv.py`, `segedge/pipeline/tuning.py`, `tests/test_optuna_csv.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Enable direct visualization of optimization dynamics and parameter influence without scraping logs or JSON manually.
+- problems fixed: Produces run-level `bayes_trials_timeseries.csv` (per-trial objective/params/attrs) and `bayes_hyperparam_importances.csv` (stage-wise importance table) alongside existing JSON outputs.
+
 ## [0.2.32]
 - Description: Propagate Bayesian-tuned `neg_alpha` into inference/runtime settings and exported best-settings YAML.
 - file touched: `segedge/pipeline/tuning.py`, `segedge/pipeline/run.py`, `CHANGELOG.md`
