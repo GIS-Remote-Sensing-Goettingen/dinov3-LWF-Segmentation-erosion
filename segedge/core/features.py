@@ -11,7 +11,13 @@ import numpy as np
 import torch
 from scipy.ndimage import uniform_filter
 
-from .timing_utils import DEBUG_TIMING, DEBUG_TIMING_VERBOSE, time_end, time_start
+from .timing_utils import (
+    DEBUG_TIMING,
+    DEBUG_TIMING_VERBOSE,
+    time_end,
+    time_end_tile,
+    time_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -383,7 +389,7 @@ def extract_patch_features_single_scale(
     assert hp * wp == num_tokens, f"patch-grid mismatch: {hp} * {wp} != {num_tokens}"
     feats = patch_tokens[0].cpu().numpy().reshape(hp, wp, dim)
     feats = l2_normalize(feats)
-    time_end("extract_patch_features_single_scale", t0)
+    time_end_tile("extract_patch_features_single_scale", t0)
     return feats, hp, wp
 
 
@@ -438,7 +444,7 @@ def extract_patch_features_batch_single_scale(
     assert hp * wp == num_tokens, f"patch-grid mismatch: {hp} * {wp} != {num_tokens}"
     feats_np = patch_tokens.cpu().numpy().reshape(len(images_hw3), hp, wp, dim)
     feats_list = [l2_normalize(feats_np[i]) for i in range(feats_np.shape[0])]
-    time_end("extract_patch_features_batch_single_scale", t0)
+    time_end_tile("extract_patch_features_batch_single_scale", t0)
     return feats_list, hp, wp
 
 
@@ -476,6 +482,7 @@ def prefetch_features_single_scale_image(
         True
     """
     t0 = time_start()
+    t0_wall = time.perf_counter()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0
     resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
@@ -602,8 +609,11 @@ def prefetch_features_single_scale_image(
     for items in pending.values():
         flush_pending(items)
     time_end("prefetch_features_single_scale_image", t0)
+    total_s = time.perf_counter() - t0_wall
     logger.info(
-        "prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)",
+        "prefetch image=%s total=%.3fs tiles=%s (cached=%s, computed=%s, skipped=%s)",
+        image_id or "<unknown>",
+        total_s,
         len(cache),
         cached_tiles,
         computed_tiles,

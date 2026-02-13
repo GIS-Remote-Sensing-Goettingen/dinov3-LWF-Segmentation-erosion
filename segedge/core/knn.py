@@ -25,7 +25,7 @@ from .metrics_utils import (
     compute_metrics_batch_cpu,
     compute_metrics_batch_gpu,
 )
-from .timing_utils import DEBUG_TIMING, time_end, time_start
+from .timing_utils import DEBUG_TIMING, time_end, time_end_tile, time_start
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +78,13 @@ def zero_shot_knn_single_scale_B_with_saliency(
         True
     """
     t0 = time_start()
+    t0_wall = time.perf_counter()
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
     saliency_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
-    cached_tiles = computed_tiles = 0
+    cached_tiles = computed_tiles = skipped_tiles = 0
+    tile_total = 0
     resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
     pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
@@ -125,6 +127,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
         )
 
     for tile_entry in tile_iter:
+        tile_total += 1
         t0_tile = time_start()
         if prefetched_tiles is not None:
             y, x, feat_info = tile_entry
@@ -138,7 +141,8 @@ def zero_shot_knn_single_scale_B_with_saliency(
             y, x, img_tile = tile_entry
             img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
             if h_eff < ps or w_eff < ps:
-                time_end(f"zero_shot_tile_skip(y={y},x={x})", t0_tile)
+                skipped_tiles += 1
+                time_end_tile(f"zero_shot_tile_skip(y={y},x={x})", t0_tile)
                 continue
             feats_tile = None
             hp = wp = None
@@ -185,6 +189,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
             logger.warning(
                 "missing patch dimensions for tile y=%s x=%s; skipping", y, x
             )
+            skipped_tiles += 1
             continue
         x_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(np.float32)
         with torch.no_grad():
@@ -238,13 +243,23 @@ def zero_shot_knn_single_scale_B_with_saliency(
         weight_full[y : y + h_eff, x : x + w_eff] += 1.0
         if DEBUG_TIMING and t_resize0 is not None:
             resize_time += time.perf_counter() - t_resize0
-        time_end(f"zero_shot_tile(y={y},x={x},k={k})", t0_tile)
+        time_end_tile(f"zero_shot_tile(y={y},x={x},k={k})", t0_tile)
 
     mask_nonzero = weight_full > 0.0
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     saliency_full[mask_nonzero] /= weight_full[mask_nonzero]
+    total_s = time.perf_counter() - t0_wall
     time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
-    logger.info("B: cached tiles=%s, computed tiles=%s", cached_tiles, computed_tiles)
+    logger.info(
+        "zero_shot image=%s k=%s total=%.3fs tiles=%s (cached=%s, computed=%s, skipped=%s)",
+        image_id or "<unknown>",
+        k,
+        total_s,
+        tile_total,
+        cached_tiles,
+        computed_tiles,
+        skipped_tiles,
+    )
     if DEBUG_TIMING:
         logger.info(
             "k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time

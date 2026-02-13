@@ -14,6 +14,7 @@ from segedge.core.timing_csv import (
     summarize_timing_rows,
     write_timing_summary_csv,
 )
+from segedge.core.timing_utils import tile_timing_enabled
 
 
 def test_build_tile_timing_rows_expands_per_phase() -> None:
@@ -175,3 +176,13 @@ def test_write_timing_summary_csv_writes_expected_columns(tmp_path: Path) -> Non
         assert reader.fieldnames == SUMMARY_COLUMNS
         rows = list(reader)
     assert len(rows) >= 1
+
+
+def test_tile_timing_enabled_returns_bool() -> None:
+    """Tile timing switch helper should always return a boolean flag.
+
+    Examples:
+        >>> True
+        True
+    """
+    assert isinstance(tile_timing_enabled(), bool)

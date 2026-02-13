@@ -82,6 +82,11 @@ TIMING_CSV_FILENAME = "tile_phase_timing.csv"
 TIMING_SUMMARY_CSV_FILENAME = "timing_opportunity_cost.csv"
 # Flush cadence for detailed rows (1 updates files after every completed tile).
 TIMING_CSV_FLUSH_EVERY = 1
+# Runtime timing logs.
+DEBUG_TIMING = True
+DEBUG_TIMING_VERBOSE = False
+# If False, suppress per-tile timing lines and keep image-level timing summaries.
+TIMING_TILE_LOGS = False
 # Explainability outputs (Tier 1, no SHAP dependency).
 XAI_ENABLED = True
 XAI_SAVE_JSON = True
@@ -104,6 +109,8 @@ UNION_BACKUP_DIR = None
 
 # Feature cache mode: "disk" caches tiles to FEATURE_DIR, "memory" reuses per-image in RAM.
 FEATURE_CACHE_MODE = "memory"  # "disk" | "memory"
+# If True, prefetch/cache source features only for source tiles overlapping GT vectors.
+SOURCE_PREFETCH_GT_ONLY = True
 # Batch size for feature extraction (1 disables batching).
 FEATURE_BATCH_SIZE = 4
 

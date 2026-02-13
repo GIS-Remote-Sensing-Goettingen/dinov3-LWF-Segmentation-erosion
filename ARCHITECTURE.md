@@ -23,6 +23,7 @@ interfaces, and run artifacts.
   - Feature extraction, banks, kNN, XGBoost, CRF, continuity, shadow, metrics.
   - I/O exports (`io_utils.py`).
   - Timing and telemetry helpers (`timing_utils.py`, `timing_csv.py`).
+  - Curated training-config logging helper (`run_config_logging.py`).
 - `tests/`
   - Smoke and unit coverage for pipeline behavior and utility contracts.
 
@@ -39,6 +40,8 @@ interfaces, and run artifacts.
 2. Configure logging and initialize run-scoped artifact paths.
 3. Resolve source/validation/holdout tile sets.
 4. Build source-derived banks and XGB dataset from source tiles.
+   - Optional GT-aware source cache gate:
+     `SOURCE_PREFETCH_GT_ONLY=True` caches/prefetches only GT-overlap source tiles.
 5. Tune on validation tiles.
    - `TUNING_MODE="grid"`: exhaustive Cartesian search (legacy).
    - `TUNING_MODE="bayes"`: staged Bayesian search:
@@ -90,6 +93,9 @@ Telemetry controls:
 - `TIMING_CSV_FILENAME`
 - `TIMING_SUMMARY_CSV_FILENAME`
 - `TIMING_CSV_FLUSH_EVERY`
+- `DEBUG_TIMING`
+- `TIMING_TILE_LOGS` (set `False` to suppress per-tile timing lines and keep
+  image-level summaries)
 
 ## Explainability Architecture
 Tier-1 explainability is generated online during inference:

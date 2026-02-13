@@ -12,15 +12,26 @@ Notes:
 - Geometries built with Shapely; export with Fiona; reprojection with pyproj.
 """
 
+import os
+import random
+import time
+
+import fiona
+import requests
+from pyproj import CRS, Transformer
+from shapely.geometry import LineString, MultiLineString, mapping
+from shapely.ops import unary_union
+from tqdm import tqdm
+
 # =========================
 # GLOBALS (EDIT THESE)
 # =========================
 
 # BBOX in WGS84 degrees (south, west, north, east)
 SOUTH = 53.46
-WEST  =  8.69
+WEST = 8.69
 NORTH = 54.9
-EAST  = 10.85
+EAST = 10.85
 
 OUT_DIR = "roads_db"
 
@@ -46,8 +57,15 @@ RETRIES = 4
 # Keep only these highway categories (edit to your definition of "road")
 # (If you want "all highway=*" set KEEP_HIGHWAY = None)
 KEEP_HIGHWAY = {
-    "motorway", "trunk", "primary", "secondary", "tertiary",
-    "unclassified", "residential", "service", "living_street"
+    "motorway",
+    "trunk",
+    "primary",
+    "secondary",
+    "tertiary",
+    "unclassified",
+    "residential",
+    "service",
+    "living_street",
 }
 # Typical non-road paths you may want excluded if you use KEEP_HIGHWAY=None
 EXCLUDE_HIGHWAY = {"footway", "path", "cycleway", "steps", "corridor", "pedestrian"}
@@ -60,22 +78,11 @@ TARGET_CRS = ""
 
 # Output filenames (in OUT_DIR)
 ROADS_LINES_SHP = "roads_lines.shp"
-ROADS_MASK_SHP  = "roads_mask.shp"
+ROADS_MASK_SHP = "roads_mask.shp"
 
 # =========================
 # IMPLEMENTATION
 # =========================
-
-import os
-import time
-import random
-import requests
-import fiona
-
-from tqdm import tqdm
-from shapely.geometry import LineString, MultiLineString, mapping
-from shapely.ops import unary_union
-from pyproj import CRS, Transformer
 
 
 def utm_epsg_from_lonlat(lon: float, lat: float) -> str:
@@ -131,7 +138,9 @@ def _post_overpass(url: str, query: str) -> dict:
     return r.json()
 
 
-def overpass_query_roads_tiled(south: float, west: float, north: float, east: float) -> dict:
+def overpass_query_roads_tiled(
+    south: float, west: float, north: float, east: float
+) -> dict:
     """
     Query roads by tiling the bbox. Dedupes elements by (type,id).
     Returns a dict like {"elements": [...]} compatible with build_ways_as_lines().
@@ -140,7 +149,7 @@ def overpass_query_roads_tiled(south: float, west: float, north: float, east: fl
     elements = []
     seen = set()  # (type, id)
 
-    for (s, w, n, e) in tqdm(tiles, desc="Overpass tiles", unit="tile"):
+    for s, w, n, e in tqdm(tiles, desc="Overpass tiles", unit="tile"):
         query = _make_overpass_query(s, w, n, e)
 
         last_err = None
@@ -160,7 +169,7 @@ def overpass_query_roads_tiled(south: float, west: float, north: float, east: fl
                     status = getattr(err.response, "status_code", None)
                     # Retry on typical overload/timeouts
                     if status in (429, 502, 503, 504):
-                        time.sleep((2 ** attempt) + random.random())
+                        time.sleep((2**attempt) + random.random())
                         continue
                     raise
             if last_err is None:
@@ -211,12 +220,14 @@ def build_ways_as_lines(overpass_json: dict):
             continue
 
         geom = LineString(coords)
-        features.append({
-            "osmid": int(w["id"]),
-            "highway": str(highway),
-            "name": tags.get("name"),
-            "geometry": geom,
-        })
+        features.append(
+            {
+                "osmid": int(w["id"]),
+                "highway": str(highway),
+                "name": tags.get("name"),
+                "geometry": geom,
+            }
+        )
 
     return features
 
@@ -244,7 +255,8 @@ def write_lines_shp(path: str, crs_epsg: str, line_features):
         "properties": {"osmid": "int", "highway": "str:40", "name": "str:80"},
     }
     with fiona.open(
-        path, "w",
+        path,
+        "w",
         driver="ESRI Shapefile",
         crs=CRS.from_user_input(crs_epsg).to_wkt(),
         schema=schema,
@@ -253,23 +265,27 @@ def write_lines_shp(path: str, crs_epsg: str, line_features):
             g = f["geometry"]
             if g.geom_type == "MultiLineString":
                 for part in g.geoms:
-                    sink.write({
-                        "geometry": mapping(part),
+                    sink.write(
+                        {
+                            "geometry": mapping(part),
+                            "properties": {
+                                "osmid": f["osmid"],
+                                "highway": f["highway"],
+                                "name": (f["name"] or "")[:80],
+                            },
+                        }
+                    )
+            else:
+                sink.write(
+                    {
+                        "geometry": mapping(g),
                         "properties": {
                             "osmid": f["osmid"],
                             "highway": f["highway"],
                             "name": (f["name"] or "")[:80],
-                        }
-                    })
-            else:
-                sink.write({
-                    "geometry": mapping(g),
-                    "properties": {
-                        "osmid": f["osmid"],
-                        "highway": f["highway"],
-                        "name": (f["name"] or "")[:80],
+                        },
                     }
-                })
+                )
 
 
 def write_mask_shp(path: str, crs_epsg: str, mask_geom):
@@ -278,7 +294,8 @@ def write_mask_shp(path: str, crs_epsg: str, mask_geom):
         "properties": {"id": "int"},
     }
     with fiona.open(
-        path, "w",
+        path,
+        "w",
         driver="ESRI Shapefile",
         crs=CRS.from_user_input(crs_epsg).to_wkt(),
         schema=schema,
@@ -315,7 +332,9 @@ def main():
     # 2) Build shapely lines in WGS84
     feats = build_ways_as_lines(data)
     if not feats:
-        raise RuntimeError("No road features found after filtering. Adjust bbox or KEEP_HIGHWAY / TILE_DEG.")
+        raise RuntimeError(
+            "No road features found after filtering. Adjust bbox or KEEP_HIGHWAY / TILE_DEG."
+        )
 
     # 3) Choose output CRS (meters) for buffering
     center_lat = (SOUTH + NORTH) / 2.0

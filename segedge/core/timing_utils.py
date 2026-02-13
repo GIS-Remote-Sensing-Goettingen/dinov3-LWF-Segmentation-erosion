@@ -14,6 +14,16 @@ DEBUG_TIMING_VERBOSE = getattr(cfg, "DEBUG_TIMING_VERBOSE", False)
 logger = logging.getLogger(__name__)
 
 
+def tile_timing_enabled() -> bool:
+    """Return whether verbose tile-level timing lines are enabled.
+
+    Examples:
+        >>> isinstance(tile_timing_enabled(), bool)
+        True
+    """
+    return bool(getattr(cfg, "TIMING_TILE_LOGS", False))
+
+
 def time_start():
     """Return a perf counter start if timing is enabled.
 
@@ -44,3 +54,15 @@ def time_end(label: str, t0):
         return
     dt = time.perf_counter() - t0
     logger.info("time %s: %.3f s", label, dt)
+
+
+def time_end_tile(label: str, t0):
+    """Log elapsed time only when tile-level timing is enabled.
+
+    Examples:
+        >>> time_end_tile("noop", None) is None
+        True
+    """
+    if not tile_timing_enabled():
+        return
+    time_end(label, t0)

@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.37]
+- Description: Reduce timing-log clutter with image-level summaries by default, add curated training ablation/config logging, and gate source feature caching to GT-overlap tiles.
+- file touched: `config.py`, `segedge/core/timing_utils.py`, `segedge/core/features.py`, `segedge/core/knn.py`, `segedge/core/run_config_logging.py`, `segedge/core/__init__.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Keep runtime logs readable during large runs while still surfacing actionable timing/ablation context, and avoid unnecessary source-cache work on non-GT tiles.
+- problems fixed: Suppresses noisy per-tile timing lines unless explicitly enabled via `TIMING_TILE_LOGS`, logs active training/tuning settings at run start, and applies `SOURCE_PREFETCH_GT_ONLY` GT-overlap gating for source prefetch/cache usage.
+
 ## [0.2.36]
 - Description: Add a comprehensive repository `README.md` that documents purpose, runtime flow, tuning strategy, outputs, telemetry, and operating guidance.
 - file touched: `README.md`, `CHANGELOG.md`

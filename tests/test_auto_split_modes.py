@@ -9,6 +9,7 @@ from segedge.pipeline.common import (
     AUTO_SPLIT_MODE_LEGACY,
     _cap_inference_tiles,
     _split_tiles_from_gt_presence,
+    tile_has_gt_overlap,
 )
 
 
@@ -95,3 +96,13 @@ def test_split_tiles_mode_legacy_preserves_source_plus_val_count() -> None:
     assert len(source) + len(val) == 4
     assert set(source).isdisjoint(set(val))
     assert holdout == ["h1", "h2"]
+
+
+def test_tile_has_gt_overlap_returns_false_without_vectors() -> None:
+    """Public GT-overlap helper should short-circuit when vectors are missing.
+
+    Examples:
+        >>> True
+        True
+    """
+    assert tile_has_gt_overlap("missing_tile.tif", [], downsample_factor=1) is False

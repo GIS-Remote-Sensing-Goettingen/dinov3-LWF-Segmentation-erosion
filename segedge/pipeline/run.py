@@ -44,6 +44,7 @@ from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.logging_utils import setup_logging
 from ..core.metrics_utils import compute_metrics
 from ..core.plotting import save_unified_plot
+from ..core.run_config_logging import log_training_ablation_summary
 from ..core.summary_utils import phase_delta_summary as _phase_delta_summary
 from ..core.summary_utils import phase_metrics_summary as _phase_metrics_summary
 from ..core.summary_utils import timing_summary as _timing_summary
@@ -61,6 +62,7 @@ from .common import (
     AUTO_SPLIT_MODE_LEGACY,
     init_model,
     resolve_tile_splits_from_gt,
+    tile_has_gt_overlap,
 )
 from .inference_utils import (
     _apply_roads_penalty,
@@ -966,6 +968,15 @@ def main():
     else:
         feature_dir = None
     logger.info("feature cache mode: %s", feature_cache_mode)
+    source_prefetch_gt_only = bool(getattr(cfg, "SOURCE_PREFETCH_GT_ONLY", True))
+    log_training_ablation_summary(
+        source_count=len(img_a_paths),
+        val_count=len(val_tiles),
+        holdout_count=len(holdout_tiles),
+        feature_cache_mode=feature_cache_mode,
+        source_prefetch_gt_only=source_prefetch_gt_only,
+        auto_split_mode_legacy=AUTO_SPLIT_MODE_LEGACY,
+    )
 
     image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
 
@@ -977,6 +988,12 @@ def main():
     neg_banks = []
     X_list = []
     y_list = []
+    source_cache_eligible = 0
+    source_cache_skipped_no_gt = 0
+    source_prefetch_attempted = 0
+    source_prefetch_completed = 0
+    source_gt_overlap_cache: dict[str, bool] = {}
+    source_prefetch_warned_no_gt_vectors = False
     for img_a_path, lab_a_path, image_id_a in zip(
         img_a_paths, lab_a_paths, image_id_a_list, strict=True
     ):
@@ -984,6 +1001,30 @@ def main():
         t0_source_total = time.perf_counter()
         logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
         ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        source_has_gt = True
+        if source_prefetch_gt_only:
+            if gt_vector_paths:
+                source_has_gt = source_gt_overlap_cache.get(img_a_path, False)
+                if img_a_path not in source_gt_overlap_cache:
+                    source_has_gt = tile_has_gt_overlap(
+                        img_a_path,
+                        gt_vector_paths,
+                        downsample_factor=ds,
+                    )
+                    source_gt_overlap_cache[img_a_path] = source_has_gt
+            else:
+                if not source_prefetch_warned_no_gt_vectors:
+                    logger.warning(
+                        "SOURCE_PREFETCH_GT_ONLY=True but EVAL_GT_VECTORS is "
+                        "empty; source cache gating disabled for this run"
+                    )
+                    source_prefetch_warned_no_gt_vectors = True
+                source_has_gt = True
+        if source_has_gt:
+            source_cache_eligible += 1
+        else:
+            source_cache_skipped_no_gt += 1
+
         t0 = time.perf_counter()
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
         source_timings["load_source_image_s"] = time.perf_counter() - t0
@@ -992,23 +1033,29 @@ def main():
             img_a_path, lab_a_path, downsample_factor=ds
         )
         source_timings["reproject_source_labels_s"] = time.perf_counter() - t0
+        source_feature_dir = feature_dir if source_has_gt else None
         prefetched_a = None
         if feature_cache_mode == "memory":
-            logger.info("prefetch: Image A %s", image_id_a)
-            t0 = time.perf_counter()
-            prefetched_a = prefetch_features_single_scale_image(
-                img_a,
-                model,
-                processor,
-                device,
-                ps,
-                tile_size,
-                stride,
-                None,
-                None,
-                image_id_a,
-            )
-            source_timings["prefetch_source_features_s"] = time.perf_counter() - t0
+            source_prefetch_attempted += 1
+            if source_has_gt:
+                logger.info("prefetch: Image A %s", image_id_a)
+                t0 = time.perf_counter()
+                prefetched_a = prefetch_features_single_scale_image(
+                    img_a,
+                    model,
+                    processor,
+                    device,
+                    ps,
+                    tile_size,
+                    stride,
+                    None,
+                    None,
+                    image_id_a,
+                )
+                source_timings["prefetch_source_features_s"] = time.perf_counter() - t0
+                source_prefetch_completed += 1
+            else:
+                logger.info("prefetch: skip Image A %s (no GT overlap)", image_id_a)
 
         t0 = time.perf_counter()
         pos_bank_i, neg_bank_i = build_banks_single_scale(
@@ -1022,7 +1069,7 @@ def main():
             stride,
             getattr(cfg, "POS_FRAC_THRESH", 0.1),
             None,
-            feature_dir,
+            source_feature_dir,
             image_id_a,
             cfg.BANK_CACHE_DIR,
             context_radius=context_radius,
@@ -1041,7 +1088,7 @@ def main():
             ps,
             tile_size,
             stride,
-            feature_dir,
+            source_feature_dir,
             image_id_a,
             pos_frac=cfg.POS_FRAC_THRESH,
             max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
@@ -1062,6 +1109,20 @@ def main():
         if X_i.size > 0 and y_i.size > 0:
             X_list.append(X_i)
             y_list.append(y_i)
+    if source_prefetch_gt_only:
+        logger.info(
+            "source cache gate: eligible=%s skipped_no_gt=%s total=%s",
+            source_cache_eligible,
+            source_cache_skipped_no_gt,
+            len(img_a_paths),
+        )
+    if feature_cache_mode == "memory":
+        logger.info(
+            "source prefetch summary: attempted=%s completed=%s skipped_no_gt=%s",
+            source_prefetch_attempted,
+            source_prefetch_completed,
+            source_prefetch_attempted - source_prefetch_completed,
+        )
 
     if not pos_banks:
         raise ValueError("no positive banks were built; check SOURCE_TILES and labels")

@@ -18,6 +18,7 @@ __all__ = [
     "logging_utils",
     "metrics_utils",
     "plotting",
+    "run_config_logging",
     "shadow_filter",
     "timing_utils",
     "timing_csv",

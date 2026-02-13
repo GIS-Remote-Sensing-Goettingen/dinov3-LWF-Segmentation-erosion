@@ -74,6 +74,35 @@ def _tile_has_gt(
     return any(tile_box.intersects(geom) for geom in hits)
 
 
+def tile_has_gt_overlap(
+    tile_path: str,
+    gt_vector_paths: list[str],
+    downsample_factor: int | None = None,
+) -> bool:
+    """Return True when GT vectors overlap a tile footprint.
+
+    Args:
+        tile_path (str): Tile path to test.
+        gt_vector_paths (list[str]): GT vector paths.
+        downsample_factor (int | None): Optional downsample factor.
+
+    Returns:
+        bool: True if any GT geometry intersects the tile.
+
+    Examples:
+        >>> tile_has_gt_overlap("tile.tif", [], downsample_factor=1)
+        False
+    """
+    if not gt_vector_paths:
+        return False
+    ds = int(
+        downsample_factor
+        if downsample_factor is not None
+        else (getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    )
+    return _tile_has_gt(tile_path, gt_vector_paths, ds)
+
+
 def _load_gt_geometries(
     gt_vector_paths: list[str],
     target_crs,
