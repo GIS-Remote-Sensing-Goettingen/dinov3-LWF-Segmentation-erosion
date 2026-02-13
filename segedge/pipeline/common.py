@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _GT_INDEX_CACHE: dict[tuple[tuple[str, ...], str], tuple[STRtree | None, list]] = {}
 _GT_CRS_LOGGED: set[str] = set()
+AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT = "gt_to_val_cap_holdout"
+AUTO_SPLIT_MODE_LEGACY = "legacy_gt_source_val_holdout"
 
 
 def _tile_has_gt(
@@ -51,7 +53,7 @@ def _tile_has_gt(
         bool: True if GT positives exist for the tile.
 
     Examples:
-        >>> callable(_tile_has_gt)
+        >>> isinstance(_tile_has_gt.__name__, str)
         True
     """
     with rio_open(tile_path) as src:
@@ -72,6 +74,35 @@ def _tile_has_gt(
     return any(tile_box.intersects(geom) for geom in hits)
 
 
+def tile_has_gt_overlap(
+    tile_path: str,
+    gt_vector_paths: list[str],
+    downsample_factor: int | None = None,
+) -> bool:
+    """Return True when GT vectors overlap a tile footprint.
+
+    Args:
+        tile_path (str): Tile path to test.
+        gt_vector_paths (list[str]): GT vector paths.
+        downsample_factor (int | None): Optional downsample factor.
+
+    Returns:
+        bool: True if any GT geometry intersects the tile.
+
+    Examples:
+        >>> tile_has_gt_overlap("tile.tif", [], downsample_factor=1)
+        False
+    """
+    if not gt_vector_paths:
+        return False
+    ds = int(
+        downsample_factor
+        if downsample_factor is not None
+        else (getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    )
+    return _tile_has_gt(tile_path, gt_vector_paths, ds)
+
+
 def _load_gt_geometries(
     gt_vector_paths: list[str],
     target_crs,
@@ -86,7 +117,7 @@ def _load_gt_geometries(
         list: List of shapely geometries.
 
     Examples:
-        >>> callable(_load_gt_geometries)
+        >>> isinstance(_load_gt_geometries.__name__, str)
         True
     """
     geoms = []
@@ -131,7 +162,7 @@ def _get_gt_index(
         tuple[STRtree | None, list]: Spatial index and geometries.
 
     Examples:
-        >>> callable(_get_gt_index)
+        >>> isinstance(_get_gt_index.__name__, str)
         True
     """
     crs_key = target_crs.to_string() if target_crs is not None else "<none>"
@@ -207,7 +238,7 @@ def _tiles_with_gt_chunk(
         tuple[list[str], list[str]]: GT tiles and holdout tiles.
 
     Examples:
-        >>> callable(_tiles_with_gt_chunk)
+        >>> isinstance(_tiles_with_gt_chunk.__name__, str)
         True
     """
     gt_tiles = []
@@ -220,6 +251,118 @@ def _tiles_with_gt_chunk(
     return gt_tiles, holdout_tiles
 
 
+def _cap_inference_tiles(
+    holdout_tiles: list[str],
+    cap_enabled: bool,
+    cap: int | None,
+    seed: int,
+) -> list[str]:
+    """Return a deterministic capped subset of holdout tiles.
+
+    Args:
+        holdout_tiles (list[str]): Holdout tile paths.
+        cap_enabled (bool): Whether capping is enabled.
+        cap (int | None): Maximum number of tiles when enabled.
+        seed (int): Seed for deterministic sampling.
+
+    Returns:
+        list[str]: Capped holdout tile paths.
+
+    Raises:
+        ValueError: If capping is enabled and cap is not positive.
+
+    Examples:
+        >>> _cap_inference_tiles(["b", "a"], False, 1, 42)
+        ['a', 'b']
+        >>> _cap_inference_tiles(["a", "b", "c"], True, 2, 42)
+        ['a', 'c']
+    """
+    tiles_sorted = sorted(holdout_tiles)
+    if not cap_enabled:
+        return tiles_sorted
+    if cap is None or int(cap) <= 0:
+        raise ValueError("INFERENCE_TILE_CAP must be > 0 when cap is enabled")
+    cap_int = int(cap)
+    if len(tiles_sorted) <= cap_int:
+        return tiles_sorted
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(tiles_sorted), size=cap_int, replace=False)
+    return sorted(tiles_sorted[int(i)] for i in idx)
+
+
+def _split_tiles_from_gt_presence(
+    gt_tiles: list[str],
+    holdout_tiles: list[str],
+    mode: str,
+    val_fraction: float,
+    seed: int,
+    cap_enabled: bool,
+    cap: int | None,
+    cap_seed: int,
+) -> tuple[list[str], list[str], list[str]]:
+    """Resolve source/val/holdout lists from GT-presence partitions.
+
+    Args:
+        gt_tiles (list[str]): Tiles overlapping GT vectors.
+        holdout_tiles (list[str]): Tiles without GT overlap.
+        mode (str): Auto split mode.
+        val_fraction (float): Validation fraction for legacy mode.
+        seed (int): Legacy split seed.
+        cap_enabled (bool): Enable holdout cap for GT->val mode.
+        cap (int | None): Holdout cap value.
+        cap_seed (int): Holdout cap seed.
+
+    Returns:
+        tuple[list[str], list[str], list[str]]: Source, validation, holdout tiles.
+
+    Examples:
+        >>> _split_tiles_from_gt_presence(
+        ...     ["g2", "g1"], ["h2", "h1"], AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT,
+        ...     0.5, 42, True, 1, 11
+        ... )
+        ([], ['g1', 'g2'], ['h1'])
+        >>> src, val, hold = _split_tiles_from_gt_presence(
+        ...     ["g1", "g2", "g3"], ["h1"], AUTO_SPLIT_MODE_LEGACY,
+        ...     0.34, 42, False, None, 0
+        ... )
+        >>> len(src) + len(val), hold
+        (3, ['h1'])
+    """
+    gt_sorted = sorted(gt_tiles)
+    holdout_sorted = sorted(holdout_tiles)
+    if mode == AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT:
+        val_tiles = gt_sorted
+        holdout_capped = _cap_inference_tiles(
+            holdout_sorted,
+            cap_enabled=cap_enabled,
+            cap=cap,
+            seed=cap_seed,
+        )
+        return [], val_tiles, holdout_capped
+    if mode != AUTO_SPLIT_MODE_LEGACY:
+        raise ValueError(
+            "AUTO_SPLIT_MODE must be one of "
+            f"{AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT!r} or "
+            f"{AUTO_SPLIT_MODE_LEGACY!r}"
+        )
+    if len(gt_sorted) == 1:
+        logger.warning(
+            "only one GT tile found; using it for both source and validation"
+        )
+        return gt_sorted, gt_sorted, holdout_sorted
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(gt_sorted))
+    rng.shuffle(indices)
+    val_count = max(1, int(round(len(gt_sorted) * val_fraction)))
+    if val_count >= len(gt_sorted):
+        val_count = len(gt_sorted) - 1
+    val_idx = set(indices[:val_count].tolist())
+    source_tiles = [p for i, p in enumerate(gt_sorted) if i not in val_idx]
+    val_tiles = [p for i, p in enumerate(gt_sorted) if i in val_idx]
+    return source_tiles, val_tiles, holdout_sorted
+
+
 def resolve_tile_splits_from_gt(
     tiles_dir: str,
     tile_glob: str,
@@ -228,11 +371,18 @@ def resolve_tile_splits_from_gt(
     seed: int,
     downsample_factor: int | None = None,
     num_workers: int | None = None,
+    mode: str | None = None,
+    inference_tile_cap_enabled: bool | None = None,
+    inference_tile_cap: int | None = None,
+    inference_tile_cap_seed: int | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Resolve source/val/holdout tiles using GT presence.
 
-    Tiles with any GT positives are split into source (train) and validation.
-    Tiles without GT positives are assigned to holdout.
+    Behavior depends on `mode`:
+    - `gt_to_val_cap_holdout`: all GT tiles become validation and non-GT tiles can
+      be capped for holdout.
+    - `legacy_gt_source_val_holdout`: GT tiles are split into source/validation and
+      non-GT tiles are holdout.
 
     Args:
         tiles_dir (str): Directory containing tiles.
@@ -242,12 +392,16 @@ def resolve_tile_splits_from_gt(
         seed (int): RNG seed for split.
         downsample_factor (int | None): Downsample factor for GT presence checks.
         num_workers (int | None): Worker count for GT presence checks.
+        mode (str | None): Auto split mode.
+        inference_tile_cap_enabled (bool | None): Holdout cap toggle.
+        inference_tile_cap (int | None): Holdout cap value.
+        inference_tile_cap_seed (int | None): Holdout cap seed.
 
     Returns:
         tuple[list[str], list[str], list[str]]: Source, validation, holdout tiles.
 
     Examples:
-        >>> callable(resolve_tile_splits_from_gt)
+        >>> isinstance(resolve_tile_splits_from_gt.__name__, str)
         True
     """
     if not gt_vector_paths:
@@ -259,6 +413,17 @@ def resolve_tile_splits_from_gt(
         raise ValueError(f"no tiles found in {tiles_dir} with {tile_glob}")
     if downsample_factor is None:
         downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    if mode is None:
+        mode = str(getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)).strip()
+    if inference_tile_cap_enabled is None:
+        inference_tile_cap_enabled = bool(
+            getattr(cfg, "INFERENCE_TILE_CAP_ENABLED", False)
+        )
+    if inference_tile_cap is None:
+        inference_tile_cap = getattr(cfg, "INFERENCE_TILE_CAP", None)
+    if inference_tile_cap_seed is None:
+        inference_tile_cap_seed = int(getattr(cfg, "INFERENCE_TILE_CAP_SEED", seed))
+    debug_reproject = bool(getattr(cfg, "DEBUG_REPROJECT", False))
 
     raster_path = getattr(cfg, "SOURCE_LABEL_RASTER", None)
     filtered_paths = []
@@ -284,6 +449,35 @@ def resolve_tile_splits_from_gt(
                 or tb_top <= rb_bottom
                 or tb_bottom >= rb_top
             )
+            if debug_reproject:
+                inter_left = max(tb_left, rb_left)
+                inter_right = min(tb_right, rb_right)
+                inter_bottom = max(tb_bottom, rb_bottom)
+                inter_top = min(tb_top, rb_top)
+                inter_w = max(0.0, inter_right - inter_left)
+                inter_h = max(0.0, inter_top - inter_bottom)
+                tile_area = max(0.0, (tb_right - tb_left) * (tb_top - tb_bottom))
+                coverage_ratio = (
+                    (inter_w * inter_h / tile_area) if tile_area > 0 else 0.0
+                )
+                left_gap = max(0.0, rb_left - tb_left)
+                right_gap = max(0.0, tb_right - rb_right)
+                top_gap = max(0.0, tb_top - rb_top)
+                bottom_gap = max(0.0, rb_bottom - tb_bottom)
+                logger.info(
+                    "auto split: label coverage tile=%s bounds=%s "
+                    "raster_bounds=%s ratio=%.4f gaps(L/R/T/B)="
+                    "(%.3f, %.3f, %.3f, %.3f) intersects=%s",
+                    tile_path,
+                    tuple(tile_bounds),
+                    tuple(raster_bounds),
+                    coverage_ratio,
+                    left_gap,
+                    right_gap,
+                    top_gap,
+                    bottom_gap,
+                    intersects,
+                )
             if intersects:
                 filtered_paths.append(tile_path)
             else:
@@ -335,21 +529,25 @@ def resolve_tile_splits_from_gt(
 
     if not gt_tiles:
         raise ValueError("no tiles overlap GT vectors; cannot build source/val")
-    if len(gt_tiles) == 1:
-        logger.warning(
-            "only one GT tile found; using it for both source and validation"
+    holdout_total = len(holdout_tiles)
+    source_tiles, val_tiles, holdout_tiles = _split_tiles_from_gt_presence(
+        gt_tiles=gt_tiles,
+        holdout_tiles=holdout_tiles,
+        mode=mode,
+        val_fraction=val_fraction,
+        seed=seed,
+        cap_enabled=bool(inference_tile_cap_enabled),
+        cap=inference_tile_cap,
+        cap_seed=int(inference_tile_cap_seed),
+    )
+    if mode == AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT:
+        logger.info(
+            "auto split mode=%s: val(gt)=%s holdout_total=%s holdout_selected=%s",
+            mode,
+            len(val_tiles),
+            holdout_total,
+            len(holdout_tiles),
         )
-        return gt_tiles, gt_tiles, holdout_tiles
-
-    rng = np.random.default_rng(seed)
-    indices = np.arange(len(gt_tiles))
-    rng.shuffle(indices)
-    val_count = max(1, int(round(len(gt_tiles) * val_fraction)))
-    if val_count >= len(gt_tiles):
-        val_count = len(gt_tiles) - 1
-    val_idx = set(indices[:val_count].tolist())
-    source_tiles = [p for i, p in enumerate(gt_tiles) if i not in val_idx]
-    val_tiles = [p for i, p in enumerate(gt_tiles) if i in val_idx]
     return source_tiles, val_tiles, holdout_tiles
 
 
@@ -363,7 +561,7 @@ def init_model(model_name: str):
         tuple: (model, processor, device).
 
     Examples:
-        >>> callable(init_model)
+        >>> isinstance(init_model.__name__, str)
         True
     """
     t0 = time_start()
@@ -404,7 +602,7 @@ def build_banks_for_sources(
         tuple[np.ndarray, np.ndarray | None]: Positive and negative banks.
 
     Examples:
-        >>> callable(build_banks_for_sources)
+        >>> isinstance(build_banks_for_sources.__name__, str)
         True
     """
     img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
@@ -465,7 +663,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
         tuple[np.ndarray, np.ndarray]: Feature matrix and labels.
 
     Examples:
-        >>> callable(build_xgb_training_data)
+        >>> isinstance(build_xgb_training_data.__name__, str)
         True
     """
     from ..core.xdboost import build_xgb_dataset
@@ -515,7 +713,7 @@ def prep_b_tile(img_path, gt_paths):
             img_b, labels_sh, gt_mask_eval, sh_buffer_mask
 
     Examples:
-        >>> callable(prep_b_tile)
+        >>> isinstance(prep_b_tile.__name__, str)
         True
     """
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)

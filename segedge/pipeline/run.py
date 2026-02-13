@@ -5,267 +5,78 @@ from __future__ import annotations
 import json
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor
+import time
 from datetime import datetime
 
-import fiona
 import numpy as np
-import rasterio
-import rasterio.features as rfeatures
-import torch
-from pyproj import CRS, Transformer
 from scipy.ndimage import median_filter
-from shapely.geometry import box, mapping, shape
-from shapely.ops import transform as shp_transform
-from shapely.strtree import STRtree
-from skimage.transform import resize
+from skimage.morphology import binary_dilation, disk
 
 import config as cfg
 
 from ..core.banks import build_banks_single_scale
 from ..core.continuity import bridge_skeleton_gaps, skeletonize_with_endpoints
 from ..core.crf_utils import refine_with_densecrf
+from ..core.explainability import (
+    append_xai_summary_csv,
+    build_dim_activation_map,
+    build_xai_summary_row,
+    distribution_stats,
+    get_xgb_importance_dict,
+    save_xai_tile_plot,
+    select_holdout_tiles_for_xai,
+    summarize_knn_signals,
+    summarize_tile_latent_dims,
+    write_xai_tile_json,
+)
 from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
     append_mask_to_union_shapefile,
     backup_union_shapefile,
-    build_sh_buffer_mask,
     consolidate_features_for_image,
     count_shapefile_features,
     export_best_settings,
+    export_run_summary,
     load_dop20_image,
-    rasterize_vector_labels,
     reproject_labels_to_image,
 )
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.logging_utils import setup_logging
-from ..core.metrics_utils import (
-    compute_metrics,
-    compute_metrics_batch_cpu,
-    compute_metrics_batch_gpu,
-    compute_oracle_upper_bound,
-)
+from ..core.metrics_utils import compute_metrics
 from ..core.plotting import save_unified_plot
-from ..core.timing_utils import time_end, time_start
-from ..core.xdboost import (
-    build_xgb_dataset,
-    hyperparam_search_xgb_iou,
-    train_xgb_classifier,
-    xgb_score_image_b,
+from ..core.run_config_logging import log_training_ablation_summary
+from ..core.summary_utils import phase_delta_summary as _phase_delta_summary
+from ..core.summary_utils import phase_metrics_summary as _phase_metrics_summary
+from ..core.summary_utils import timing_summary as _timing_summary
+from ..core.summary_utils import weighted_mean as _weighted_mean
+from ..core.timing_csv import (
+    append_tile_timing_csv_rows,
+    build_tile_timing_rows,
+    read_timing_detail_csv,
+    write_timing_summary_csv,
 )
-from .common import init_model, resolve_tile_splits_from_gt
+from ..core.timing_utils import time_end, time_start
+from ..core.xdboost import build_xgb_dataset, xgb_score_image_b
+from .common import (
+    AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT,
+    AUTO_SPLIT_MODE_LEGACY,
+    init_model,
+    resolve_tile_splits_from_gt,
+    tile_has_gt_overlap,
+)
+from .inference_utils import (
+    _apply_roads_penalty,
+    _apply_shadow_filter,
+    _compute_top_p,
+    _get_roads_mask,
+    _top_p_threshold,
+    load_b_tile_context,
+)
+from .tuning import tune_on_validation_multi
 
 # Config-driven flags
 USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
-CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
-
 logger = logging.getLogger(__name__)
-
-_CRF_PARALLEL_CONTEXTS: list[dict] | None = None
-_ROADS_MASK_CACHE: dict[tuple[str, int], np.ndarray] = {}
-_ROADS_INDEX_CACHE: dict[tuple[str, str], tuple[STRtree | None, list]] = {}
-
-
-def _get_roads_index(tile_crs) -> tuple[STRtree | None, list]:
-    """Load and cache road geometries in a spatial index.
-
-    Args:
-        tile_crs: Target CRS for geometries.
-
-    Returns:
-        tuple[STRtree | None, list]: Index and geometry list.
-
-    Examples:
-        >>> callable(_get_roads_index)
-        True
-    """
-    roads_path = getattr(cfg, "ROADS_MASK_PATH", None)
-    if not roads_path or not os.path.exists(roads_path):
-        return None, []
-    crs_key = CRS.from_user_input(tile_crs).to_string() if tile_crs else "<none>"
-    cache_key = (roads_path, crs_key)
-    if cache_key in _ROADS_INDEX_CACHE:
-        return _ROADS_INDEX_CACHE[cache_key]
-
-    t0 = time_start()
-    geoms = []
-    with fiona.open(roads_path, "r") as shp:
-        vec_crs = shp.crs
-        transformer = None
-        if vec_crs and tile_crs is not None:
-            vec_crs_obj = CRS.from_user_input(vec_crs)
-            tile_crs_obj = CRS.from_user_input(tile_crs)
-            if vec_crs_obj != tile_crs_obj:
-                logger.info(
-                    "reprojecting road geometries from %s -> %s for %s",
-                    vec_crs_obj.to_string(),
-                    tile_crs_obj.to_string(),
-                    roads_path,
-                )
-                transformer = Transformer.from_crs(
-                    vec_crs_obj, tile_crs_obj, always_xy=True
-                )
-        for feat in shp:
-            geom = feat.get("geometry")
-            if not geom:
-                continue
-            geom_obj = shape(geom)
-            if geom_obj.is_empty:
-                continue
-            if transformer is not None:
-                geom_obj = shp_transform(transformer.transform, geom_obj)
-            geoms.append(geom_obj)
-
-    tree = STRtree(geoms) if geoms else None
-    _ROADS_INDEX_CACHE[cache_key] = (tree, geoms)
-    time_end("roads_index_build", t0)
-    logger.info("roads index built: %s geometries", len(geoms))
-    return tree, geoms
-
-
-def _get_roads_mask(
-    tile_path: str,
-    downsample_factor: int,
-    target_shape: tuple[int, int] | None = None,
-) -> np.ndarray | None:
-    """Load or cache a roads mask rasterized to the tile grid.
-
-    Args:
-        tile_path (str): Tile path.
-        downsample_factor (int): Downsample factor for rasterization.
-
-    Returns:
-        np.ndarray | None: Boolean mask if available.
-
-    Examples:
-        >>> callable(_get_roads_mask)
-        True
-    """
-    key = (tile_path, downsample_factor)
-    if key in _ROADS_MASK_CACHE:
-        return _ROADS_MASK_CACHE[key]
-
-    with rasterio.open(tile_path) as tile_src:
-        if downsample_factor > 1:
-            out_shape = (
-                tile_src.height // downsample_factor,
-                tile_src.width // downsample_factor,
-            )
-            transform = tile_src.transform * tile_src.transform.scale(
-                tile_src.width / out_shape[1],
-                tile_src.height / out_shape[0],
-            )
-        else:
-            out_shape = (tile_src.height, tile_src.width)
-            transform = tile_src.transform
-        tile_bounds = tile_src.bounds
-        tile_crs = tile_src.crs
-
-    tree, geoms = _get_roads_index(tile_crs)
-    if tree is None or not geoms:
-        mask_empty = np.zeros(out_shape, dtype=bool)
-        _ROADS_MASK_CACHE[key] = mask_empty
-        return mask_empty
-
-    tile_box = box(
-        tile_bounds.left,
-        tile_bounds.bottom,
-        tile_bounds.right,
-        tile_bounds.top,
-    )
-    hits = tree.query(tile_box)
-    if len(hits) == 0:
-        mask_empty = np.zeros(out_shape, dtype=bool)
-        _ROADS_MASK_CACHE[key] = mask_empty
-        return mask_empty
-
-    if isinstance(hits[0], (int, np.integer)):
-        candidates = [geoms[int(idx)] for idx in hits]
-    else:
-        candidates = list(hits)
-    shapes = [mapping(g) for g in candidates if g.intersects(tile_box)]
-    if not shapes:
-        mask_empty = np.zeros(out_shape, dtype=bool)
-        _ROADS_MASK_CACHE[key] = mask_empty
-        return mask_empty
-
-    t0 = time_start()
-    mask = rfeatures.rasterize(
-        shapes=[(geom, 1) for geom in shapes],
-        out_shape=out_shape,
-        transform=transform,
-        fill=0,
-        default_value=1,
-        dtype="uint8",
-        all_touched=False,
-    )
-    if target_shape is not None and mask.shape != target_shape:
-        mask = resize(
-            mask,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype("uint8")
-    mask_bool = mask.astype(bool)
-    time_end("roads_mask_rasterize", t0)
-    logger.info(
-        "roads mask rasterized: shapes=%s coverage=%.4f",
-        len(shapes),
-        float(mask_bool.mean()),
-    )
-    _ROADS_MASK_CACHE[key] = mask_bool
-    return mask_bool
-
-
-def _apply_roads_penalty(
-    score_map: np.ndarray,
-    roads_mask: np.ndarray | None,
-    penalty: float,
-) -> np.ndarray:
-    """Apply a multiplicative penalty on road pixels.
-
-    Args:
-        score_map (np.ndarray): Score map.
-        roads_mask (np.ndarray | None): Roads mask.
-        penalty (float): Multiplicative penalty in [0, 1].
-
-    Returns:
-        np.ndarray: Penalized score map.
-
-    Examples:
-        >>> import numpy as np
-        >>> score = np.array([[1.0, 2.0]], dtype=np.float32)
-        >>> mask = np.array([[True, False]])
-        >>> _apply_roads_penalty(score, mask, 0.5).tolist()
-        [[0.5, 2.0]]
-    """
-    if roads_mask is None or penalty >= 1.0:
-        return score_map
-    if roads_mask.shape != score_map.shape:
-        raise ValueError("roads_mask must match score_map shape")
-    penalty_map = np.where(roads_mask, penalty, 1.0).astype(score_map.dtype)
-    return score_map * penalty_map
-
-
-def _weighted_mean(values: list[float], weights: list[float]) -> float:
-    """Compute weighted mean with safe fallback.
-
-    Args:
-        values (list[float]): Values.
-        weights (list[float]): Weights.
-
-    Returns:
-        float: Weighted mean or simple mean if total weight is zero.
-
-    Examples:
-        >>> _weighted_mean([1.0, 3.0], [1.0, 1.0])
-        2.0
-    """
-    total_w = float(np.sum(weights))
-    if total_w <= 0:
-        return float(np.mean(values)) if values else 0.0
-    return float(np.sum(np.array(values) * np.array(weights)) / total_w)
 
 
 def _log_phase(kind: str, name: str) -> None:
@@ -276,7 +87,7 @@ def _log_phase(kind: str, name: str) -> None:
         name (str): Phase name.
 
     Examples:
-        >>> callable(_log_phase)
+        >>> isinstance(_log_phase.__name__, str)
         True
     """
     msg = f"PHASE {kind}: {name}".upper()
@@ -302,6 +113,7 @@ def _summarize_phase_metrics(
         "xgb_raw",
         "xgb_crf",
         "xgb_shadow",
+        "silver_core",
         "champion_raw",
         "champion_crf",
     ]
@@ -333,7 +145,7 @@ def _summarize_phase_metrics(
     if bridge_enabled:
         champ_chain.append("champion_bridge")
     champ_chain.append("champion_shadow")
-    for prev, curr in zip(champ_chain, champ_chain[1:], strict=True):
+    for prev, curr in zip(champ_chain, champ_chain[1:]):
         if prev not in acc or curr not in acc:
             continue
         prev_weights = [float(m.get("_weight", 0.0)) for m in acc[prev]]
@@ -352,679 +164,6 @@ def _summarize_phase_metrics(
         )
 
 
-def _init_crf_parallel(contexts: list[dict]) -> None:
-    global _CRF_PARALLEL_CONTEXTS
-    _CRF_PARALLEL_CONTEXTS = contexts
-
-
-def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
-    if _CRF_PARALLEL_CONTEXTS is None:
-        raise RuntimeError("CRF contexts not initialized")
-    prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
-    ious = []
-    weights = []
-    for ctx in _CRF_PARALLEL_CONTEXTS:
-        mask_crf_local = refine_with_densecrf(
-            ctx["img_b"],
-            ctx["score_full"],
-            ctx["thr_center"],
-            ctx["sh_buffer_mask"],
-            prob_softness=prob_soft,
-            n_iters=n_iters,
-            pos_w=pos_w,
-            pos_xy_std=pos_xy,
-            bilateral_w=bi_w,
-            bilateral_xy_std=bi_xy,
-            bilateral_rgb_std=bi_rgb,
-        )
-        ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
-        weights.append(float(ctx["gt_weight"]))
-    return _weighted_mean(ious, weights), cfg
-
-
-def _apply_shadow_filter(
-    img_b: np.ndarray,
-    base_mask: np.ndarray,
-    weights,
-    threshold: float,
-    score_full: np.ndarray,
-    protect_score: float | None,
-) -> np.ndarray:
-    img_float = img_b.astype(np.float32)
-    w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
-    wsum = (img_float * w).sum(axis=2)
-    shadow_pass = wsum >= threshold
-    if protect_score is None:
-        return np.logical_and(base_mask, shadow_pass)
-    return np.logical_and(base_mask, shadow_pass | (score_full >= protect_score))
-
-
-def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
-    """Load B tile, SH raster, GT (optional), and buffer mask.
-
-    Args:
-        img_path (str): Image B path.
-        gt_vector_paths (list[str] | None): Vector GT paths.
-
-    Returns:
-        tuple: (img_b, labels_sh, gt_mask, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m)
-
-    Examples:
-        >>> callable(load_b_tile_context)
-        True
-    """
-    logger.info("loading tile: %s", img_path)
-    t0_data = time_start()
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
-    img_b = load_dop20_image(img_path, downsample_factor=ds)
-    labels_sh = reproject_labels_to_image(
-        img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds
-    )
-    gt_mask = (
-        rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds)
-        if gt_vector_paths
-        else None
-    )
-    time_end("data_loading_and_reprojection", t0_data)
-    target_shape = img_b.shape[:2]
-    if labels_sh.shape != target_shape:
-        logger.warning(
-            "labels_sh shape %s != image shape %s; resizing to match",
-            labels_sh.shape,
-            target_shape,
-        )
-        labels_sh = resize(
-            labels_sh,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(labels_sh.dtype)
-    if gt_mask is not None and gt_mask.shape != target_shape:
-        logger.warning(
-            "gt_mask shape %s != image shape %s; resizing to match",
-            gt_mask.shape,
-            target_shape,
-        )
-        gt_mask = resize(
-            gt_mask,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(gt_mask.dtype)
-
-    if gt_mask is not None:
-        logger.debug("GT positives on B: %s", gt_mask.sum())
-    logger.debug("SH_2022 positives on B: %s", (labels_sh > 0).sum())
-
-    with __import__("rasterio").open(img_path) as src:
-        pixel_size_m = abs(src.transform.a)
-    pixel_size_m = pixel_size_m * ds
-    buffer_m = cfg.BUFFER_M
-    buffer_pixels = int(round(buffer_m / pixel_size_m))
-    logger.info(
-        "tile=%s pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s",
-        img_path,
-        pixel_size_m,
-        buffer_m,
-        buffer_pixels,
-    )
-
-    sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
-    if gt_mask is not None and getattr(cfg, "CLIP_GT_TO_BUFFER", False):
-        gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
-        logger.info(
-            "CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)",
-            gt_mask_eval.sum(),
-            gt_mask.sum(),
-        )
-    else:
-        gt_mask_eval = gt_mask
-    return (
-        img_b,
-        labels_sh,
-        gt_mask,
-        gt_mask_eval,
-        sh_buffer_mask,
-        buffer_m,
-        pixel_size_m,
-    )
-
-
-def tune_on_validation_multi(
-    val_paths: list[str],
-    gt_vector_paths: list[str],
-    model,
-    processor,
-    device,
-    pos_bank: np.ndarray,
-    neg_bank: np.ndarray | None,
-    X: np.ndarray,
-    y: np.ndarray,
-    ps: int,
-    tile_size: int,
-    stride: int,
-    feature_dir: str | None,
-    context_radius: int,
-):
-    """Tune hyperparameters using weighted-mean IoU across validation tiles.
-
-    Args:
-        val_paths (list[str]): Validation tile paths.
-        gt_vector_paths (list[str]): Vector GT paths.
-        model: DINO model.
-        processor: DINO processor.
-        device: Torch device.
-        pos_bank (np.ndarray): Positive bank.
-        neg_bank (np.ndarray | None): Negative bank.
-        X (np.ndarray): XGB feature matrix.
-        y (np.ndarray): XGB labels.
-        ps (int): Patch size.
-        tile_size (int): Tile size in pixels.
-        stride (int): Tile stride.
-        feature_dir (str | None): Feature cache directory.
-        context_radius (int): Feature context radius.
-
-    Returns:
-        dict: Tuned configurations and models.
-
-    Examples:
-        >>> callable(tune_on_validation_multi)
-        True
-    """
-    if not val_paths:
-        raise ValueError("VAL_TILES is empty.")
-
-    val_contexts = []
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
-    for val_path in val_paths:
-        logger.info("tune: preparing validation tile %s", val_path)
-        (
-            img_b,
-            labels_sh,
-            gt_mask_B,
-            gt_mask_eval,
-            sh_buffer_mask,
-            buffer_m,
-            pixel_size_m,
-        ) = load_b_tile_context(val_path, gt_vector_paths)
-        if gt_mask_eval is None:
-            raise ValueError("Validation requires GT vectors for metric-based tuning.")
-        _ = compute_oracle_upper_bound(gt_mask_eval, sh_buffer_mask)
-        gt_weight = float(gt_mask_eval.sum())
-        image_id_b = os.path.splitext(os.path.basename(val_path))[0]
-        prefetched_b = prefetch_features_single_scale_image(
-            img_b,
-            model,
-            processor,
-            device,
-            ps,
-            tile_size,
-            stride,
-            None,
-            feature_dir,
-            image_id_b,
-        )
-        roads_mask = _get_roads_mask(val_path, ds, target_shape=img_b.shape[:2])
-        val_contexts.append(
-            {
-                "path": val_path,
-                "image_id": image_id_b,
-                "img_b": img_b,
-                "labels_sh": labels_sh,
-                "gt_mask_B": gt_mask_B,
-                "gt_mask_eval": gt_mask_eval,
-                "sh_buffer_mask": sh_buffer_mask,
-                "gt_weight": gt_weight,
-                "roads_mask": roads_mask,
-                "prefetched_b": prefetched_b,
-                "buffer_m": buffer_m,
-                "pixel_size_m": pixel_size_m,
-            }
-        )
-
-    # XGB training (shared across road penalties)
-    use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
-    param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
-    num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
-    early_stop = getattr(cfg, "XGB_EARLY_STOP", 40)
-    verbose_eval = getattr(cfg, "XGB_VERBOSE_EVAL", 50)
-    val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
-    if param_grid is None:
-        param_grid = [None]
-
-    xgb_candidates = []
-    for overrides in param_grid:
-        if overrides is None:
-            bst = train_xgb_classifier(
-                X,
-                y,
-                use_gpu=use_gpu_xgb,
-                num_boost_round=num_boost_round,
-                verbose_eval=verbose_eval,
-            )
-            params_used = None
-        else:
-            bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
-                X,
-                y,
-                [0.5],
-                val_contexts[0]["sh_buffer_mask"],
-                val_contexts[0]["gt_mask_eval"],
-                val_contexts[0]["img_b"],
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                val_contexts[0]["image_id"],
-                prefetched_tiles=val_contexts[0]["prefetched_b"],
-                device=device,
-                use_gpu=use_gpu_xgb,
-                param_grid=[overrides],
-                num_boost_round=num_boost_round,
-                val_fraction=val_fraction,
-                early_stopping_rounds=early_stop,
-                verbose_eval=verbose_eval,
-                seed=42,
-                context_radius=context_radius,
-            )
-        xgb_candidates.append({"bst": bst, "params": params_used})
-
-    roads_penalties = [float(p) for p in getattr(cfg, "ROADS_PENALTY_VALUES", [1.0])]
-    best_bundle = None
-    best_champion_iou = None
-
-    for penalty in roads_penalties:
-        logger.info("tune: roads penalty=%s", penalty)
-
-        # kNN tuning (weighted-mean IoU across val tiles)
-        best_raw_config = None
-        for k in cfg.K_VALUES:
-            stats_by_thr = {
-                thr: {
-                    "iou": 0.0,
-                    "f1": 0.0,
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "w": 0.0,
-                    "n": 0,
-                }
-                for thr in cfg.THRESHOLDS
-            }
-            for ctx in val_contexts:
-                logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
-                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
-                    img_b=ctx["img_b"],
-                    pos_bank=pos_bank,
-                    neg_bank=neg_bank,
-                    model=model,
-                    processor=processor,
-                    device=device,
-                    ps=ps,
-                    tile_size=tile_size,
-                    stride=stride,
-                    k=k,
-                    aggregate_layers=None,
-                    feature_dir=feature_dir,
-                    image_id=ctx["image_id"],
-                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
-                    prefetched_tiles=ctx["prefetched_b"],
-                    use_fp16_matmul=USE_FP16_KNN,
-                    context_radius=context_radius,
-                )
-                score_full = _apply_roads_penalty(
-                    score_full, ctx["roads_mask"], penalty
-                )
-                try:
-                    metrics_list = compute_metrics_batch_gpu(
-                        score_full,
-                        cfg.THRESHOLDS,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                        device=device,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    metrics_list = compute_metrics_batch_cpu(
-                        score_full,
-                        cfg.THRESHOLDS,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                    )
-                weight = float(ctx["gt_weight"])
-                for m in metrics_list:
-                    stats = stats_by_thr[m["threshold"]]
-                    stats["iou"] += float(m["iou"]) * weight
-                    stats["f1"] += float(m["f1"]) * weight
-                    stats["precision"] += float(m["precision"]) * weight
-                    stats["recall"] += float(m["recall"]) * weight
-                    stats["w"] += weight
-                    stats["n"] += 1
-
-            for thr, stats in stats_by_thr.items():
-                if stats["w"] > 0:
-                    weighted_iou = float(stats["iou"] / stats["w"])
-                    weighted_f1 = float(stats["f1"] / stats["w"])
-                    weighted_precision = float(stats["precision"] / stats["w"])
-                    weighted_recall = float(stats["recall"] / stats["w"])
-                else:
-                    weighted_iou = 0.0
-                    weighted_f1 = 0.0
-                    weighted_precision = 0.0
-                    weighted_recall = 0.0
-                if best_raw_config is None or weighted_iou > best_raw_config["iou"]:
-                    best_raw_config = {
-                        "k": k,
-                        "threshold": thr,
-                        "source": "raw",
-                        "iou": weighted_iou,
-                        "f1": weighted_f1,
-                        "precision": weighted_precision,
-                        "recall": weighted_recall,
-                    }
-        if best_raw_config is None:
-            raise ValueError("kNN tuning returned no results")
-
-        # XGB tuning (weighted-mean IoU across val tiles)
-        best_xgb_config = None
-        best_bst = None
-        for candidate in xgb_candidates:
-            bst = candidate["bst"]
-            params_used = candidate["params"]
-            stats_by_thr = {
-                thr: {
-                    "iou": 0.0,
-                    "f1": 0.0,
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "w": 0.0,
-                    "n": 0,
-                }
-                for thr in cfg.THRESHOLDS
-            }
-            for ctx in val_contexts:
-                logger.info("tune: XGB scoring on %s", ctx["path"])
-                score_full = xgb_score_image_b(
-                    ctx["img_b"],
-                    bst,
-                    ps,
-                    tile_size,
-                    stride,
-                    feature_dir,
-                    ctx["image_id"],
-                    prefetched_tiles=ctx["prefetched_b"],
-                    context_radius=context_radius,
-                )
-                score_full = _apply_roads_penalty(
-                    score_full, ctx["roads_mask"], penalty
-                )
-                try:
-                    metrics_list = compute_metrics_batch_gpu(
-                        score_full,
-                        cfg.THRESHOLDS,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                        device=device,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    metrics_list = compute_metrics_batch_cpu(
-                        score_full,
-                        cfg.THRESHOLDS,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                    )
-                weight = float(ctx["gt_weight"])
-                for m in metrics_list:
-                    stats = stats_by_thr[m["threshold"]]
-                    stats["iou"] += float(m["iou"]) * weight
-                    stats["f1"] += float(m["f1"]) * weight
-                    stats["precision"] += float(m["precision"]) * weight
-                    stats["recall"] += float(m["recall"]) * weight
-                    stats["w"] += weight
-                    stats["n"] += 1
-
-            for thr, stats in stats_by_thr.items():
-                if stats["w"] > 0:
-                    weighted_iou = float(stats["iou"] / stats["w"])
-                    weighted_f1 = float(stats["f1"] / stats["w"])
-                    weighted_precision = float(stats["precision"] / stats["w"])
-                    weighted_recall = float(stats["recall"] / stats["w"])
-                else:
-                    weighted_iou = 0.0
-                    weighted_f1 = 0.0
-                    weighted_precision = 0.0
-                    weighted_recall = 0.0
-                cand = {
-                    "k": -1,
-                    "threshold": thr,
-                    "source": "xgb",
-                    "iou": weighted_iou,
-                    "f1": weighted_f1,
-                    "precision": weighted_precision,
-                    "recall": weighted_recall,
-                    "params": params_used,
-                }
-                if best_xgb_config is None or weighted_iou > best_xgb_config["iou"]:
-                    best_xgb_config = cand
-                    best_bst = bst
-        if best_xgb_config is None or best_bst is None:
-            raise ValueError("XGB tuning returned no results")
-
-        champion_source = (
-            "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
-        )
-        champion_iou = (
-            best_raw_config["iou"]
-            if champion_source == "raw"
-            else best_xgb_config["iou"]
-        )
-        if best_champion_iou is None or champion_iou > best_champion_iou:
-            best_champion_iou = champion_iou
-            best_bundle = {
-                "roads_penalty": penalty,
-                "best_raw_config": best_raw_config,
-                "best_xgb_config": best_xgb_config,
-                "best_bst": best_bst,
-                "champion_source": champion_source,
-            }
-
-    if best_bundle is None:
-        raise ValueError("roads penalty tuning returned no results")
-
-    roads_penalty = best_bundle["roads_penalty"]
-    best_raw_config = best_bundle["best_raw_config"]
-    best_xgb_config = best_bundle["best_xgb_config"]
-    best_bst = best_bundle["best_bst"]
-    champion_source = best_bundle["champion_source"]
-
-    thr_center = (
-        best_raw_config["threshold"]
-        if champion_source == "raw"
-        else best_xgb_config["threshold"]
-    )
-    for ctx in val_contexts:
-        if champion_source == "raw":
-            score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
-                img_b=ctx["img_b"],
-                pos_bank=pos_bank,
-                neg_bank=neg_bank,
-                model=model,
-                processor=processor,
-                device=device,
-                ps=ps,
-                tile_size=tile_size,
-                stride=stride,
-                k=best_raw_config["k"],
-                aggregate_layers=None,
-                feature_dir=feature_dir,
-                image_id=ctx["image_id"],
-                neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
-                prefetched_tiles=ctx["prefetched_b"],
-                use_fp16_matmul=USE_FP16_KNN,
-                context_radius=context_radius,
-            )
-        else:
-            score_full = xgb_score_image_b(
-                ctx["img_b"],
-                best_bst,
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                ctx["image_id"],
-                prefetched_tiles=ctx["prefetched_b"],
-                context_radius=context_radius,
-            )
-        score_full = _apply_roads_penalty(
-            score_full, ctx["roads_mask"], float(roads_penalty)
-        )
-        ctx["score_full"] = score_full
-        ctx["thr_center"] = thr_center
-
-    # CRF tuning across val tiles
-    crf_candidates = [
-        (psf, pw, pxy, bw, bxy, brgb)
-        for psf in cfg.PROB_SOFTNESS_VALUES
-        for pw in cfg.POS_W_VALUES
-        for pxy in cfg.POS_XY_STD_VALUES
-        for bw in cfg.BILATERAL_W_VALUES
-        for bxy in cfg.BILATERAL_XY_STD_VALUES
-        for brgb in cfg.BILATERAL_RGB_STD_VALUES
-    ]
-    best_crf_cfg = None
-    best_crf_iou = None
-    crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
-    num_workers = int(getattr(cfg, "CRF_NUM_WORKERS", 1) or 1)
-    logger.info(
-        "tune: CRF grid search configs=%s, workers=%s",
-        len(crf_candidates),
-        num_workers,
-    )
-    _init_crf_parallel(val_contexts)
-    if num_workers > 1:
-        with ProcessPoolExecutor(max_workers=num_workers) as ex:
-            for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
-                if best_crf_iou is None or med_iou > best_crf_iou:
-                    best_crf_iou = med_iou
-                    best_crf_cfg = {
-                        "prob_softness": cand[0],
-                        "pos_w": cand[1],
-                        "pos_xy_std": cand[2],
-                        "bilateral_w": cand[3],
-                        "bilateral_xy_std": cand[4],
-                        "bilateral_rgb_std": cand[5],
-                    }
-    else:
-        for cand in crf_candidates:
-            med_iou, _ = _eval_crf_config(cand)
-            if best_crf_iou is None or med_iou > best_crf_iou:
-                best_crf_iou = med_iou
-                best_crf_cfg = {
-                    "prob_softness": cand[0],
-                    "pos_w": cand[1],
-                    "pos_xy_std": cand[2],
-                    "bilateral_w": cand[3],
-                    "bilateral_xy_std": cand[4],
-                    "bilateral_rgb_std": cand[5],
-                }
-    if best_crf_cfg is None:
-        raise ValueError("CRF tuning returned no results")
-
-    # Shadow tuning across val tiles
-    best_shadow_cfg = None
-    best_shadow_iou = None
-    protect_scores = getattr(cfg, "SHADOW_PROTECT_SCORES", [0.5])
-    for weights in cfg.SHADOW_WEIGHT_SETS:
-        iou_by_key = {
-            (thr, protect_score): {"sum": 0.0, "w": 0.0}
-            for thr in cfg.SHADOW_THRESHOLDS
-            for protect_score in protect_scores
-        }
-        for ctx in val_contexts:
-            logger.info("tune: shadow scoring on %s", ctx["path"])
-            score_full = ctx["score_full"]
-            thr_center = ctx["thr_center"]
-
-            mask_crf = refine_with_densecrf(
-                ctx["img_b"],
-                score_full,
-                thr_center,
-                ctx["sh_buffer_mask"],
-                prob_softness=best_crf_cfg["prob_softness"],
-                n_iters=5,
-                pos_w=best_crf_cfg["pos_w"],
-                pos_xy_std=best_crf_cfg["pos_xy_std"],
-                bilateral_w=best_crf_cfg["bilateral_w"],
-                bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
-                bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
-            )
-            img_float = ctx["img_b"].astype(np.float32)
-            w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
-            wsum = (img_float * w).sum(axis=2)
-            flat_base = mask_crf.reshape(-1)
-            flat_gt = ctx["gt_mask_eval"].reshape(-1).astype(bool)
-            vals = wsum.reshape(-1)[flat_base]
-            gt_vals = flat_gt[flat_base]
-            if vals.size == 0:
-                continue
-            thr_arr = np.array(cfg.SHADOW_THRESHOLDS, dtype=np.float32).reshape(-1, 1)
-            mask_thr = vals[None, :] >= thr_arr
-            gt_bool = gt_vals.astype(bool)
-            score_vals = score_full.reshape(-1)[flat_base]
-            weight = float(ctx["gt_weight"])
-            for protect_score in protect_scores:
-                protect_mask = score_vals >= protect_score
-                mask_keep = mask_thr | protect_mask[None, :]
-                tp = (
-                    np.logical_and(mask_keep, gt_bool[None, :])
-                    .sum(axis=1)
-                    .astype(np.float64)
-                )
-                fp = (
-                    np.logical_and(mask_keep, ~gt_bool[None, :])
-                    .sum(axis=1)
-                    .astype(np.float64)
-                )
-                fn = (
-                    np.logical_and(~mask_keep, gt_bool[None, :])
-                    .sum(axis=1)
-                    .astype(np.float64)
-                )
-                iou = tp / (tp + fp + fn + 1e-8)
-                for i, thr in enumerate(cfg.SHADOW_THRESHOLDS):
-                    stats = iou_by_key[(thr, protect_score)]
-                    stats["sum"] += float(iou[i]) * weight
-                    stats["w"] += weight
-
-        for (thr, protect_score), stats in iou_by_key.items():
-            if stats["w"] <= 0:
-                continue
-            weighted_iou = float(stats["sum"] / stats["w"])
-            if best_shadow_iou is None or weighted_iou > best_shadow_iou:
-                best_shadow_iou = weighted_iou
-                best_shadow_cfg = {
-                    "weights": weights,
-                    "threshold": thr,
-                    "protect_score": protect_score,
-                    "iou": weighted_iou,
-                }
-    if best_shadow_cfg is None:
-        raise ValueError("shadow tuning returned no results")
-
-    logger.info("tune: roads penalty selected=%s", roads_penalty)
-    return {
-        "bst": best_bst,
-        "best_raw_config": best_raw_config,
-        "best_xgb_config": best_xgb_config,
-        "champion_source": champion_source,
-        "best_crf_config": {**best_crf_cfg, "k": best_raw_config["k"]},
-        "shadow_cfg": best_shadow_cfg,
-        "roads_penalty": float(roads_penalty),
-    }
-
-
 def infer_on_holdout(
     holdout_path: str,
     gt_vector_paths: list[str] | None,
@@ -1041,6 +180,7 @@ def infer_on_holdout(
     shape_dir: str,
     context_radius: int,
     plot_with_metrics: bool = True,
+    xai_options: dict | None = None,
 ):
     """Run inference on a holdout tile using tuned settings.
 
@@ -1060,15 +200,19 @@ def infer_on_holdout(
         shape_dir (str): Output shapefile directory.
         context_radius (int): Feature context radius.
         plot_with_metrics (bool): Whether to show metrics on plots.
+        xai_options (dict | None): Optional explainability configuration.
 
     Returns:
         dict: Masks, metrics, and metadata for the tile.
 
     Examples:
-        >>> callable(infer_on_holdout)
+        >>> isinstance(infer_on_holdout.__name__, str)
         True
     """
     logger.info("inference: holdout tile %s", holdout_path)
+    timings: dict[str, float] = {}
+    t0_total = time.perf_counter()
+    t0 = time.perf_counter()
     (
         img_b,
         labels_sh,
@@ -1078,16 +222,20 @@ def infer_on_holdout(
         buffer_m,
         pixel_size_m,
     ) = load_b_tile_context(holdout_path, gt_vector_paths)
+    timings["load_context_s"] = time.perf_counter() - t0
     gt_available = gt_mask_eval is not None
     if gt_mask_eval is None:
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
     gt_weight = float(gt_mask_eval.sum())
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    t0 = time.perf_counter()
     roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
+    timings["roads_mask_s"] = time.perf_counter() - t0
     roads_penalty = float(tuned.get("roads_penalty", 1.0))
 
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
+    t0 = time.perf_counter()
     prefetched_b = prefetch_features_single_scale_image(
         img_b,
         model,
@@ -1100,10 +248,18 @@ def infer_on_holdout(
         feature_dir,
         image_id_b,
     )
+    timings["prefetch_features_s"] = time.perf_counter() - t0
 
     k = tuned["best_raw_config"]["k"]
-    knn_thr = tuned["best_raw_config"]["threshold"]
-    score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
+    tuned_neg_alpha = float(tuned.get("neg_alpha", getattr(cfg, "NEG_ALPHA", 1.0)))
+    top_p_a = float(tuned.get("top_p_a", getattr(cfg, "TOP_P_A", 0.0)))
+    top_p_b = float(tuned.get("top_p_b", getattr(cfg, "TOP_P_B", 0.05)))
+    top_p_min = float(tuned.get("top_p_min", getattr(cfg, "TOP_P_MIN", 0.02)))
+    top_p_max = float(tuned.get("top_p_max", getattr(cfg, "TOP_P_MAX", 0.08)))
+    buffer_density = float(sh_buffer_mask.mean())
+    top_p_val = _compute_top_p(buffer_density, top_p_a, top_p_b, top_p_min, top_p_max)
+    t0 = time.perf_counter()
+    score_knn, saliency_knn = zero_shot_knn_single_scale_B_with_saliency(
         img_b,
         pos_bank,
         neg_bank,
@@ -1117,19 +273,27 @@ def infer_on_holdout(
         aggregate_layers=None,
         feature_dir=feature_dir,
         image_id=image_id_b,
-        neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+        neg_alpha=tuned_neg_alpha,
         prefetched_tiles=prefetched_b,
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
     )
+    timings["knn_score_s"] = time.perf_counter() - t0
     score_knn_raw = score_knn
+    t0 = time.perf_counter()
     score_knn = _apply_roads_penalty(score_knn, roads_mask, roads_penalty)
-    mask_knn = (score_knn >= knn_thr) & sh_buffer_mask
+    knn_thr, mask_knn = _top_p_threshold(score_knn, sh_buffer_mask, top_p_val)
     mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
+    timings["knn_threshold_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     metrics_knn = compute_metrics(mask_knn, gt_mask_eval)
+    timings["knn_metrics_s"] = time.perf_counter() - t0
+    timings["knn_s"] = (
+        timings["knn_score_s"] + timings["knn_threshold_s"] + timings["knn_metrics_s"]
+    )
 
     bst = tuned["bst"]
-    xgb_thr = tuned["best_xgb_config"]["threshold"]
+    t0 = time.perf_counter()
     score_xgb = xgb_score_image_b(
         img_b,
         bst,
@@ -1141,10 +305,31 @@ def infer_on_holdout(
         prefetched_tiles=prefetched_b,
         context_radius=context_radius,
     )
+    timings["xgb_score_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     score_xgb = _apply_roads_penalty(score_xgb, roads_mask, roads_penalty)
-    mask_xgb = (score_xgb >= xgb_thr) & sh_buffer_mask
+    xgb_thr, mask_xgb = _top_p_threshold(score_xgb, sh_buffer_mask, top_p_val)
     mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+    timings["xgb_threshold_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     metrics_xgb = compute_metrics(mask_xgb, gt_mask_eval)
+    timings["xgb_metrics_s"] = time.perf_counter() - t0
+    timings["xgb_s"] = (
+        timings["xgb_score_s"] + timings["xgb_threshold_s"] + timings["xgb_metrics_s"]
+    )
+
+    t0 = time.perf_counter()
+    core_mask = np.logical_and(mask_knn, mask_xgb)
+    dilate_px = int(
+        tuned.get(
+            "silver_core_dilate_px",
+            getattr(cfg, "SILVER_CORE_DILATE_PX", 1),
+        )
+    )
+    if dilate_px > 0:
+        core_mask = binary_dilation(core_mask, disk(dilate_px))
+    metrics_core = compute_metrics(core_mask, gt_mask_eval)
+    timings["silver_core_s"] = time.perf_counter() - t0
 
     champion_source = tuned["champion_source"]
     if champion_source == "raw":
@@ -1153,6 +338,7 @@ def infer_on_holdout(
         champion_score = score_xgb
 
     crf_cfg = tuned["best_crf_config"]
+    t0 = time.perf_counter()
     mask_crf_knn, prob_crf_knn = refine_with_densecrf(
         img_b,
         score_knn,
@@ -1167,6 +353,8 @@ def infer_on_holdout(
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
         return_prob=True,
     )
+    timings["crf_knn_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     mask_crf_xgb, prob_crf_xgb = refine_with_densecrf(
         img_b,
         score_xgb,
@@ -1181,6 +369,8 @@ def infer_on_holdout(
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
         return_prob=True,
     )
+    timings["crf_xgb_s"] = time.perf_counter() - t0
+    timings["crf_s"] = timings["crf_knn_s"] + timings["crf_xgb_s"]
     if champion_source == "raw":
         best_crf_mask = mask_crf_knn
     else:
@@ -1189,20 +379,47 @@ def infer_on_holdout(
     bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
     bridge_mask = best_crf_mask
     if bridge_enabled:
+        t0 = time.perf_counter()
         prob_crf = prob_crf_knn if champion_source == "raw" else prob_crf_xgb
+        bridge_cfg = tuned.get("best_bridge_config", {}) or {}
         bridge_mask = bridge_skeleton_gaps(
             best_crf_mask,
             prob_crf,
-            max_gap_px=int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            max_pairs_per_endpoint=int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            max_avg_cost=float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            bridge_width_px=int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            min_component_area_px=int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
-            spur_prune_iters=int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            max_gap_px=int(
+                bridge_cfg.get(
+                    "bridge_max_gap_px", getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)
+                )
+            ),
+            max_pairs_per_endpoint=int(
+                bridge_cfg.get("bridge_max_pairs", getattr(cfg, "BRIDGE_MAX_PAIRS", 3))
+            ),
+            max_avg_cost=float(
+                bridge_cfg.get(
+                    "bridge_max_avg_cost",
+                    getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0),
+                )
+            ),
+            bridge_width_px=int(
+                bridge_cfg.get("bridge_width_px", getattr(cfg, "BRIDGE_WIDTH_PX", 2))
+            ),
+            min_component_area_px=int(
+                bridge_cfg.get(
+                    "bridge_min_component_px",
+                    getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300),
+                )
+            ),
+            spur_prune_iters=int(
+                bridge_cfg.get(
+                    "bridge_spur_prune_iters",
+                    getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15),
+                )
+            ),
         )
+        timings["bridge_s"] = time.perf_counter() - t0
 
     shadow_cfg = tuned["shadow_cfg"]
     protect_score = shadow_cfg.get("protect_score")
+    t0 = time.perf_counter()
     shadow_mask = _apply_shadow_filter(
         img_b,
         bridge_mask,
@@ -1227,6 +444,7 @@ def infer_on_holdout(
         score_xgb,
         protect_score,
     )
+    timings["shadow_s"] = time.perf_counter() - t0
     metrics_knn_crf = compute_metrics(mask_crf_knn, gt_mask_eval)
     metrics_knn_shadow = compute_metrics(shadow_mask_knn, gt_mask_eval)
     metrics_xgb_crf = compute_metrics(mask_crf_xgb, gt_mask_eval)
@@ -1237,7 +455,9 @@ def infer_on_holdout(
     metrics_champion_bridge = compute_metrics(bridge_mask, gt_mask_eval)
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
 
+    t0 = time.perf_counter()
     skel, endpoints = skeletonize_with_endpoints(bridge_mask)
+    timings["skeleton_s"] = time.perf_counter() - t0
     metrics_map = {
         "knn_raw": metrics_knn,
         "knn_crf": metrics_knn_crf,
@@ -1245,6 +465,7 @@ def infer_on_holdout(
         "xgb_raw": metrics_xgb,
         "xgb_crf": metrics_xgb_crf,
         "xgb_shadow": metrics_xgb_shadow,
+        "silver_core": metrics_core,
         "champion_raw": metrics_champion_raw,
         "champion_crf": metrics_champion_crf,
         "champion_bridge": metrics_champion_bridge,
@@ -1260,11 +481,13 @@ def infer_on_holdout(
         "xgb_raw": mask_xgb,
         "xgb_crf": mask_crf_xgb,
         "xgb_shadow": shadow_mask_xgb,
+        "silver_core": core_mask,
         "champion_raw": champ_raw_mask,
         "champion_crf": best_crf_mask,
         "champion_bridge": bridge_mask,
         "champion_shadow": shadow_mask,
     }
+    t0 = time.perf_counter()
     save_unified_plot(
         img_b=img_b,
         gt_mask=gt_mask_eval,
@@ -1281,6 +504,136 @@ def infer_on_holdout(
         endpoints=endpoints,
         bridge_enabled=bridge_enabled,
     )
+    timings["plot_s"] = time.perf_counter() - t0
+
+    xai_cfg = xai_options or {}
+    xai_enabled = bool(xai_cfg.get("enabled", False))
+    if xai_enabled:
+        include_xgb = bool(xai_cfg.get("include_xgb", True))
+        include_knn = bool(xai_cfg.get("include_knn", True))
+        top_features = int(xai_cfg.get("top_features", 20) or 20)
+        top_patches = int(xai_cfg.get("top_patches", 50) or 50)
+        stage_name = str(xai_cfg.get("stage", "holdout")).strip().lower()
+        xai_root = str(xai_cfg.get("xai_dir", cfg.PLOT_DIR))
+        summary_csv_path = xai_cfg.get("summary_csv_path")
+        save_json = bool(xai_cfg.get("save_json", True))
+        save_plots = bool(xai_cfg.get("save_plots", True))
+
+        t0 = time.perf_counter()
+        xgb_importance = (
+            get_xgb_importance_dict(tuned.get("bst"), top_k=top_features)
+            if include_xgb
+            else {"top_dims": [], "importance": [], "xgb_gain_share_top5": 0.0}
+        )
+        latent_summary = summarize_tile_latent_dims(
+            prefetched_b,
+            xgb_importance["top_dims"],
+            top_patches=top_patches,
+        )
+        dim_activation_map = (
+            build_dim_activation_map(
+                prefetched_b,
+                img_b.shape[:2],
+                latent_summary.get("selected_dims", []),
+            )
+            if include_xgb
+            else np.zeros(img_b.shape[:2], dtype=np.float32)
+        )
+        knn_summary = (
+            summarize_knn_signals(
+                score_knn,
+                saliency_knn,
+                sh_buffer_mask,
+                threshold=knn_thr,
+            )
+            if include_knn
+            else {
+                "score_distribution": distribution_stats(score_knn),
+                "saliency_distribution": None,
+                "buffered_score_mean": 0.0,
+                "buffered_positive_ratio": None,
+            }
+        )
+        xgb_score_stats = distribution_stats(score_xgb)
+        timings["xai_prepare_s"] = time.perf_counter() - t0
+
+        xai_stage_dir = os.path.join(xai_root, stage_name)
+        os.makedirs(xai_stage_dir, exist_ok=True)
+        payload = {
+            "run_dir": os.path.dirname(cfg.PLOT_DIR),
+            "stage": stage_name,
+            "tile_path": holdout_path,
+            "image_id": image_id_b,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "xgb": {
+                "global_feature_importance": xgb_importance["importance"],
+                "top_dims": xgb_importance["top_dims"],
+                "xgb_gain_share_top5": xgb_importance["xgb_gain_share_top5"],
+                "tile_feature_activation_stats": latent_summary,
+                "score_distribution": xgb_score_stats,
+            },
+            "knn": knn_summary,
+            "masks": {
+                "knn_raw_nonzero": int(np.count_nonzero(mask_knn)),
+                "xgb_raw_nonzero": int(np.count_nonzero(mask_xgb)),
+                "champion_raw_nonzero": int(np.count_nonzero(champ_raw_mask)),
+                "champion_shadow_nonzero": int(np.count_nonzero(shadow_mask)),
+            },
+            "runtime": {},
+        }
+
+        t0 = time.perf_counter()
+        if save_plots:
+            xai_plot_path = os.path.join(xai_stage_dir, f"{image_id_b}_xai.png")
+            save_xai_tile_plot(
+                img_b=img_b,
+                score_xgb=score_xgb,
+                score_knn=score_knn,
+                dim_activation_map=dim_activation_map,
+                champion_mask=shadow_mask,
+                sh_buffer_mask=sh_buffer_mask,
+                out_path=xai_plot_path,
+                title_suffix=stage_name,
+            )
+            payload["xai_plot_path"] = xai_plot_path
+        timings["xai_plot_s"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        xai_json_path = None
+        payload["runtime"] = {
+            "xai_prepare_s": float(timings["xai_prepare_s"]),
+            "xai_plot_s": float(timings["xai_plot_s"]),
+        }
+        if save_json:
+            xai_json_path = os.path.join(xai_stage_dir, f"{image_id_b}.json")
+            payload["xai_json_path"] = xai_json_path
+            write_xai_tile_json(xai_json_path, payload)
+        timings["xai_write_s"] = time.perf_counter() - t0
+        timings["xai_total_s"] = (
+            timings.get("xai_prepare_s", 0.0)
+            + timings.get("xai_plot_s", 0.0)
+            + timings.get("xai_write_s", 0.0)
+        )
+        payload["runtime"] = {
+            "xai_prepare_s": float(timings["xai_prepare_s"]),
+            "xai_plot_s": float(timings["xai_plot_s"]),
+            "xai_write_s": float(timings["xai_write_s"]),
+            "xai_total_s": float(timings["xai_total_s"]),
+        }
+        if summary_csv_path:
+            summary_row = build_xai_summary_row(
+                stage=stage_name,
+                image_id=image_id_b,
+                tile_path=holdout_path,
+                top_dims=xgb_importance["top_dims"],
+                xgb_gain_share_top5=xgb_importance["xgb_gain_share_top5"],
+                knn_score_stats=knn_summary["score_distribution"],
+                xgb_score_stats=xgb_score_stats,
+                champion_mask=shadow_mask,
+                xai_total_s=float(timings["xai_total_s"]),
+            )
+            append_xai_summary_csv(str(summary_csv_path), summary_row)
+    timings["total_s"] = time.perf_counter() - t0_total
 
     champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
     return {
@@ -1290,6 +643,7 @@ def infer_on_holdout(
         "buffer_m": buffer_m,
         "pixel_size_m": pixel_size_m,
         "metrics": metrics_map,
+        "timings": timings,
         "masks": {
             "knn_raw": mask_knn,
             "knn_crf": mask_crf_knn,
@@ -1297,6 +651,7 @@ def infer_on_holdout(
             "xgb_raw": mask_xgb,
             "xgb_crf": mask_crf_xgb,
             "xgb_shadow": shadow_mask_xgb,
+            "silver_core": core_mask,
             "champion_raw": champ_raw_mask,
             "champion_crf": best_crf_mask,
             "champion_bridge": bridge_mask,
@@ -1309,11 +664,12 @@ def main():
     """Run the full segmentation pipeline for configured tiles.
 
     Examples:
-        >>> callable(main)
+        >>> isinstance(main.__name__, str)
         True
     """
 
     t0_main = time_start()
+    run_start = time.perf_counter()
     model_name = cfg.MODEL_NAME
 
     # ------------------------------------------------------------
@@ -1353,7 +709,22 @@ def main():
     cfg.PLOT_DIR = plot_dir
     cfg.BEST_SETTINGS_PATH = os.path.join(run_dir, "best_settings.yml")
     cfg.LOG_PATH = os.path.join(run_dir, "run.log")
-    setup_logging(getattr(cfg, "LOG_PATH", None))
+    log_level = getattr(cfg, "LOG_LEVEL", logging.INFO)
+    setup_logging(getattr(cfg, "LOG_PATH", None), level=log_level)
+    logger.info("logging configured: level=%s", log_level)
+    timing_csv_enabled = bool(getattr(cfg, "TIMING_CSV_ENABLED", True))
+    timing_csv_path = os.path.join(
+        run_dir, str(getattr(cfg, "TIMING_CSV_FILENAME", "tile_phase_timing.csv"))
+    )
+    timing_summary_csv_path = os.path.join(
+        run_dir,
+        str(getattr(cfg, "TIMING_SUMMARY_CSV_FILENAME", "timing_opportunity_cost.csv")),
+    )
+    timing_flush_every = max(1, int(getattr(cfg, "TIMING_CSV_FLUSH_EVERY", 1) or 1))
+    timing_rows: list[dict[str, object]] = []
+    pending_timing_rows: list[dict[str, object]] = []
+    if resume_run and timing_csv_enabled:
+        timing_rows = read_timing_detail_csv(timing_csv_path)
     processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
     processed_tiles: set[str] = set()
     if resume_run and os.path.exists(processed_log_path):
@@ -1372,11 +743,15 @@ def main():
 
     union_backup_every = int(getattr(cfg, "UNION_BACKUP_EVERY", 10) or 0)
     union_root = os.path.join(shape_dir, "unions")
-    union_streams = ["knn", "xgb", "champion"]
-    union_variants = ["raw", "crf", "shadow"]
+    union_variants_by_stream = {
+        "knn": ["raw", "crf", "shadow"],
+        "xgb": ["raw", "crf", "shadow"],
+        "champion": ["raw", "crf", "shadow"],
+        "silver_core": ["raw"],
+    }
     union_states: dict[tuple[str, str], dict[str, str | int]] = {}
-    for stream in union_streams:
-        for variant in union_variants:
+    for stream, variants in union_variants_by_stream.items():
+        for variant in variants:
             union_dir = os.path.join(union_root, stream, variant)
             os.makedirs(union_dir, exist_ok=True)
             union_path = os.path.join(union_dir, "union.shp")
@@ -1432,6 +807,8 @@ def main():
     source_label_raster = cfg.SOURCE_LABEL_RASTER
     gt_vector_paths = cfg.EVAL_GT_VECTORS
     auto_split_tiles = getattr(cfg, "AUTO_SPLIT_TILES", False)
+    auto_split_mode_runtime = "disabled"
+    source_mode = "manual"
 
     # ------------------------------------------------------------
     # Resolve one or more labeled source images (Image A list)
@@ -1439,11 +816,15 @@ def main():
     if auto_split_tiles:
         tiles_dir = getattr(cfg, "TILES_DIR", "data/tiles")
         tile_glob = getattr(cfg, "TILE_GLOB", "*.tif")
+        split_mode = str(
+            getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)
+        ).strip()
+        auto_split_mode_runtime = split_mode
         val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
         seed = int(getattr(cfg, "SPLIT_SEED", 42))
         downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
         num_workers = getattr(cfg, "GT_PRESENCE_WORKERS", None)
-        img_a_paths, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
+        split_source_tiles, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
             tiles_dir,
             tile_glob,
             gt_vector_paths,
@@ -1451,13 +832,38 @@ def main():
             seed,
             downsample_factor=downsample_factor,
             num_workers=num_workers,
+            mode=split_mode,
+            inference_tile_cap_enabled=getattr(
+                cfg, "INFERENCE_TILE_CAP_ENABLED", False
+            ),
+            inference_tile_cap=getattr(cfg, "INFERENCE_TILE_CAP", None),
+            inference_tile_cap_seed=getattr(cfg, "INFERENCE_TILE_CAP_SEED", seed),
         )
-        logger.info(
-            "auto split tiles: source=%s val=%s holdout=%s",
-            len(img_a_paths),
-            len(val_tiles),
-            len(holdout_tiles),
-        )
+        if split_mode == AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT:
+            img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
+            source_mode = "manual"
+            if not img_a_paths:
+                raise ValueError(
+                    "SOURCE_TILES must be set when "
+                    "AUTO_SPLIT_MODE='gt_to_val_cap_holdout'"
+                )
+            logger.info(
+                "auto split tiles mode=%s: source(manual)=%s val(gt)=%s holdout=%s",
+                split_mode,
+                len(img_a_paths),
+                len(val_tiles),
+                len(holdout_tiles),
+            )
+        else:
+            img_a_paths = split_source_tiles
+            source_mode = "auto"
+            logger.info(
+                "auto split tiles mode=%s: source=%s val=%s holdout=%s",
+                split_mode,
+                len(img_a_paths),
+                len(val_tiles),
+                len(holdout_tiles),
+            )
     else:
         img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
         val_tiles = cfg.VAL_TILES
@@ -1466,6 +872,48 @@ def main():
 
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
 
+    def _flush_timing_rows(force: bool = False) -> None:
+        if not timing_csv_enabled:
+            return
+        if not pending_timing_rows:
+            return
+        if not force and len(pending_timing_rows) < timing_flush_every:
+            return
+        append_tile_timing_csv_rows(timing_csv_path, pending_timing_rows)
+        timing_rows.extend(pending_timing_rows)
+        pending_timing_rows.clear()
+        write_timing_summary_csv(timing_summary_csv_path, timing_rows)
+
+    def _record_tile_timings(
+        stage: str,
+        tile_role: str,
+        tile_path: str,
+        image_id: str,
+        timings: dict[str, float],
+        gt_available: bool,
+        status: str = "done",
+    ) -> None:
+        if not timing_csv_enabled or not timings:
+            return
+        rows = build_tile_timing_rows(
+            run_dir=run_dir,
+            stage=stage,
+            tile_role=tile_role,
+            tile_path=tile_path,
+            image_id=image_id,
+            timings=timings,
+            gt_available=gt_available,
+            source_mode=source_mode,
+            auto_split_mode=auto_split_mode_runtime,
+            resample_factor=int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1),
+            tile_size=int(tile_size),
+            stride=int(stride),
+            status=status,
+            timestamp_utc=datetime.utcnow().isoformat(),
+        )
+        pending_timing_rows.extend(rows)
+        _flush_timing_rows(force=False)
+
     # ------------------------------------------------------------
     # Resolve validation + holdout tiles (required)
     # ------------------------------------------------------------
@@ -1473,6 +921,40 @@ def main():
         raise ValueError("VAL_TILES must be set for main.py.")
     if not holdout_tiles:
         logger.warning("no holdout tiles resolved; skipping holdout inference")
+
+    xai_enabled = bool(getattr(cfg, "XAI_ENABLED", True))
+    xai_save_json = bool(getattr(cfg, "XAI_SAVE_JSON", True))
+    xai_save_plots = bool(getattr(cfg, "XAI_SAVE_PLOTS", True))
+    xai_include_xgb = bool(getattr(cfg, "XAI_INCLUDE_XGB", True))
+    xai_include_knn = bool(getattr(cfg, "XAI_INCLUDE_KNN", True))
+    xai_top_features = int(getattr(cfg, "XAI_TOP_FEATURES", 20) or 20)
+    xai_top_patches = int(getattr(cfg, "XAI_TOP_PATCHES", 50) or 50)
+    xai_dir = os.path.join(run_dir, str(getattr(cfg, "XAI_DIRNAME", "xai")))
+    xai_summary_csv_path = os.path.join(
+        run_dir,
+        str(getattr(cfg, "XAI_SUMMARY_FILENAME", "xai_summary.csv")),
+    )
+    xai_holdout_cap_enabled = bool(getattr(cfg, "XAI_HOLDOUT_CAP_ENABLED", True))
+    xai_holdout_cap = int(getattr(cfg, "XAI_HOLDOUT_CAP", 10) or 0)
+    xai_holdout_cap_seed = int(getattr(cfg, "XAI_HOLDOUT_CAP_SEED", 42) or 42)
+    xai_holdout_selected = (
+        select_holdout_tiles_for_xai(
+            holdout_tiles,
+            xai_holdout_cap_enabled,
+            xai_holdout_cap,
+            xai_holdout_cap_seed,
+        )
+        if xai_enabled
+        else set()
+    )
+    logger.info(
+        "xai: enabled=%s val=all holdout_selected=%s/%s cap_enabled=%s cap=%s",
+        xai_enabled,
+        len(xai_holdout_selected),
+        len(holdout_tiles),
+        xai_holdout_cap_enabled,
+        xai_holdout_cap,
+    )
 
     # ------------------------------------------------------------
     # Feature caching
@@ -1486,6 +968,15 @@ def main():
     else:
         feature_dir = None
     logger.info("feature cache mode: %s", feature_cache_mode)
+    source_prefetch_gt_only = bool(getattr(cfg, "SOURCE_PREFETCH_GT_ONLY", True))
+    log_training_ablation_summary(
+        source_count=len(img_a_paths),
+        val_count=len(val_tiles),
+        holdout_count=len(holdout_tiles),
+        feature_cache_mode=feature_cache_mode,
+        source_prefetch_gt_only=source_prefetch_gt_only,
+        auto_split_mode_legacy=AUTO_SPLIT_MODE_LEGACY,
+    )
 
     image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
 
@@ -1497,31 +988,76 @@ def main():
     neg_banks = []
     X_list = []
     y_list = []
+    source_cache_eligible = 0
+    source_cache_skipped_no_gt = 0
+    source_prefetch_attempted = 0
+    source_prefetch_completed = 0
+    source_gt_overlap_cache: dict[str, bool] = {}
+    source_prefetch_warned_no_gt_vectors = False
     for img_a_path, lab_a_path, image_id_a in zip(
         img_a_paths, lab_a_paths, image_id_a_list, strict=True
     ):
+        source_timings: dict[str, float] = {}
+        t0_source_total = time.perf_counter()
         logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
         ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        source_has_gt = True
+        if source_prefetch_gt_only:
+            if gt_vector_paths:
+                source_has_gt = source_gt_overlap_cache.get(img_a_path, False)
+                if img_a_path not in source_gt_overlap_cache:
+                    source_has_gt = tile_has_gt_overlap(
+                        img_a_path,
+                        gt_vector_paths,
+                        downsample_factor=ds,
+                    )
+                    source_gt_overlap_cache[img_a_path] = source_has_gt
+            else:
+                if not source_prefetch_warned_no_gt_vectors:
+                    logger.warning(
+                        "SOURCE_PREFETCH_GT_ONLY=True but EVAL_GT_VECTORS is "
+                        "empty; source cache gating disabled for this run"
+                    )
+                    source_prefetch_warned_no_gt_vectors = True
+                source_has_gt = True
+        if source_has_gt:
+            source_cache_eligible += 1
+        else:
+            source_cache_skipped_no_gt += 1
+
+        t0 = time.perf_counter()
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
+        source_timings["load_source_image_s"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
         labels_A = reproject_labels_to_image(
             img_a_path, lab_a_path, downsample_factor=ds
         )
+        source_timings["reproject_source_labels_s"] = time.perf_counter() - t0
+        source_feature_dir = feature_dir if source_has_gt else None
         prefetched_a = None
         if feature_cache_mode == "memory":
-            logger.info("prefetch: Image A %s", image_id_a)
-            prefetched_a = prefetch_features_single_scale_image(
-                img_a,
-                model,
-                processor,
-                device,
-                ps,
-                tile_size,
-                stride,
-                None,
-                None,
-                image_id_a,
-            )
+            source_prefetch_attempted += 1
+            if source_has_gt:
+                logger.info("prefetch: Image A %s", image_id_a)
+                t0 = time.perf_counter()
+                prefetched_a = prefetch_features_single_scale_image(
+                    img_a,
+                    model,
+                    processor,
+                    device,
+                    ps,
+                    tile_size,
+                    stride,
+                    None,
+                    None,
+                    image_id_a,
+                )
+                source_timings["prefetch_source_features_s"] = time.perf_counter() - t0
+                source_prefetch_completed += 1
+            else:
+                logger.info("prefetch: skip Image A %s (no GT overlap)", image_id_a)
 
+        t0 = time.perf_counter()
         pos_bank_i, neg_bank_i = build_banks_single_scale(
             img_a,
             labels_A,
@@ -1533,33 +1069,60 @@ def main():
             stride,
             getattr(cfg, "POS_FRAC_THRESH", 0.1),
             None,
-            feature_dir,
+            source_feature_dir,
             image_id_a,
             cfg.BANK_CACHE_DIR,
             context_radius=context_radius,
             prefetched_tiles=prefetched_a,
         )
+        source_timings["build_banks_s"] = time.perf_counter() - t0
         if pos_bank_i.size > 0:
             pos_banks.append(pos_bank_i)
         if neg_bank_i is not None and len(neg_bank_i) > 0:
             neg_banks.append(neg_bank_i)
 
+        t0 = time.perf_counter()
         X_i, y_i = build_xgb_dataset(
             img_a,
             labels_A,
             ps,
             tile_size,
             stride,
-            feature_dir,
+            source_feature_dir,
             image_id_a,
             pos_frac=cfg.POS_FRAC_THRESH,
             max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
             context_radius=context_radius,
             prefetched_tiles=prefetched_a,
         )
+        source_timings["build_xgb_dataset_s"] = time.perf_counter() - t0
+        source_timings["source_tile_total_s"] = time.perf_counter() - t0_source_total
+        _record_tile_timings(
+            stage="source_training",
+            tile_role="source",
+            tile_path=img_a_path,
+            image_id=image_id_a,
+            timings=source_timings,
+            gt_available=True,
+            status="done",
+        )
         if X_i.size > 0 and y_i.size > 0:
             X_list.append(X_i)
             y_list.append(y_i)
+    if source_prefetch_gt_only:
+        logger.info(
+            "source cache gate: eligible=%s skipped_no_gt=%s total=%s",
+            source_cache_eligible,
+            source_cache_skipped_no_gt,
+            len(img_a_paths),
+        )
+    if feature_cache_mode == "memory":
+        logger.info(
+            "source prefetch summary: attempted=%s completed=%s skipped_no_gt=%s",
+            source_prefetch_attempted,
+            source_prefetch_completed,
+            source_prefetch_attempted - source_prefetch_completed,
+        )
 
     if not pos_banks:
         raise ValueError("no positive banks were built; check SOURCE_TILES and labels")
@@ -1601,6 +1164,8 @@ def main():
 
     val_phase_metrics: dict[str, list[dict]] = {}
     holdout_phase_metrics: dict[str, list[dict]] = {}
+    val_timings: list[dict] = []
+    holdout_timings: list[dict] = []
     val_buffer_m = None
     val_pixel_size_m = None
 
@@ -1623,9 +1188,32 @@ def main():
             shape_dir,
             context_radius,
             plot_with_metrics=True,
+            xai_options={
+                "enabled": xai_enabled,
+                "stage": "validation",
+                "xai_dir": xai_dir,
+                "summary_csv_path": xai_summary_csv_path,
+                "top_features": xai_top_features,
+                "top_patches": xai_top_patches,
+                "include_xgb": xai_include_xgb,
+                "include_knn": xai_include_knn,
+                "save_json": xai_save_json,
+                "save_plots": xai_save_plots,
+            },
         )
         if result["gt_available"]:
             _update_phase_metrics(val_phase_metrics, result["metrics"])
+        if isinstance(result.get("timings"), dict):
+            val_timings.append(result["timings"])
+            _record_tile_timings(
+                stage="validation_inference",
+                tile_role="validation",
+                tile_path=val_path,
+                image_id=result["image_id"],
+                timings=result["timings"],
+                gt_available=bool(result["gt_available"]),
+                status="done",
+            )
         if val_buffer_m is None:
             val_buffer_m = result["buffer_m"]
             val_pixel_size_m = result["pixel_size_m"]
@@ -1641,11 +1229,12 @@ def main():
         }
 
     inference_best_settings_path = os.path.join(run_dir, "inference_best_setting.yml")
+    tuned_bridge_cfg = tuned.get("best_bridge_config", {}) or {}
     export_best_settings(
         tuned["best_raw_config"],
         tuned["best_crf_config"],
         cfg.MODEL_NAME,
-        getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
+        img_a_paths if len(img_a_paths) > 1 else img_a_paths[0],
         f"holdout_tiles={len(holdout_tiles)}",
         float(val_buffer_m) if val_buffer_m is not None else 0.0,
         float(val_pixel_size_m) if val_pixel_size_m is not None else 0.0,
@@ -1655,19 +1244,76 @@ def main():
             "stride": stride,
             "patch_size": ps,
             "feat_context_radius": context_radius,
-            "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
+            "neg_alpha": float(tuned.get("neg_alpha", getattr(cfg, "NEG_ALPHA", 1.0))),
             "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
             "roads_penalty": tuned.get("roads_penalty", 1.0),
             "roads_mask_path": getattr(cfg, "ROADS_MASK_PATH", None),
-            "gap_bridging": bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)),
-            "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            "bridge_min_component_px": int(
-                getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
+            "top_p_a": tuned.get("top_p_a", getattr(cfg, "TOP_P_A", 0.0)),
+            "top_p_b": tuned.get("top_p_b", getattr(cfg, "TOP_P_B", 0.05)),
+            "top_p_min": tuned.get("top_p_min", getattr(cfg, "TOP_P_MIN", 0.02)),
+            "top_p_max": tuned.get("top_p_max", getattr(cfg, "TOP_P_MAX", 0.08)),
+            "silver_core_dilate_px": int(
+                tuned.get(
+                    "silver_core_dilate_px", getattr(cfg, "SILVER_CORE_DILATE_PX", 1)
+                )
             ),
-            "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            "gap_bridging": bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)),
+            "bridge_max_gap_px": int(
+                tuned_bridge_cfg.get(
+                    "bridge_max_gap_px", getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)
+                )
+            ),
+            "bridge_max_pairs": int(
+                tuned_bridge_cfg.get(
+                    "bridge_max_pairs", getattr(cfg, "BRIDGE_MAX_PAIRS", 3)
+                )
+            ),
+            "bridge_max_avg_cost": float(
+                tuned_bridge_cfg.get(
+                    "bridge_max_avg_cost",
+                    getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0),
+                )
+            ),
+            "bridge_width_px": int(
+                tuned_bridge_cfg.get(
+                    "bridge_width_px", getattr(cfg, "BRIDGE_WIDTH_PX", 2)
+                )
+            ),
+            "bridge_min_component_px": int(
+                tuned_bridge_cfg.get(
+                    "bridge_min_component_px",
+                    getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300),
+                )
+            ),
+            "bridge_spur_prune_iters": int(
+                tuned_bridge_cfg.get(
+                    "bridge_spur_prune_iters",
+                    getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15),
+                )
+            ),
+            "auto_split_tiles": bool(auto_split_tiles),
+            "auto_split_mode": str(
+                getattr(cfg, "AUTO_SPLIT_MODE", AUTO_SPLIT_MODE_LEGACY)
+            ),
+            "inference_tile_cap_enabled": bool(
+                getattr(cfg, "INFERENCE_TILE_CAP_ENABLED", False)
+            ),
+            "inference_tile_cap": getattr(cfg, "INFERENCE_TILE_CAP", None),
+            "timing_csv_enabled": timing_csv_enabled,
+            "timing_csv_filename": str(
+                getattr(cfg, "TIMING_CSV_FILENAME", "tile_phase_timing.csv")
+            ),
+            "timing_summary_csv_filename": str(
+                getattr(
+                    cfg, "TIMING_SUMMARY_CSV_FILENAME", "timing_opportunity_cost.csv"
+                )
+            ),
+            "xai_enabled": xai_enabled,
+            "xai_summary_filename": str(
+                getattr(cfg, "XAI_SUMMARY_FILENAME", "xai_summary.csv")
+            ),
+            "xai_holdout_cap_enabled": xai_holdout_cap_enabled,
+            "xai_holdout_cap": xai_holdout_cap,
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,
@@ -1682,6 +1328,7 @@ def main():
         if b_path in processed_tiles:
             logger.info("holdout skip (already processed): %s", b_path)
             continue
+        holdout_xai_enabled = xai_enabled and b_path in xai_holdout_selected
         result = infer_on_holdout(
             b_path,
             gt_vector_paths,
@@ -1698,15 +1345,41 @@ def main():
             shape_dir,
             context_radius,
             plot_with_metrics=False,
+            xai_options={
+                "enabled": holdout_xai_enabled,
+                "stage": "holdout",
+                "xai_dir": xai_dir,
+                "summary_csv_path": xai_summary_csv_path,
+                "top_features": xai_top_features,
+                "top_patches": xai_top_patches,
+                "include_xgb": xai_include_xgb,
+                "include_knn": xai_include_knn,
+                "save_json": xai_save_json,
+                "save_plots": xai_save_plots,
+            },
         )
         if result["gt_available"]:
             _update_phase_metrics(holdout_phase_metrics, result["metrics"])
+        if isinstance(result.get("timings"), dict):
+            holdout_timings.append(result["timings"])
+            _record_tile_timings(
+                stage="holdout_inference",
+                tile_role="holdout",
+                tile_path=b_path,
+                image_id=result["image_id"],
+                timings=result["timings"],
+                gt_available=bool(result["gt_available"]),
+                status="done",
+            )
         holdout_tiles_processed += 1
         ref_path = result["ref_path"]
         masks = result["masks"]
-        for stream in ("knn", "xgb", "champion"):
-            for variant in ("raw", "crf", "shadow"):
-                mask_key = f"{stream}_{variant}"
+        for stream, variants in union_variants_by_stream.items():
+            for variant in variants:
+                if stream == "silver_core":
+                    mask_key = "silver_core"
+                else:
+                    mask_key = f"{stream}_{variant}"
                 _append_union(
                     stream,
                     variant,
@@ -1741,6 +1414,59 @@ def main():
             image_id_b = os.path.splitext(os.path.basename(b_path))[0]
             consolidate_features_for_image(feature_dir, image_id_b)
         _log_phase("END", "feature_consolidation")
+
+    _flush_timing_rows(force=True)
+    if timing_csv_enabled:
+        logger.info("timing detail csv: %s", timing_csv_path)
+        logger.info("timing summary csv: %s", timing_summary_csv_path)
+
+    run_total_s = time.perf_counter() - run_start
+    phase_summary_val = _phase_metrics_summary(val_phase_metrics, bridge_enabled)
+    phase_deltas_val = _phase_delta_summary(phase_summary_val, bridge_enabled)
+    timing_summary_val = _timing_summary(val_timings)
+    summary_payload = {
+        "run": {
+            "run_dir": run_dir,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "model_name": model_name,
+            "tile_size": int(tile_size),
+            "stride": int(stride),
+            "patch_size": int(ps),
+            "resample_factor": int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1),
+            "buffer_m": float(cfg.BUFFER_M),
+            "context_radius": int(context_radius),
+            "val_tiles_count": int(len(val_tiles)),
+            "holdout_tiles_count": int(len(holdout_tiles)),
+            "runtime_s": float(run_total_s),
+            "timing_csv_path": timing_csv_path if timing_csv_enabled else None,
+            "timing_summary_csv_path": (
+                timing_summary_csv_path if timing_csv_enabled else None
+            ),
+            "xai_enabled": bool(xai_enabled),
+            "xai_dir": xai_dir if xai_enabled else None,
+            "xai_summary_csv_path": xai_summary_csv_path if xai_enabled else None,
+        },
+        "validation": {
+            "metrics": phase_summary_val,
+            "deltas": phase_deltas_val,
+            "timing": timing_summary_val,
+        },
+    }
+    if holdout_phase_metrics:
+        phase_summary_holdout = _phase_metrics_summary(
+            holdout_phase_metrics, bridge_enabled
+        )
+        phase_deltas_holdout = _phase_delta_summary(
+            phase_summary_holdout, bridge_enabled
+        )
+        timing_summary_holdout = _timing_summary(holdout_timings)
+        summary_payload["holdout"] = {
+            "metrics": phase_summary_holdout,
+            "deltas": phase_deltas_holdout,
+            "timing": timing_summary_holdout,
+        }
+    run_summary_path = os.path.join(run_dir, "run_summary.yml")
+    export_run_summary(summary_payload, run_summary_path)
 
     time_end("main (total)", t0_main)
 

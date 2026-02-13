@@ -14,7 +14,7 @@ def setup_logging(log_path: str | None = None, level: int = logging.INFO) -> Non
         level (int): Logging level.
 
     Examples:
-        >>> callable(setup_logging)
+        >>> isinstance(setup_logging.__name__, str)
         True
     """
     handlers: list[logging.Handler] = [logging.StreamHandler()]

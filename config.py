@@ -1,4 +1,6 @@
 # SegEdge zero-shot pipeline configuration.
+import logging
+
 # Organized by: IO paths, model/tiling, scoring/search, evaluation/runtime.
 
 # -----------------------------------------------------------------------------
@@ -13,8 +15,17 @@ TARGET_TILE = "data/dop20_592000_5982000_1km_20cm.tif"
 TILES_DIR = "/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1"
 TILE_GLOB = "*.tif"
 AUTO_SPLIT_TILES = True
+# Auto-split mode:
+# - "gt_to_val_cap_holdout": all GT-overlap tiles are validation; source comes from
+#   SOURCE_TILES; holdout (non-GT) can be capped.
+# - "legacy_gt_source_val_holdout": split GT-overlap tiles into source/validation.
+AUTO_SPLIT_MODE = "gt_to_val_cap_holdout"
 VAL_SPLIT_FRACTION = 0.5
 SPLIT_SEED = 42
+# Holdout cap (applies in gt_to_val_cap_holdout mode).
+INFERENCE_TILE_CAP_ENABLED = True
+INFERENCE_TILE_CAP = 50
+INFERENCE_TILE_CAP_SEED = 42
 # Downsample factor for GT presence checks (None uses RESAMPLE_FACTOR).
 GT_PRESENCE_DOWNSAMPLE = None
 # Worker count for GT presence checks (None uses SLURM_CPUS_PER_TASK or os.cpu_count()).
@@ -60,8 +71,35 @@ FEATURE_DIR = "data/dino_features"
 BANK_CACHE_DIR = "data/dino_features/banks"
 OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
+TUNING_PLOT_MAX_TILES = 10
 BEST_SETTINGS_PATH = "output/best_settings.yml"
 LOG_PATH = "output/run.log"
+LOG_LEVEL = logging.INFO
+DEBUG_REPROJECT = True
+# Incremental timing telemetry CSV outputs.
+TIMING_CSV_ENABLED = True
+TIMING_CSV_FILENAME = "tile_phase_timing.csv"
+TIMING_SUMMARY_CSV_FILENAME = "timing_opportunity_cost.csv"
+# Flush cadence for detailed rows (1 updates files after every completed tile).
+TIMING_CSV_FLUSH_EVERY = 1
+# Runtime timing logs.
+DEBUG_TIMING = True
+DEBUG_TIMING_VERBOSE = False
+# If False, suppress per-tile timing lines and keep image-level timing summaries.
+TIMING_TILE_LOGS = False
+# Explainability outputs (Tier 1, no SHAP dependency).
+XAI_ENABLED = True
+XAI_SAVE_JSON = True
+XAI_SAVE_PLOTS = True
+XAI_DIRNAME = "xai"
+XAI_SUMMARY_FILENAME = "xai_summary.csv"
+XAI_TOP_FEATURES = 20
+XAI_TOP_PATCHES = 50
+XAI_INCLUDE_XGB = True
+XAI_INCLUDE_KNN = True
+XAI_HOLDOUT_CAP_ENABLED = True
+XAI_HOLDOUT_CAP = 10
+XAI_HOLDOUT_CAP_SEED = 42
 # Resume previous run (requires RESUME_RUN_DIR).
 RESUME_RUN = False
 RESUME_RUN_DIR = None
@@ -71,6 +109,8 @@ UNION_BACKUP_DIR = None
 
 # Feature cache mode: "disk" caches tiles to FEATURE_DIR, "memory" reuses per-image in RAM.
 FEATURE_CACHE_MODE = "memory"  # "disk" | "memory"
+# If True, prefetch/cache source features only for source tiles overlapping GT vectors.
+SOURCE_PREFETCH_GT_ONLY = True
 # Batch size for feature extraction (1 disables batching).
 FEATURE_BATCH_SIZE = 4
 
@@ -104,11 +144,11 @@ K_VALUES = [175, 200, 250]
 THRESHOLDS = [float(x) for x in __import__("numpy").linspace(0.01, 0.9, 100)]
 
 # CRF grid search
-PROB_SOFTNESS_VALUES = [0.03, 0.05, 0.08]
-POS_W_VALUES = [3.0, 4.0]
-POS_XY_STD_VALUES = [3.0]
-BILATERAL_W_VALUES = [5.0, 7.0]
-BILATERAL_XY_STD_VALUES = [25.0, 50.0]
+PROB_SOFTNESS_VALUES = [0.08, 0.12, 0.2]
+POS_W_VALUES = [1.0, 2.0, 3.0]
+POS_XY_STD_VALUES = [3.0, 5.0]
+BILATERAL_W_VALUES = [1.0, 3.0, 5.0]
+BILATERAL_XY_STD_VALUES = [25.0]
 BILATERAL_RGB_STD_VALUES = [3.0, 5.0]
 CRF_NUM_WORKERS = 16
 
@@ -116,10 +156,6 @@ CRF_NUM_WORKERS = 16
 SHADOW_WEIGHT_SETS = [
     (1.0, 1.0, 1.0),
     (0.7, 1.0, 1.0),
-    (0.5, 0.8, 1.0),
-    (0.5, 1.0, 0.5),
-    (0.5, 0.5, 1.0),
-    (0.1, 0.5, 0.5),
 ]
 SHADOW_THRESHOLDS = [
     20,
@@ -128,37 +164,111 @@ SHADOW_THRESHOLDS = [
     80,
     100,
     120,
-    160,
-    180,
-    210,
-    240,
-    270,
-    300,
-    330,
-    360,
-    450,
-    500,
 ]
-SHADOW_PROTECT_SCORES = [0.3, 0.4, 0.5, 0.6]
+SHADOW_PROTECT_SCORES = [0.3, 0.5]
 
 # Roads mask penalty (multiplicative) for kNN/XGB scores
 ROADS_MASK_PATH = "data/roads/roads_mask.shp"
-ROADS_PENALTY_VALUES = [0.7, 0.6, 0.5]
+ROADS_PENALTY_VALUES = [0.8, 0.7, 0.6]
+ROADS_SIMPLIFY_TOLERANCE_M = 0.2
+
+# Adaptive top-p selection inside buffer
+TOP_P_A = 0.2
+TOP_P_B = 0.04
+TOP_P_MIN = 0.02
+TOP_P_MAX = 0.12
+TOP_P_A_VALUES = [0.0, 0.2, 0.4]
+TOP_P_B_VALUES = [0.02, 0.04, 0.06]
+TOP_P_MIN_VALUES = [0.02, 0.03]
+TOP_P_MAX_VALUES = [0.06, 0.08, 0.1, 0.12]
+SILVER_CORE_DILATE_PX = 1
+SILVER_CORE_DILATE_PX_VALUES = [0, 1, 2]
+
+# Tuning strategy
+# - "grid": exhaustive Cartesian search (legacy behavior).
+# - "bayes": staged Optuna TPE search with optional perturbation robustness.
+TUNING_MODE = "bayes"
+
+# Bayesian optimization controls
+BO_SEED = 42
+BO_STAGE1_TRIALS = 400
+BO_STAGE2_TRIALS = 400
+BO_STAGE3_TRIALS = 200
+BO_TIMEOUT_S = None
+BO_ENABLE_PRUNING = True
+BO_EARLY_STOP_PATIENCE = 20
+BO_EARLY_STOP_MIN_DELTA = 0.0
+BO_N_STARTUP_TRIALS = 12
+BO_PRUNER_MIN_RESOURCE = 1
+BO_PRUNER_REDUCTION_FACTOR = 2
+BO_PRUNER_WARMUP_STEPS = 1
+BO_SAMPLER = "tpe"  # "tpe" | "cmaes"
+BO_TPE_MULTIVARIATE = True
+BO_TPE_GROUP = True
+BO_STORAGE_PATH = "output/optuna_tuning.db"
+BO_STUDY_NAME = "segedge_tuning"
+BO_STUDY_TAG = "v2_ranges"
+BO_IMPORTANCE_FILENAME = "bayes_hyperparam_importances.json"
+BO_IMPORTANCE_CSV_FILENAME = "bayes_hyperparam_importances.csv"
+BO_TRIALS_CSV_FILENAME = "bayes_trials_timeseries.csv"
+# Robust objective = w_gt * IoU_GT + w_sh * IoU_SH
+BO_OBJECTIVE_W_GT = 0.8
+BO_OBJECTIVE_W_SH = 0.2
+BO_PERTURBATIONS_PER_TILE = 1
+BO_PERTURB_SEED = 42
+# Optional dynamic threshold calibration (validation objective only).
+BO_USE_DYNAMIC_F1_THRESHOLD = False
+BO_DYNAMIC_THRESHOLD_BINS = 64
+# Stage-2 refinement controls.
+BO_STAGE2_TOP_N = 10
+BO_STAGE2_BROAD_FRACTION = 0.6
+# Bridge optimization gate.
+BO_TUNE_BRIDGE = True
+
+# Range-first Optuna search space (if set, takes precedence over *_VALUES).
+BO_K_RANGE = (10, 300)
+BO_NEG_ALPHA_RANGE = (0.1, 5.0)
+BO_ROADS_PENALTY_RANGE = (0.5, 1.0)
+BO_TOP_P_A_RANGE = (0.0, 1.0)
+BO_TOP_P_B_RANGE = (0.01, 0.15)
+BO_TOP_P_MIN_RANGE = (0.01, 0.06)
+BO_TOP_P_MAX_RANGE = (0.05, 0.2)
+BO_SILVER_CORE_DILATE_PX_RANGE = (0, 3, 1)
+BO_CRF_PROB_SOFTNESS_RANGE = (0.05, 0.5)
+BO_CRF_POS_W_RANGE = (0.5, 8.0)
+BO_CRF_POS_XY_STD_RANGE = (1.0, 10.0)
+BO_CRF_BILATERAL_W_RANGE = (0.5, 10.0)
+BO_CRF_BILATERAL_XY_STD_RANGE = (10.0, 100.0)
+BO_CRF_BILATERAL_RGB_STD_RANGE = (1.0, 20.0)
+BO_SHADOW_THRESHOLD_RANGE = (10, 140, 5)
+BO_SHADOW_PROTECT_SCORE_RANGE = (0.1, 0.9)
+BO_BRIDGE_MAX_GAP_PX_RANGE = (100, 600, 50)
+BO_BRIDGE_MAX_PAIRS_RANGE = (1, 5, 1)
+BO_BRIDGE_MAX_AVG_COST_RANGE = (0.2, 1.0)
+BO_BRIDGE_WIDTH_PX_RANGE = (80, 240, 20)
+BO_BRIDGE_MIN_COMPONENT_PX_RANGE = (50, 300, 10)
+BO_BRIDGE_SPUR_PRUNE_ITERS_RANGE = (5, 25, 1)
 
 # Continuity bridging (post-CRF, pre-shadow)
 ENABLE_GAP_BRIDGING = True
 BRIDGE_MAX_GAP_PX = 500
 BRIDGE_MAX_PAIRS = 3
 BRIDGE_MAX_AVG_COST = 0.5
-BRIDGE_WIDTH_PX = 20
-BRIDGE_MIN_COMPONENT_PX = 300
+BRIDGE_WIDTH_PX = 200
+BRIDGE_MIN_COMPONENT_PX = 100
 BRIDGE_SPUR_PRUNE_ITERS = 15
+BRIDGE_MAX_GAP_PX_VALUES = [200, 350, 500]
+BRIDGE_MAX_PAIRS_VALUES = [2, 3, 4]
+BRIDGE_MAX_AVG_COST_VALUES = [0.4, 0.5, 0.7]
+BRIDGE_WIDTH_PX_VALUES = [120, 160, 200]
+BRIDGE_MIN_COMPONENT_PX_VALUES = [80, 100, 150]
+BRIDGE_SPUR_PRUNE_ITERS_VALUES = [10, 15, 20]
 
 # XGBoost (patch classifier)
 XGB_USE_GPU = True
 XGB_VAL_FRACTION = 0.2
-XGB_NUM_BOOST_ROUND = 10
-XGB_EARLY_STOP = 40
+XGB_NUM_BOOST_ROUND = 15
+XGB_EARLY_STOP = 100
 XGB_VERBOSE_EVAL = 20
 XGB_PARAM_GRID = [
     # 1) Baseline

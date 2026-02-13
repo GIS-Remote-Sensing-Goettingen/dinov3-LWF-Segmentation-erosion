@@ -54,7 +54,7 @@ def build_xgb_dataset(
         tuple[np.ndarray, np.ndarray]: Feature matrix X and labels y.
 
     Examples:
-        >>> callable(build_xgb_dataset)
+        >>> isinstance(build_xgb_dataset.__name__, str)
         True
     """
     if feature_dir is None and prefetched_tiles is None:
@@ -159,7 +159,7 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         xgb.Booster: Trained XGBoost booster.
 
     Examples:
-        >>> callable(train_xgb_classifier)
+        >>> isinstance(train_xgb_classifier.__name__, str)
         True
     """
     dtrain = xgb.DMatrix(X, label=y)
@@ -228,7 +228,7 @@ def hyperparam_search_xgb(
         tuple[xgb.Booster | None, dict | None, float]: Best model, params, logloss.
 
     Examples:
-        >>> callable(hyperparam_search_xgb)
+        >>> isinstance(hyperparam_search_xgb.__name__, str)
         True
     """
     n = len(X)
@@ -366,7 +366,7 @@ def hyperparam_search_xgb_iou(
             Best model, params, IoU, threshold, metrics.
 
     Examples:
-        >>> callable(hyperparam_search_xgb_iou)
+        >>> isinstance(hyperparam_search_xgb_iou.__name__, str)
         True
     """
     best_model = None
@@ -512,7 +512,7 @@ def xgb_score_image_b(
         np.ndarray: Score map at pixel resolution.
 
     Examples:
-        >>> callable(xgb_score_image_b)
+        >>> isinstance(xgb_score_image_b.__name__, str)
         True
     """
     if feature_dir is None and prefetched_tiles is None:

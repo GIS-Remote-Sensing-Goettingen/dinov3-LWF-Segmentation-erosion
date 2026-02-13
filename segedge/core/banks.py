@@ -111,7 +111,7 @@ def build_banks_single_scale(
         tuple[np.ndarray, np.ndarray | None]: Positive and negative banks.
 
     Examples:
-        >>> callable(build_banks_single_scale)
+        >>> isinstance(build_banks_single_scale.__name__, str)
         True
     """
     t0 = time_start()
