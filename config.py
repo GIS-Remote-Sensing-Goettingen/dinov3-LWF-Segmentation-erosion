@@ -67,8 +67,9 @@ HOLDOUT_TILES = [
 
 
 # Output locations (everything except DINO features).
-FEATURE_DIR = "data/dino_features"
-BANK_CACHE_DIR = "data/dino_features/banks"
+# Persist DINO feature/tile cache under project storage for long runs.
+FEATURE_DIR = "/mnt/ceph-hdd/projects/mthesis_davide_mattioli/dino_features"
+BANK_CACHE_DIR = "/mnt/ceph-hdd/projects/mthesis_davide_mattioli/dino_features/banks"
 OUTPUT_DIR = "output"
 PLOT_DIR = "output/plots"
 TUNING_PLOT_MAX_TILES = 10
@@ -108,7 +109,7 @@ UNION_BACKUP_EVERY = 10
 UNION_BACKUP_DIR = None
 
 # Feature cache mode: "disk" caches tiles to FEATURE_DIR, "memory" reuses per-image in RAM.
-FEATURE_CACHE_MODE = "memory"  # "disk" | "memory"
+FEATURE_CACHE_MODE = "disk"  # "disk" | "memory"
 # If True, prefetch/cache source features only for source tiles overlapping GT vectors.
 SOURCE_PREFETCH_GT_ONLY = True
 # Batch size for feature extraction (1 disables batching).
@@ -191,9 +192,9 @@ TUNING_MODE = "bayes"
 
 # Bayesian optimization controls
 BO_SEED = 42
-BO_STAGE1_TRIALS = 400
-BO_STAGE2_TRIALS = 400
-BO_STAGE3_TRIALS = 200
+BO_STAGE1_TRIALS = 40
+BO_STAGE2_TRIALS = 40
+BO_STAGE3_TRIALS = 20
 BO_TIMEOUT_S = None
 BO_ENABLE_PRUNING = True
 BO_EARLY_STOP_PATIENCE = 20

@@ -14,7 +14,10 @@ from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.metrics_utils import compute_metrics
-from ..core.optuna_stop import build_no_improvement_callbacks_from_config
+from ..core.optuna_feedback import (
+    build_optuna_callbacks_with_feedback,
+    objective_weights,
+)
 from ..core.summary_utils import weighted_mean
 from ..core.xdboost import xgb_score_image_b
 from .inference_utils import (
@@ -28,7 +31,6 @@ USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
 
 
 def get_optuna_module():
-    """Return the optuna module when available, else None."""
     try:
         import optuna  # type: ignore
 
@@ -61,7 +63,6 @@ def mask_iou(
 
 
 def robust_objective(iou_gt: float, iou_sh: float, w_gt: float, w_sh: float) -> float:
-    """Combine GT and SH IoU into one robustness-aware objective."""
     return float(w_gt * iou_gt + w_sh * iou_sh)
 
 
@@ -531,15 +532,6 @@ def _predict_champion_shadow(
     )
 
 
-def _objective_weights() -> tuple[float, float]:
-    w_gt = float(getattr(cfg, "BO_OBJECTIVE_W_GT", 0.8))
-    w_sh = float(getattr(cfg, "BO_OBJECTIVE_W_SH", 0.2))
-    w_sum = w_gt + w_sh
-    if w_sum <= 0:
-        return 1.0, 0.0
-    return w_gt / w_sum, w_sh / w_sum
-
-
 def run_stage1_bayes(
     *,
     optuna_mod,
@@ -556,8 +548,7 @@ def run_stage1_bayes(
     pos_bank: np.ndarray,
     neg_bank: np.ndarray | None,
 ) -> dict:
-    """Run Bayesian optimization for raw-stage parameters."""
-    w_gt, w_sh = _objective_weights()
+    w_gt, w_sh = objective_weights(cfg)
 
     def objective(trial):
         roads_penalty = _suggest_float_param(
@@ -758,7 +749,11 @@ def run_stage1_bayes(
         objective,
         n_trials=int(getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50),
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
-        callbacks=build_no_improvement_callbacks_from_config(cfg, default_patience=20),
+        callbacks=build_optuna_callbacks_with_feedback(
+            cfg,
+            stage_name="stage1_raw",
+            default_patience=20,
+        ),
     )
     best = study.best_trial
     xgb_idx = int(
@@ -835,8 +830,7 @@ def run_stage2_bayes(
     pos_bank: np.ndarray,
     neg_bank: np.ndarray | None,
 ) -> tuple[dict, dict, dict]:
-    """Run Bayesian optimization for CRF + shadow parameters."""
-    w_gt, w_sh = _objective_weights()
+    w_gt, w_sh = objective_weights(cfg)
     champion_source = str(stage1_bundle["champion_source"])
     k = int(stage1_bundle["best_raw_config"]["k"])
     bst = stage1_bundle["best_bst"]
@@ -1049,14 +1043,15 @@ def run_stage2_bayes(
         "stage2_crf_shadow_broad",
         seed=int(getattr(cfg, "BO_SEED", 42) or 42) + 101,
     )
-    stagnation_callbacks = build_no_improvement_callbacks_from_config(
-        cfg, default_patience=20
-    )
     stage2_broad.optimize(
         lambda tr: _objective_with_refine(tr, refine=None),
         n_trials=broad_trials,
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
-        callbacks=stagnation_callbacks,
+        callbacks=build_optuna_callbacks_with_feedback(
+            cfg,
+            stage_name="stage2_broad",
+            default_patience=20,
+        ),
     )
 
     completed = [t for t in stage2_broad.trials if t.value is not None]
@@ -1126,7 +1121,11 @@ def run_stage2_bayes(
             lambda tr: _objective_with_refine(tr, refine=refine_spec),
             n_trials=refine_trials,
             timeout=getattr(cfg, "BO_TIMEOUT_S", None),
-            callbacks=stagnation_callbacks,
+            callbacks=build_optuna_callbacks_with_feedback(
+                cfg,
+                stage_name="stage2_refine",
+                default_patience=20,
+            ),
         )
         final_study = stage2_refine
     else:
@@ -1185,7 +1184,6 @@ def run_stage3_bayes(
     pos_bank: np.ndarray,
     neg_bank: np.ndarray | None,
 ) -> dict:
-    """Run Bayesian optimization for bridge/skeleton parameters."""
     if not bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)) or not bool(
         getattr(cfg, "BO_TUNE_BRIDGE", True)
     ):
@@ -1203,7 +1201,7 @@ def run_stage3_bayes(
             "optuna_best_value": 0.0,
         }
 
-    w_gt, w_sh = _objective_weights()
+    w_gt, w_sh = objective_weights(cfg)
     champion_source = str(stage1_bundle["champion_source"])
     k = int(stage1_bundle["best_raw_config"]["k"])
     bst = stage1_bundle["best_bst"]
@@ -1455,7 +1453,11 @@ def run_stage3_bayes(
         objective,
         n_trials=int(getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30),
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
-        callbacks=build_no_improvement_callbacks_from_config(cfg, default_patience=20),
+        callbacks=build_optuna_callbacks_with_feedback(
+            cfg,
+            stage_name="stage3_bridge",
+            default_patience=20,
+        ),
     )
     best = study.best_trial
     return {

@@ -24,6 +24,7 @@ interfaces, and run artifacts.
   - I/O exports (`io_utils.py`).
   - Timing and telemetry helpers (`timing_utils.py`, `timing_csv.py`).
   - Curated training-config logging helper (`run_config_logging.py`).
+  - Optuna tuning callbacks (`optuna_stop.py`, `optuna_feedback.py`).
 - `tests/`
   - Smoke and unit coverage for pipeline behavior and utility contracts.
 
@@ -51,6 +52,8 @@ interfaces, and run artifacts.
          `enqueue_trial(...)`.
      - Stage 3: bridge/skeleton continuity parameters with frozen upstream maps.
      - Sampler: configurable (`BO_SAMPLER`), default TPE.
+     - Trial telemetry: each trial logs objective, proxy loss (`1-objective`),
+       IoU metrics, and best-so-far value.
 6. Run fixed-setting inference on validation tiles (metrics + plots).
 7. Run fixed-setting inference on holdout tiles (plots + union exports + resume log).
 8. Emit per-tile explainability artifacts (XGB+kNN) during validation and capped holdout.

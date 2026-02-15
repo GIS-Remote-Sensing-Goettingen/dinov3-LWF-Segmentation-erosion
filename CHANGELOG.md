@@ -3,6 +3,18 @@
 
 ## [Unreleased]
 
+## [0.2.39]
+- Description: Add per-trial Bayesian IoU/loss feedback logging, switch feature caching to on-disk Ceph storage, and reduce default Bayes trial budgets for faster iteration.
+- file touched: `config.py`, `segedge/pipeline/tuning_bayes.py`, `segedge/core/optuna_feedback.py`, `segedge/core/run_config_logging.py`, `CHANGELOG.md`
+- reason: Long tuning runs needed clearer progress telemetry and lower default budgets, while persisting tile features to shared storage to avoid repeated extraction cost.
+- problems fixed: Logs stage-wise trial progress (`value`, proxy `loss`, IoU metrics, best-so-far), stores feature caches under `/mnt/ceph-hdd/projects/mthesis_davide_mattioli/dino_features`, and reduces default stage trials from `400/400/200` to `40/40/20`.
+
+## [0.2.38]
+- Description: Replace generic `test.md` loop doc with a SegEdge-specific experiment/promotion specification and enforce agent execution on feature branches only.
+- file touched: `test.md`, `CHANGELOG.md`
+- reason: Align the specification with this repository's real pipeline, artifacts, gating signals, and workflow constraints.
+- problems fixed: Removes non-repo assumptions, defines concrete SegEdge run/metric/artifact contracts, requires human-approved promotion, and explicitly restricts agent work to dedicated feature branches.
+
 ## [0.2.37]
 - Description: Reduce timing-log clutter with image-level summaries by default, add curated training ablation/config logging, and gate source feature caching to GT-overlap tiles.
 - file touched: `config.py`, `segedge/core/timing_utils.py`, `segedge/core/features.py`, `segedge/core/knn.py`, `segedge/core/run_config_logging.py`, `segedge/core/__init__.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

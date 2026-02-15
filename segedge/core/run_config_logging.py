@@ -52,7 +52,9 @@ def log_training_ablation_summary(
         str(getattr(cfg, "AUTO_SPLIT_MODE", auto_split_mode_legacy)),
     )
     logger.info(
-        "train settings: features cache_mode=%s source_prefetch_gt_only=%s batch=%s resample=%s patch=%s tile=%s stride=%s context=%s timing_tile_logs=%s",
+        "train settings: features cache_mode=%s source_prefetch_gt_only=%s "
+        "batch=%s resample=%s patch=%s tile=%s stride=%s context=%s "
+        "timing_tile_logs=%s feature_dir=%s bank_cache_dir=%s",
         feature_cache_mode,
         source_prefetch_gt_only,
         int(getattr(cfg, "FEATURE_BATCH_SIZE", 1) or 1),
@@ -62,6 +64,8 @@ def log_training_ablation_summary(
         int(getattr(cfg, "STRIDE", 1024) or 1024),
         int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0),
         bool(getattr(cfg, "TIMING_TILE_LOGS", False)),
+        str(getattr(cfg, "FEATURE_DIR", "")),
+        str(getattr(cfg, "BANK_CACHE_DIR", "")),
     )
     logger.info(
         "train settings: postprocess bridge=%s shadow_weights=%s shadow_thresholds=%s roads_penalties=%s",
