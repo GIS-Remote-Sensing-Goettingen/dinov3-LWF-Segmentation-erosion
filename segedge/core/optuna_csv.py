@@ -182,6 +182,88 @@ def write_optuna_trials_csv(output_path: str, rows: list[dict[str, object]]) -> 
             writer.writerow(row)
 
 
+def write_bayes_trial_phase_timing_csv(
+    output_path: str,
+    rows: list[dict[str, object]],
+) -> None:
+    """Write compact one-row-per-trial Bayesian phase timing CSV.
+
+    Examples:
+        >>> isinstance(write_bayes_trial_phase_timing_csv.__name__, str)
+        True
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    phase_cols = [
+        "score_base_knn_xgb_s",
+        "score_perturb_knn_xgb_s",
+        "threshold_base_s",
+        "threshold_perturb_s",
+        "metrics_base_s",
+        "metrics_perturb_s",
+        "crf_s",
+        "bridge_s",
+        "shadow_s",
+        "trial_total_s",
+        "perturb_share_pct",
+        "scoring_share_pct",
+    ]
+    fieldnames = [
+        "timestamp_utc",
+        "stage",
+        "study_name",
+        "trial_index_stage",
+        "trial_number_global",
+        "state",
+        "objective",
+        "duration_s",
+        "is_best_so_far",
+    ] + phase_cols
+
+    def _as_float(value) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    with open(output_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            out = {
+                "timestamp_utc": row.get("timestamp_utc", ""),
+                "stage": row.get("stage", ""),
+                "study_name": row.get("study_name", ""),
+                "trial_index_stage": row.get("trial_index_stage", ""),
+                "trial_number_global": row.get("trial_number_global", ""),
+                "state": row.get("state", ""),
+                "objective": row.get("objective", ""),
+                "duration_s": row.get("duration_s", ""),
+                "is_best_so_far": row.get("is_best_so_far", ""),
+            }
+            for phase in phase_cols:
+                attr_key = f"attr__{phase}"
+                out[phase] = row.get(attr_key, "")
+            if out.get("perturb_share_pct", "") in ("", None):
+                total = _as_float(out.get("trial_total_s"))
+                perturb = (
+                    _as_float(out.get("score_perturb_knn_xgb_s"))
+                    + _as_float(out.get("threshold_perturb_s"))
+                    + _as_float(out.get("metrics_perturb_s"))
+                )
+                out["perturb_share_pct"] = (
+                    (perturb / total * 100.0) if total > 0 else 0.0
+                )
+            if out.get("scoring_share_pct", "") in ("", None):
+                total = _as_float(out.get("trial_total_s"))
+                scoring = _as_float(out.get("score_base_knn_xgb_s")) + _as_float(
+                    out.get("score_perturb_knn_xgb_s")
+                )
+                out["scoring_share_pct"] = (
+                    (scoring / total * 100.0) if total > 0 else 0.0
+                )
+            writer.writerow(out)
+
+
 def write_optuna_importance_csv(output_path: str, payload: dict) -> None:
     """Write stage-wise parameter importances to CSV.
 

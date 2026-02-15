@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 import xgboost as xgb
 from skimage.transform import resize
+
+import config as cfg
 
 from .features import (
     add_local_context_mean,
@@ -18,8 +23,45 @@ from .features import (
     tile_iterator,
 )
 from .metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
+from .timing_utils import DEBUG_TIMING, time_end, time_start
 
 logger = logging.getLogger(__name__)
+
+
+def _resize_patch_map(
+    patch_map: np.ndarray,
+    out_h: int,
+    out_w: int,
+    *,
+    resize_device: torch.device | None,
+) -> np.ndarray:
+    """Resize a patch-grid map to pixel space, preferring CUDA interpolation.
+
+    Examples:
+        >>> isinstance(_resize_patch_map.__name__, str)
+        True
+    """
+    if resize_device is not None and resize_device.type == "cuda":
+        with torch.no_grad():
+            patch_t = torch.from_numpy(patch_map).to(
+                device=resize_device,
+                dtype=torch.float32,
+            )
+            resized_t = F.interpolate(
+                patch_t.unsqueeze(0).unsqueeze(0),
+                size=(out_h, out_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return resized_t.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+    return resize(
+        patch_map,
+        (out_h, out_w),
+        order=1,
+        preserve_range=True,
+        anti_aliasing=True,
+    ).astype(np.float32)
 
 
 def build_xgb_dataset(
@@ -494,6 +536,7 @@ def xgb_score_image_b(
     image_id_b,
     prefetched_tiles=None,
     context_radius: int = 0,
+    emit_timing_logs: bool = True,
 ):
     """Apply a trained XGBoost model to Image B and return a score map.
 
@@ -507,6 +550,7 @@ def xgb_score_image_b(
         image_id_b (str): Image B identifier.
         prefetched_tiles (dict | None): Optional in-memory cache.
         context_radius (int): Feature context radius.
+        emit_timing_logs (bool): If False, suppress image-level timing/info logs.
 
     Returns:
         np.ndarray: Score map at pixel resolution.
@@ -515,11 +559,19 @@ def xgb_score_image_b(
         >>> isinstance(xgb_score_image_b.__name__, str)
         True
     """
+    t0 = time_start()
+    t0_wall = time.perf_counter()
     if feature_dir is None and prefetched_tiles is None:
         raise ValueError("feature_dir or prefetched_tiles must be provided")
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
+    predict_time = resize_time = 0.0
+    tile_total = cached_tiles = loaded_tiles = skipped_tiles = 0
+    use_gpu_resize = bool(getattr(cfg, "USE_GPU_RESIZE", True))
+    resize_device = (
+        torch.device("cuda") if use_gpu_resize and torch.cuda.is_available() else None
+    )
 
     if prefetched_tiles is not None:
         tile_items = sorted(prefetched_tiles.items())
@@ -531,6 +583,7 @@ def xgb_score_image_b(
         )
 
     for tile_entry in tile_iter:
+        tile_total += 1
         if prefetched_tiles is not None:
             y, x, feat_info = tile_entry
             feats_tile = feat_info["feats"]
@@ -538,16 +591,20 @@ def xgb_score_image_b(
             w_eff = feat_info["w_eff"]
             hp = feat_info["hp"]
             wp = feat_info["wp"]
+            cached_tiles += 1
         else:
             y, x, img_tile = tile_entry
             img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
             if h_eff < ps or w_eff < ps:
+                skipped_tiles += 1
                 continue
             fpath = tile_feature_path(feature_dir, image_id_b, y, x)
             if not os.path.exists(fpath):
+                skipped_tiles += 1
                 continue
             feats_tile = np.load(fpath)
             hp, wp = feats_tile.shape[:2]
+            loaded_tiles += 1
 
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
@@ -556,19 +613,44 @@ def xgb_score_image_b(
             logger.warning(
                 "missing patch dimensions for tile y=%s x=%s; skipping", y, x
             )
+            skipped_tiles += 1
             continue
+        t_predict0 = time.perf_counter() if DEBUG_TIMING else None
         dtest = xgb.DMatrix(feats_tile.reshape(-1, feats_tile.shape[-1]))
         scores_patch = bst.predict(dtest).reshape(hp, wp)
-        scores_tile = resize(
+        if DEBUG_TIMING and t_predict0 is not None:
+            predict_time += time.perf_counter() - t_predict0
+        t_resize0 = time.perf_counter() if DEBUG_TIMING else None
+        scores_tile = _resize_patch_map(
             scores_patch,
-            (h_eff, w_eff),
-            order=1,
-            preserve_range=True,
-            anti_aliasing=True,
-        ).astype(np.float32)
+            h_eff,
+            w_eff,
+            resize_device=resize_device,
+        )
+        if DEBUG_TIMING and t_resize0 is not None:
+            resize_time += time.perf_counter() - t_resize0
         score_full[y : y + h_eff, x : x + w_eff] += scores_tile
         weight_full[y : y + h_eff, x : x + w_eff] += 1.0
 
     mask_nonzero = weight_full > 0
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
+    total_s = time.perf_counter() - t0_wall
+    if emit_timing_logs:
+        time_end("xgb_score_image_b", t0)
+        logger.info(
+            "xgb_score image=%s total=%.3fs tiles=%s (cached=%s, loaded=%s, skipped=%s)",
+            image_id_b,
+            total_s,
+            tile_total,
+            cached_tiles,
+            loaded_tiles,
+            skipped_tiles,
+        )
+        if DEBUG_TIMING:
+            logger.info(
+                "xgb image=%s predict_time=%.2fs, resize_time=%.2fs",
+                image_id_b,
+                predict_time,
+                resize_time,
+            )
     return score_full

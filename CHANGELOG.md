@@ -3,6 +3,18 @@
 
 ## [Unreleased]
 
+## [0.2.42]
+- Description: Add compact Bayesian phase-timing telemetry with one-line trial summaries, suppress per-image kNN/XGB timing spam during Bayes tuning by default, and export per-trial phase timing CSV.
+- file touched: `config.py`, `segedge/core/bayes_timing.py`, `segedge/core/knn.py`, `segedge/core/xdboost.py`, `segedge/core/optuna_feedback.py`, `segedge/core/optuna_csv.py`, `segedge/core/__init__.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/tuning_bayes.py`, `tests/test_optuna_csv.py`, `tests/test_optuna_feedback.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Bayes logs were crowded with repeated component timing lines, making trial-level bottleneck diagnosis difficult during long runs.
+- problems fixed: Adds coarse phase timing attrs (`score/threshold/metrics/crf/bridge/shadow` + shares), appends optional compact timing suffix on trial feedback lines, writes `bayes_trial_phase_timing.csv`, and gates component timing logs in Bayes loops via `BO_EMIT_COMPONENT_TIMING_LOGS`.
+
+## [0.2.41]
+- Description: Add XGB scoring timing telemetry and move kNN/XGB patch-to-pixel resize hot paths to CUDA interpolation (with config fallback).
+- file touched: `config.py`, `segedge/core/knn.py`, `segedge/core/xdboost.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Stage-1 runs were dominated by resize overhead while XGB timing visibility was limited compared with existing kNN timing logs.
+- problems fixed: Adds image-level XGB timing logs (`total`, `predict_time`, `resize_time`) and uses GPU bilinear interpolation for resize-heavy kNN/XGB paths when `USE_GPU_RESIZE=True`.
+
 ## [0.2.40]
 - Description: Fix Bayesian `_bo` feature caching to reuse disk cache, force fresh Optuna studies by default, and improve Bayes trial-log readability with explicit trial separators/progress counters.
 - file touched: `config.py`, `segedge/pipeline/tuning_bayes.py`, `segedge/core/optuna_feedback.py`, `segedge/core/run_config_logging.py`, `tests/test_optuna_feedback.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

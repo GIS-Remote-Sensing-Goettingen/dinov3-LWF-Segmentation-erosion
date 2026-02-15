@@ -133,3 +133,37 @@ def test_objective_weights_normalizes_or_falls_back() -> None:
     gt_zero, sh_zero = objective_weights(_CfgZero)
     assert gt_zero == 1.0
     assert sh_zero == 0.0
+
+
+def test_feedback_appends_timing_summary_suffix(caplog) -> None:
+    """Callback should append compact timing suffix when enabled by config.
+
+    Examples:
+        >>> isinstance(test_feedback_appends_timing_summary_suffix.__name__, str)
+        True
+    """
+
+    class _Cfg:
+        BO_VERBOSE_TRIAL_SEPARATORS = False
+        BO_EARLY_STOP_PATIENCE = 0
+        BO_EARLY_STOP_MIN_DELTA = 0.0
+        BO_TIMING_SUMMARY_LOG = True
+
+    callbacks = build_optuna_callbacks_with_feedback(
+        _Cfg,
+        stage_name="Stage1 Raw",
+        trial_total=3,
+        default_patience=0,
+    )
+    cb = callbacks[0]
+    trial = _Trial(
+        number=1,
+        value=0.3,
+        state=_State("COMPLETE"),
+        user_attrs={"timing_summary": "score_base_knn_xgb_s:4.20s"},
+    )
+    study = _Study(best_trial=trial)
+    with caplog.at_level("INFO", logger="segedge.core.optuna_feedback"):
+        cb(study, trial)
+    joined = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "timing=score_base_knn_xgb_s:4.20s" in joined

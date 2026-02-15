@@ -17,6 +17,7 @@ from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.metrics_utils import compute_metrics, compute_oracle_upper_bound
 from ..core.optuna_csv import (
     collect_optuna_trials_from_storage,
+    write_bayes_trial_phase_timing_csv,
     write_optuna_importance_csv,
     write_optuna_trials_csv,
 )
@@ -36,13 +37,13 @@ from .inference_utils import (
     load_b_tile_context,
 )
 from .tuning_bayes import (
-    attach_perturbations_to_contexts,
     get_optuna_module,
     run_stage1_bayes,
     run_stage2_bayes,
     run_stage3_bayes,
     write_bo_importances_file,
 )
+from .tuning_bayes_utils import attach_perturbations_to_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +653,21 @@ def tune_on_validation_multi(
                 write_optuna_trials_csv(bo_trials_csv_path, trial_rows)
                 logger.info(
                     "tune: wrote bayes trial time-series csv: %s", bo_trials_csv_path
+                )
+                bo_phase_timing_csv_path = os.path.join(
+                    run_root,
+                    str(
+                        getattr(
+                            cfg,
+                            "BO_TRIAL_PHASE_TIMING_CSV_FILENAME",
+                            "bayes_trial_phase_timing.csv",
+                        )
+                    ),
+                )
+                write_bayes_trial_phase_timing_csv(bo_phase_timing_csv_path, trial_rows)
+                logger.info(
+                    "tune: wrote bayes trial phase timing csv: %s",
+                    bo_phase_timing_csv_path,
                 )
             logger.info(
                 "tune: bayes selected champion=%s roads_penalty=%.3f top-p=(%.3f, %.3f, %.3f, %.3f)",

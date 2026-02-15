@@ -45,6 +45,31 @@ def _safe_best_trial(
         return fallback_value, fallback_number
 
 
+def _trial_timing_summary(cfg_module, trial) -> str:
+    """Return compact timing summary suffix for a trial log line.
+
+    Examples:
+        >>> class _Cfg:
+        ...     BO_TIMING_SUMMARY_LOG = True
+        >>> class _Trial:
+        ...     user_attrs = {"timing_summary": "score:1.0s"}
+        >>> _trial_timing_summary(_Cfg, _Trial)
+        'score:1.0s'
+    """
+    if not bool(getattr(cfg_module, "BO_TIMING_SUMMARY_LOG", False)):
+        return ""
+    attrs = getattr(trial, "user_attrs", {}) or {}
+    summary = str(attrs.get("timing_summary", "") or "").strip()
+    if not summary:
+        total = attrs.get("trial_total_s")
+        try:
+            if total is not None:
+                summary = f"trial_total={float(total):.2f}s"
+        except Exception:
+            summary = ""
+    return summary
+
+
 def _trial_feedback_callback(
     cfg_module,
     *,
@@ -76,14 +101,17 @@ def _trial_feedback_callback(
             )
         trial_num = int(getattr(trial, "number", -1))
         state_name = str(getattr(getattr(trial, "state", None), "name", "UNKNOWN"))
+        timing_summary = _trial_timing_summary(cfg_module, trial)
         if state_name != "COMPLETE":
+            timing_suffix = f" timing={timing_summary}" if timing_summary else ""
             logger.info(
-                "bayes %s trial=%s state=%s progress=%d/%d",
+                "bayes %s trial=%s state=%s progress=%d/%d%s",
                 stage_label,
                 trial_num,
                 state_name,
                 progress_idx,
                 progress_total,
+                timing_suffix,
             )
             if verbose_separators:
                 logger.info(
@@ -105,9 +133,10 @@ def _trial_feedback_callback(
             fallback_value=value,
             fallback_number=trial_num,
         )
+        timing_suffix = f" timing={timing_summary}" if timing_summary else ""
         logger.info(
             "bayes %s trial=%d value=%.4f loss=%.4f iou_gt=%s iou_sh=%s "
-            "knn_iou=%s xgb_iou=%s best=%.4f best_trial=%d progress=%d/%d",
+            "knn_iou=%s xgb_iou=%s best=%.4f best_trial=%d progress=%d/%d%s",
             stage_label,
             trial_num,
             value,
@@ -120,6 +149,7 @@ def _trial_feedback_callback(
             best_number,
             progress_idx,
             progress_total,
+            timing_suffix,
         )
         if verbose_separators:
             logger.info(

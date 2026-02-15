@@ -9,6 +9,7 @@ Examples:
 from __future__ import annotations
 
 __all__ = [
+    "bayes_timing",
     "banks",
     "crf_utils",
     "features",

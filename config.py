@@ -86,6 +86,8 @@ TIMING_CSV_FLUSH_EVERY = 1
 # Runtime timing logs.
 DEBUG_TIMING = True
 DEBUG_TIMING_VERBOSE = False
+# Prefer CUDA bilinear interpolation for patch->pixel resize hot paths (kNN/XGB).
+USE_GPU_RESIZE = True
 # If False, suppress per-tile timing lines and keep image-level timing summaries.
 TIMING_TILE_LOGS = False
 # Explainability outputs (Tier 1, no SHAP dependency).
@@ -218,11 +220,18 @@ BO_VERBOSE_TRIAL_SEPARATORS = True
 BO_IMPORTANCE_FILENAME = "bayes_hyperparam_importances.json"
 BO_IMPORTANCE_CSV_FILENAME = "bayes_hyperparam_importances.csv"
 BO_TRIALS_CSV_FILENAME = "bayes_trials_timeseries.csv"
+BO_TRIAL_PHASE_TIMING_CSV_FILENAME = "bayes_trial_phase_timing.csv"
 # Robust objective = w_gt * IoU_GT + w_sh * IoU_SH
 BO_OBJECTIVE_W_GT = 0.8
 BO_OBJECTIVE_W_SH = 0.2
 BO_PERTURBATIONS_PER_TILE = 1
 BO_PERTURB_SEED = 42
+# Keep tuning logs compact and append a single timing suffix per trial line.
+BO_TIMING_SUMMARY_LOG = True
+BO_TIMING_LOG_TOP_PHASES = 1
+BO_TIMING_LOG_MIN_PHASE_S = 0.5
+# If False, suppress kNN/XGB image-level timing logs inside Bayes tuning loops.
+BO_EMIT_COMPONENT_TIMING_LOGS = False
 # Optional dynamic threshold calibration (validation objective only).
 BO_USE_DYNAMIC_F1_THRESHOLD = False
 BO_DYNAMIC_THRESHOLD_BINS = 64

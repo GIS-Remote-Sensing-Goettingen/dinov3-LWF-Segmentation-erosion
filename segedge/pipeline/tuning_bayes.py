@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, median_filter
+from scipy.ndimage import median_filter
 from skimage.morphology import binary_dilation, disk
 
 import config as cfg
 
+from ..core.bayes_timing import TrialPhaseTimer
 from ..core.continuity import bridge_skeleton_gaps
 from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
@@ -28,8 +30,17 @@ from .inference_utils import (
     _compute_top_p,
     _top_p_threshold,
 )
+from .tuning_bayes_utils import (
+    f1_optimal_threshold,
+    mask_iou,
+    robust_objective,
+    set_trial_timing_attrs,
+)
 
 USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
+BO_EMIT_COMPONENT_TIMING_LOGS = bool(
+    getattr(cfg, "BO_EMIT_COMPONENT_TIMING_LOGS", False)
+)
 logger = logging.getLogger(__name__)
 _BO_STUDY_RUN_TOKEN = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -41,124 +52,6 @@ def get_optuna_module():
         return optuna
     except Exception:
         return None
-
-
-def mask_iou(
-    pred_mask: np.ndarray,
-    ref_mask: np.ndarray,
-    region_mask: np.ndarray | None = None,
-) -> float:
-    """Compute IoU between binary masks inside an optional region.
-
-    Examples:
-        >>> isinstance(mask_iou.__name__, str)
-        True
-    """
-    p = np.asarray(pred_mask).astype(bool)
-    r = np.asarray(ref_mask).astype(bool)
-    if region_mask is not None:
-        reg = np.asarray(region_mask).astype(bool)
-        p = np.logical_and(p, reg)
-        r = np.logical_and(r, reg)
-    tp = float(np.logical_and(p, r).sum())
-    fp = float(np.logical_and(p, ~r).sum())
-    fn = float(np.logical_and(~p, r).sum())
-    return tp / (tp + fp + fn + 1e-8)
-
-
-def robust_objective(iou_gt: float, iou_sh: float, w_gt: float, w_sh: float) -> float:
-    return float(w_gt * iou_gt + w_sh * iou_sh)
-
-
-def _f1_optimal_threshold(
-    score_map: np.ndarray,
-    gt_mask: np.ndarray,
-    region_mask: np.ndarray,
-    bins: int = 64,
-) -> float:
-    """Approximate F1-optimal threshold on a score map.
-
-    Examples:
-        >>> isinstance(_f1_optimal_threshold.__name__, str)
-        True
-    """
-    reg = np.asarray(region_mask).astype(bool)
-    if reg.sum() == 0:
-        return 0.5
-    y_true = np.asarray(gt_mask).astype(bool)[reg]
-    y_score = np.asarray(score_map, dtype=np.float32)[reg]
-    if y_score.size == 0:
-        return 0.5
-    lo = float(np.min(y_score))
-    hi = float(np.max(y_score))
-    if not np.isfinite(lo) or not np.isfinite(hi) or abs(hi - lo) < 1e-12:
-        return float(lo if np.isfinite(lo) else 0.5)
-    thresholds = np.linspace(lo, hi, int(max(8, bins)))
-    best_thr = thresholds[0]
-    best_f1 = -1.0
-    for thr in thresholds:
-        pred = y_score >= thr
-        tp = float(np.logical_and(pred, y_true).sum())
-        fp = float(np.logical_and(pred, ~y_true).sum())
-        fn = float(np.logical_and(~pred, y_true).sum())
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        f1 = 2.0 * precision * recall / (precision + recall + 1e-8)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thr = thr
-    return float(best_thr)
-
-
-def light_deterministic_perturbations(
-    img_rgb: np.ndarray,
-    count: int,
-    seed: int,
-) -> list[np.ndarray]:
-    """Generate deterministic light perturbations for robustness scoring.
-
-    Examples:
-        >>> isinstance(light_deterministic_perturbations.__name__, str)
-        True
-    """
-    if count <= 0:
-        return []
-    base = img_rgb.astype(np.float32) / 255.0
-    rng = np.random.default_rng(int(seed))
-    outs: list[np.ndarray] = []
-    for _ in range(int(count)):
-        contrast = float(rng.uniform(0.95, 1.05))
-        brightness = float(rng.uniform(0.95, 1.05))
-        noise_sigma = float(rng.uniform(0.0, 0.01))
-        blur_sigma = float(rng.uniform(0.0, 0.6))
-        arr = (base - 0.5) * contrast + 0.5
-        arr = arr * brightness
-        if noise_sigma > 0.0:
-            arr = arr + rng.normal(0.0, noise_sigma, size=arr.shape).astype(np.float32)
-        arr = np.clip(arr, 0.0, 1.0)
-        if blur_sigma > 1e-6:
-            arr = gaussian_filter(arr, sigma=(blur_sigma, blur_sigma, 0.0))
-        outs.append(np.clip(np.round(arr * 255.0), 0, 255).astype(np.uint8))
-    return outs
-
-
-def attach_perturbations_to_contexts(
-    val_contexts: list[dict],
-    count: int,
-    seed: int,
-) -> None:
-    """Attach deterministic perturbed images to validation contexts.
-
-    Examples:
-        >>> isinstance(attach_perturbations_to_contexts.__name__, str)
-        True
-    """
-    for idx, ctx in enumerate(val_contexts):
-        ctx["perturbed_imgs"] = light_deterministic_perturbations(
-            ctx["img_b"],
-            count=count,
-            seed=seed + idx * 1009,
-        )
 
 
 def score_maps_for_image(
@@ -181,6 +74,7 @@ def score_maps_for_image(
     neg_alpha: float,
     use_prefetched: bool,
     prefetch_image_id: str | None = None,
+    emit_component_timing_logs: bool = BO_EMIT_COMPONENT_TIMING_LOGS,
 ) -> tuple[np.ndarray, np.ndarray]:
     prefetched = ctx.get("prefetched_b") if use_prefetched else None
     if prefetched is None:
@@ -215,6 +109,7 @@ def score_maps_for_image(
         prefetched_tiles=prefetched,
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
+        emit_timing_logs=bool(emit_component_timing_logs),
     )
     score_xgb = xgb_score_image_b(
         img_b,
@@ -226,6 +121,7 @@ def score_maps_for_image(
         ctx["image_id"],
         prefetched_tiles=prefetched,
         context_radius=context_radius,
+        emit_timing_logs=bool(emit_component_timing_logs),
     )
     score_knn = _apply_roads_penalty(score_knn, ctx["roads_mask"], roads_penalty)
     score_xgb = _apply_roads_penalty(score_xgb, ctx["roads_mask"], roads_penalty)
@@ -443,7 +339,11 @@ def _predict_champion_shadow(
     use_prefetched: bool,
     prefetch_image_id: str | None = None,
     use_dynamic_f1_threshold: bool = False,
+    trial_timer: TrialPhaseTimer | None = None,
+    phase_prefix: str = "base",
+    emit_component_timing_logs: bool = BO_EMIT_COMPONENT_TIMING_LOGS,
 ) -> np.ndarray:
+    t_phase0 = time.perf_counter()
     score_knn, score_xgb = score_maps_for_image(
         img_b=img_b,
         ctx=ctx,
@@ -463,7 +363,13 @@ def _predict_champion_shadow(
         neg_alpha=neg_alpha,
         use_prefetched=use_prefetched,
         prefetch_image_id=prefetch_image_id,
+        emit_component_timing_logs=emit_component_timing_logs,
     )
+    if trial_timer is not None:
+        trial_timer.add_duration(
+            f"score_{phase_prefix}_knn_xgb_s", time.perf_counter() - t_phase0
+        )
+    t_phase0 = time.perf_counter()
     thr = threshold_knn_xgb(
         score_knn,
         score_xgb,
@@ -474,15 +380,20 @@ def _predict_champion_shadow(
         top_p_min=top_p_min,
         top_p_max=top_p_max,
     )
+    if trial_timer is not None:
+        trial_timer.add_duration(
+            f"threshold_{phase_prefix}_s", time.perf_counter() - t_phase0
+        )
     champion_score = score_knn if champion_source == "raw" else score_xgb
     champion_thr = thr["knn_thr"] if champion_source == "raw" else thr["xgb_thr"]
     if use_dynamic_f1_threshold:
-        champion_thr = _f1_optimal_threshold(
+        champion_thr = f1_optimal_threshold(
             champion_score,
             ctx["gt_mask_eval"],
             ctx["sh_buffer_mask"],
             bins=int(getattr(cfg, "BO_DYNAMIC_THRESHOLD_BINS", 64) or 64),
         )
+    t_phase0 = time.perf_counter()
     champion_crf, champion_prob = refine_with_densecrf(
         img_b,
         champion_score,
@@ -497,8 +408,11 @@ def _predict_champion_shadow(
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
         return_prob=True,
     )
+    if trial_timer is not None:
+        trial_timer.add_duration("crf_s", time.perf_counter() - t_phase0)
     bridged = champion_crf
     if bridge_cfg is not None:
+        t_phase0 = time.perf_counter()
         bridged = bridge_skeleton_gaps(
             champion_crf,
             champion_prob,
@@ -509,7 +423,10 @@ def _predict_champion_shadow(
             min_component_area_px=int(bridge_cfg["bridge_min_component_px"]),
             spur_prune_iters=int(bridge_cfg["bridge_spur_prune_iters"]),
         )
-    return _apply_shadow_filter(
+        if trial_timer is not None:
+            trial_timer.add_duration("bridge_s", time.perf_counter() - t_phase0)
+    t_phase0 = time.perf_counter()
+    shadow = _apply_shadow_filter(
         img_b,
         bridged,
         shadow_cfg["weights"],
@@ -517,6 +434,9 @@ def _predict_champion_shadow(
         champion_score,
         shadow_cfg.get("protect_score"),
     )
+    if trial_timer is not None:
+        trial_timer.add_duration("shadow_s", time.perf_counter() - t_phase0)
+    return shadow
 
 
 def run_stage1_bayes(
@@ -538,6 +458,8 @@ def run_stage1_bayes(
     w_gt, w_sh = objective_weights(cfg)
 
     def objective(trial):
+        trial_t0 = time.perf_counter()
+        timer = TrialPhaseTimer()
         roads_penalty = _suggest_float_param(
             trial,
             name="roads_penalty",
@@ -609,6 +531,7 @@ def run_stage1_bayes(
         weights = []
 
         for step, ctx in enumerate(val_contexts):
+            t_phase0 = time.perf_counter()
             score_knn, score_xgb = score_maps_for_image(
                 img_b=ctx["img_b"],
                 ctx=ctx,
@@ -627,7 +550,10 @@ def run_stage1_bayes(
                 neg_bank=neg_bank,
                 neg_alpha=neg_alpha,
                 use_prefetched=True,
+                emit_component_timing_logs=BO_EMIT_COMPONENT_TIMING_LOGS,
             )
+            timer.add_duration("score_base_knn_xgb_s", time.perf_counter() - t_phase0)
+            t_phase0 = time.perf_counter()
             thr = threshold_knn_xgb(
                 score_knn,
                 score_xgb,
@@ -638,6 +564,8 @@ def run_stage1_bayes(
                 top_p_min=top_p_min,
                 top_p_max=top_p_max,
             )
+            timer.add_duration("threshold_base_s", time.perf_counter() - t_phase0)
+            t_phase0 = time.perf_counter()
             metrics_knn = compute_metrics(thr["mask_knn"], ctx["gt_mask_eval"])
             metrics_xgb = compute_metrics(thr["mask_xgb"], ctx["gt_mask_eval"])
             for key in knn_stats:
@@ -648,9 +576,11 @@ def run_stage1_bayes(
             if dilate_px > 0:
                 core_mask = binary_dilation(core_mask, disk(dilate_px))
             iou_gt = float(compute_metrics(core_mask, ctx["gt_mask_eval"])["iou"])
+            timer.add_duration("metrics_base_s", time.perf_counter() - t_phase0)
 
             sh_ious = []
             for p_idx, p_img in enumerate(ctx.get("perturbed_imgs", [])):
+                t_phase0 = time.perf_counter()
                 score_knn_p, score_xgb_p = score_maps_for_image(
                     img_b=p_img,
                     ctx=ctx,
@@ -670,7 +600,13 @@ def run_stage1_bayes(
                     neg_alpha=neg_alpha,
                     use_prefetched=False,
                     prefetch_image_id=f"{ctx['image_id']}_bo_p{p_idx}",
+                    emit_component_timing_logs=BO_EMIT_COMPONENT_TIMING_LOGS,
                 )
+                timer.add_duration(
+                    "score_perturb_knn_xgb_s",
+                    time.perf_counter() - t_phase0,
+                )
+                t_phase0 = time.perf_counter()
                 thr_p = threshold_knn_xgb(
                     score_knn_p,
                     score_xgb_p,
@@ -681,12 +617,18 @@ def run_stage1_bayes(
                     top_p_min=top_p_min,
                     top_p_max=top_p_max,
                 )
+                timer.add_duration(
+                    "threshold_perturb_s",
+                    time.perf_counter() - t_phase0,
+                )
                 core_mask_p = np.logical_and(thr_p["mask_knn"], thr_p["mask_xgb"])
                 if dilate_px > 0:
                     core_mask_p = binary_dilation(core_mask_p, disk(dilate_px))
+                t_phase0 = time.perf_counter()
                 sh_ious.append(
                     mask_iou(core_mask_p, ctx["labels_sh"] > 0, ctx["sh_buffer_mask"])
                 )
+                timer.add_duration("metrics_perturb_s", time.perf_counter() - t_phase0)
             iou_sh = (
                 float(np.mean(sh_ious))
                 if sh_ious
@@ -700,6 +642,7 @@ def run_stage1_bayes(
             core_gt_vals.append(iou_gt)
             core_sh_vals.append(iou_sh)
             weights.append(float(ctx["gt_weight"]))
+            set_trial_timing_attrs(trial, timer, trial_t0=trial_t0)
             trial.report(float(weighted_mean(core_vals, weights)), step=step)
             if bool(getattr(cfg, "BO_ENABLE_PRUNING", True)) and trial.should_prune():
                 raise optuna_mod.TrialPruned()
@@ -726,6 +669,7 @@ def run_stage1_bayes(
             trial.set_user_attr(
                 f"xgb_{key}", float(weighted_mean(xgb_stats[key], weights))
             )
+        set_trial_timing_attrs(trial, timer, trial_t0=trial_t0)
         return float(weighted_mean(core_vals, weights))
 
     study = make_optuna_study(
@@ -932,6 +876,8 @@ def run_stage2_bayes(
         return crf_cfg, shadow_cfg, shadow_weight_idx
 
     def _objective_with_refine(trial, refine: dict | None = None):
+        trial_t0 = time.perf_counter()
+        timer = TrialPhaseTimer()
         crf_cfg, shadow_cfg, shadow_weight_idx = _suggest_stage2(trial, refine=refine)
         vals = []
         gt_vals = []
@@ -968,8 +914,13 @@ def run_stage2_bayes(
                 use_dynamic_f1_threshold=bool(
                     getattr(cfg, "BO_USE_DYNAMIC_F1_THRESHOLD", False)
                 ),
+                trial_timer=timer,
+                phase_prefix="base",
+                emit_component_timing_logs=BO_EMIT_COMPONENT_TIMING_LOGS,
             )
+            t_phase0 = time.perf_counter()
             iou_gt = float(compute_metrics(shadow, ctx["gt_mask_eval"])["iou"])
+            timer.add_duration("metrics_base_s", time.perf_counter() - t_phase0)
             sh_ious = []
             for p_idx, p_img in enumerate(ctx.get("perturbed_imgs", [])):
                 shadow_p = _predict_champion_shadow(
@@ -1002,10 +953,15 @@ def run_stage2_bayes(
                     use_dynamic_f1_threshold=bool(
                         getattr(cfg, "BO_USE_DYNAMIC_F1_THRESHOLD", False)
                     ),
+                    trial_timer=timer,
+                    phase_prefix="perturb",
+                    emit_component_timing_logs=BO_EMIT_COMPONENT_TIMING_LOGS,
                 )
+                t_phase0 = time.perf_counter()
                 sh_ious.append(
                     mask_iou(shadow_p, ctx["labels_sh"] > 0, ctx["sh_buffer_mask"])
                 )
+                timer.add_duration("metrics_perturb_s", time.perf_counter() - t_phase0)
             iou_sh = (
                 float(np.mean(sh_ious))
                 if sh_ious
@@ -1019,6 +975,7 @@ def run_stage2_bayes(
             gt_vals.append(iou_gt)
             sh_vals.append(iou_sh)
             weights.append(float(ctx["gt_weight"]))
+            set_trial_timing_attrs(trial, timer, trial_t0=trial_t0)
             trial.report(float(weighted_mean(vals, weights)), step=step)
             if bool(getattr(cfg, "BO_ENABLE_PRUNING", True)) and trial.should_prune():
                 raise optuna_mod.TrialPruned()
@@ -1033,6 +990,7 @@ def run_stage2_bayes(
         trial.set_user_attr("shadow_weight_idx", int(shadow_weight_idx))
         trial.set_user_attr("shadow_threshold", int(shadow_cfg["threshold"]))
         trial.set_user_attr("shadow_protect_score", float(shadow_cfg["protect_score"]))
+        set_trial_timing_attrs(trial, timer, trial_t0=trial_t0)
         return float(weighted_mean(vals, weights))
 
     stage2_broad = make_optuna_study(
@@ -1233,6 +1191,7 @@ def run_stage3_bayes(
             neg_bank=neg_bank,
             neg_alpha=neg_alpha,
             use_prefetched=True,
+            emit_component_timing_logs=BO_EMIT_COMPONENT_TIMING_LOGS,
         )
         thr = threshold_knn_xgb(
             score_knn,
@@ -1281,6 +1240,7 @@ def run_stage3_bayes(
                 neg_alpha=neg_alpha,
                 use_prefetched=False,
                 prefetch_image_id=f"{ctx['image_id']}_bo_p{p_idx}",
+                emit_component_timing_logs=BO_EMIT_COMPONENT_TIMING_LOGS,
             )
             thr_p = threshold_knn_xgb(
                 s_knn_p,
@@ -1330,6 +1290,8 @@ def run_stage3_bayes(
         )
 
     def objective(trial):
+        trial_t0 = time.perf_counter()
+        timer = TrialPhaseTimer()
         bridge_cfg = {
             "bridge_max_gap_px": _suggest_int_param(
                 trial,
@@ -1380,6 +1342,7 @@ def run_stage3_bayes(
         weights = []
         for step, entry in enumerate(cached_entries):
             ctx = entry["ctx"]
+            t_phase0 = time.perf_counter()
             bridged = bridge_skeleton_gaps(
                 entry["crf"],
                 entry["prob"],
@@ -1390,6 +1353,8 @@ def run_stage3_bayes(
                 min_component_area_px=int(bridge_cfg["bridge_min_component_px"]),
                 spur_prune_iters=int(bridge_cfg["bridge_spur_prune_iters"]),
             )
+            timer.add_duration("bridge_s", time.perf_counter() - t_phase0)
+            t_phase0 = time.perf_counter()
             shadow = _apply_shadow_filter(
                 entry["img"],
                 bridged,
@@ -1398,9 +1363,13 @@ def run_stage3_bayes(
                 entry["score"],
                 best_shadow_cfg.get("protect_score"),
             )
+            timer.add_duration("shadow_s", time.perf_counter() - t_phase0)
+            t_phase0 = time.perf_counter()
             iou_gt = float(compute_metrics(shadow, ctx["gt_mask_eval"])["iou"])
+            timer.add_duration("metrics_base_s", time.perf_counter() - t_phase0)
             sh_ious = []
             for p_entry in entry["perturbed"]:
+                t_phase0 = time.perf_counter()
                 bridged_p = bridge_skeleton_gaps(
                     p_entry["crf"],
                     p_entry["prob"],
@@ -1411,6 +1380,8 @@ def run_stage3_bayes(
                     min_component_area_px=int(bridge_cfg["bridge_min_component_px"]),
                     spur_prune_iters=int(bridge_cfg["bridge_spur_prune_iters"]),
                 )
+                timer.add_duration("bridge_s", time.perf_counter() - t_phase0)
+                t_phase0 = time.perf_counter()
                 shadow_p = _apply_shadow_filter(
                     p_entry["img"],
                     bridged_p,
@@ -1419,9 +1390,12 @@ def run_stage3_bayes(
                     p_entry["score"],
                     best_shadow_cfg.get("protect_score"),
                 )
+                timer.add_duration("shadow_s", time.perf_counter() - t_phase0)
+                t_phase0 = time.perf_counter()
                 sh_ious.append(
                     mask_iou(shadow_p, ctx["labels_sh"] > 0, ctx["sh_buffer_mask"])
                 )
+                timer.add_duration("metrics_perturb_s", time.perf_counter() - t_phase0)
             iou_sh = (
                 float(np.mean(sh_ious))
                 if sh_ious
@@ -1435,6 +1409,7 @@ def run_stage3_bayes(
             gt_vals.append(iou_gt)
             sh_vals.append(iou_sh)
             weights.append(float(ctx["gt_weight"]))
+            set_trial_timing_attrs(trial, timer, trial_t0=trial_t0)
             trial.report(float(weighted_mean(vals, weights)), step=step)
             if bool(getattr(cfg, "BO_ENABLE_PRUNING", True)) and trial.should_prune():
                 raise optuna_mod.TrialPruned()
@@ -1443,6 +1418,7 @@ def run_stage3_bayes(
         trial.set_user_attr("weighted_iou_sh", float(weighted_mean(sh_vals, weights)))
         for key, value in bridge_cfg.items():
             trial.set_user_attr(key, value)
+        set_trial_timing_attrs(trial, timer, trial_t0=trial_t0)
         return float(weighted_mean(vals, weights))
 
     study = make_optuna_study(

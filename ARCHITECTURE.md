@@ -54,9 +54,12 @@ interfaces, and run artifacts.
      - Sampler: configurable (`BO_SAMPLER`), default TPE.
      - Study lifecycle: fresh-by-default namespacing with
        `BO_FORCE_NEW_STUDY` to avoid accidental resume from old trial history.
-     - Trial telemetry: each trial logs objective, proxy loss (`1-objective`),
-       IoU metrics, best-so-far value, and readable progress separators
-       (for example `==== Stage2 Broad Trial 3/40 ====`).
+- Trial telemetry: each trial logs objective, proxy loss (`1-objective`),
+  IoU metrics, best-so-far value, and readable progress separators
+  (for example `==== Stage2 Broad Trial 3/40 ====`).
+  - Compact timing suffix mode:
+    when enabled, each trial log line can append one short timing summary
+    instead of emitting per-image component timing logs.
 6. Run fixed-setting inference on validation tiles (metrics + plots).
 7. Run fixed-setting inference on holdout tiles (plots + union exports + resume log).
 8. Emit per-tile explainability artifacts (XGB+kNN) during validation and capped holdout.
@@ -139,6 +142,12 @@ Run outputs are rooted at `output/run_XXX/`:
 - BO perturbation feature cache:
   `_bo` feature prefetches now use disk cache in `FEATURE_DIR` so repeated
   perturbation evaluations can reuse cached tiles rather than recomputing all tiles.
+- Resize hot path acceleration:
+  kNN and XGB patch-to-pixel interpolation prefer CUDA bilinear resize when
+  `USE_GPU_RESIZE=True` (fallback remains CPU resize path).
+- XGB runtime diagnostics:
+  `xgb_score_image_b` now logs image-level total/predict/resize timings,
+  mirroring kNN timing introspection.
 - Bayesian stagnation guard:
   Optuna studies can stop early after `BO_EARLY_STOP_PATIENCE` non-improving trials
   (with tolerance `BO_EARLY_STOP_MIN_DELTA`).
@@ -148,6 +157,12 @@ Run outputs are rooted at `output/run_XXX/`:
   run-level hyperparameter importances JSON (`BO_IMPORTANCE_FILENAME`) and CSV
   (`BO_IMPORTANCE_CSV_FILENAME`), plus trial time series CSV
   (`BO_TRIALS_CSV_FILENAME`) from Optuna storage.
+- Bayesian phase timing artifact:
+  run-level compact phase timing CSV (`BO_TRIAL_PHASE_TIMING_CSV_FILENAME`)
+  with one row per trial (`bayes_trial_phase_timing.csv` by default).
+- Bayesian log-noise guard:
+  `BO_EMIT_COMPONENT_TIMING_LOGS=False` suppresses repeated kNN/XGB image-level
+  timing lines inside Bayes tuning while preserving compact trial summaries.
 - Champion selection: choose better of `knn_raw` and `xgb_raw` by weighted validation IoU.
 - Post-processing chain: champion raw -> CRF -> optional bridge -> shadow.
 - Silver core: `kNN ∩ XGB` (optional dilation) exported as auxiliary stream.

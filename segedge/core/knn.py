@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from numpy import ndarray
 from skimage.transform import resize
 
@@ -30,6 +31,40 @@ from .timing_utils import DEBUG_TIMING, time_end, time_end_tile, time_start
 logger = logging.getLogger(__name__)
 
 
+def _resize_patch_map(
+    patch_map_t: torch.Tensor,
+    out_h: int,
+    out_w: int,
+    *,
+    use_gpu_resize: bool,
+) -> np.ndarray:
+    """Resize a patch-grid map to pixel space, preferring CUDA interpolation.
+
+    Examples:
+        >>> isinstance(_resize_patch_map.__name__, str)
+        True
+    """
+    patch_map_t = patch_map_t.float()
+    if use_gpu_resize and patch_map_t.device.type == "cuda":
+        with torch.no_grad():
+            resized_t = F.interpolate(
+                patch_map_t.unsqueeze(0).unsqueeze(0),
+                size=(out_h, out_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return resized_t.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+    patch_map = patch_map_t.detach().cpu().numpy()
+    return resize(
+        patch_map,
+        (out_h, out_w),
+        order=1,
+        preserve_range=True,
+        anti_aliasing=True,
+    ).astype(np.float32)
+
+
 def zero_shot_knn_single_scale_B_with_saliency(
     img_b: np.ndarray,
     pos_bank: np.ndarray,
@@ -48,6 +83,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     prefetched_tiles: dict | None = None,
     use_fp16_matmul: bool = False,
     context_radius: int = 0,
+    emit_timing_logs: bool = True,
 ) -> tuple[ndarray, ndarray]:
     """Compute kNN transfer scores on Image B using GPU matmul.
 
@@ -69,6 +105,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
         prefetched_tiles (dict | None): Optional in-memory feature cache.
         use_fp16_matmul (bool): Enable half precision on CUDA for speed.
         context_radius (int): Feature context radius.
+        emit_timing_logs (bool): If False, suppress image-level timing/info logs.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: Score map and saliency map.
@@ -100,25 +137,29 @@ def zero_shot_knn_single_scale_B_with_saliency(
         )
         k_neg_eff = min(k, neg_bank_t.shape[0])
         use_neg = True
-        logger.info(
-            "zero_shot: using negative bank size=%s, k_neg_eff=%s, alpha=%s",
-            neg_bank_t.shape[0],
-            k_neg_eff,
-            neg_alpha,
-        )
+        if emit_timing_logs:
+            logger.info(
+                "zero_shot: using negative bank size=%s, k_neg_eff=%s, alpha=%s",
+                neg_bank_t.shape[0],
+                k_neg_eff,
+                neg_alpha,
+            )
     else:
         neg_bank_t = None
         neg_bank_t_half = None
         k_neg_eff = 0
         use_neg = False
-        logger.info("zero_shot: negative bank disabled (neg_bank is None)")
+        if emit_timing_logs:
+            logger.info("zero_shot: negative bank disabled (neg_bank is None)")
 
     matmul_time = resize_time = 0.0
+    use_gpu_resize = bool(getattr(cfg, "USE_GPU_RESIZE", True))
     if prefetched_tiles is not None:
         tile_items = sorted(prefetched_tiles.items())
-        logger.info(
-            "zero_shot: using prefetched features for %s tiles", len(tile_items)
-        )
+        if emit_timing_logs:
+            logger.info(
+                "zero_shot: using prefetched features for %s tiles", len(tile_items)
+            )
         tile_iter = ((y, x, info) for (y, x), info in tile_items)
     else:
         tile_iter = (
@@ -218,26 +259,23 @@ def zero_shot_knn_single_scale_B_with_saliency(
                 score_batch = score_pos
             if DEBUG_TIMING and t_matmul0 is not None:
                 matmul_time += time.perf_counter() - t_matmul0
-        score_patch = score_batch.cpu().numpy().reshape(hp, wp)
-        sims_pos = sims_pos_topk.float().cpu().numpy()
-        weights = sims_pos / (sims_pos.sum(axis=1, keepdims=True) + 1e-8)
-        saliency_vals = (weights * sims_pos).sum(axis=1)
-        saliency_patch = saliency_vals.reshape(hp, wp)
+        score_patch_t = score_batch.reshape(hp, wp)
+        sims_pos = sims_pos_topk.float()
+        weights = sims_pos / (sims_pos.sum(dim=1, keepdim=True) + 1e-8)
+        saliency_patch_t = (weights * sims_pos).sum(dim=1).reshape(hp, wp)
         t_resize0 = time.perf_counter() if DEBUG_TIMING else None
-        score_tile = resize(
-            score_patch,
-            (h_eff, w_eff),
-            order=1,
-            preserve_range=True,
-            anti_aliasing=True,
-        ).astype(np.float32)
-        saliency_tile = resize(
-            saliency_patch,
-            (h_eff, w_eff),
-            order=1,
-            preserve_range=True,
-            anti_aliasing=True,
-        ).astype(np.float32)
+        score_tile = _resize_patch_map(
+            score_patch_t,
+            h_eff,
+            w_eff,
+            use_gpu_resize=use_gpu_resize,
+        )
+        saliency_tile = _resize_patch_map(
+            saliency_patch_t,
+            h_eff,
+            w_eff,
+            use_gpu_resize=use_gpu_resize,
+        )
         score_full[y : y + h_eff, x : x + w_eff] += score_tile
         saliency_full[y : y + h_eff, x : x + w_eff] += saliency_tile
         weight_full[y : y + h_eff, x : x + w_eff] += 1.0
@@ -249,21 +287,22 @@ def zero_shot_knn_single_scale_B_with_saliency(
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     saliency_full[mask_nonzero] /= weight_full[mask_nonzero]
     total_s = time.perf_counter() - t0_wall
-    time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
-    logger.info(
-        "zero_shot image=%s k=%s total=%.3fs tiles=%s (cached=%s, computed=%s, skipped=%s)",
-        image_id or "<unknown>",
-        k,
-        total_s,
-        tile_total,
-        cached_tiles,
-        computed_tiles,
-        skipped_tiles,
-    )
-    if DEBUG_TIMING:
+    if emit_timing_logs:
+        time_end(f"zero_shot_knn_single_scale_B_with_saliency (GPU, k={k})", t0)
         logger.info(
-            "k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time
+            "zero_shot image=%s k=%s total=%.3fs tiles=%s (cached=%s, computed=%s, skipped=%s)",
+            image_id or "<unknown>",
+            k,
+            total_s,
+            tile_total,
+            cached_tiles,
+            computed_tiles,
+            skipped_tiles,
         )
+        if DEBUG_TIMING:
+            logger.info(
+                "k=%s matmul_time=%.2fs, resize_time=%.2fs", k, matmul_time, resize_time
+            )
     return score_full, saliency_full
 
 

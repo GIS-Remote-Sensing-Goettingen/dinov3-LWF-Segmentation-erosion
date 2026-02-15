@@ -9,6 +9,7 @@ from pathlib import Path
 
 from segedge.core.optuna_csv import (
     collect_optuna_trials_from_storage,
+    write_bayes_trial_phase_timing_csv,
     write_optuna_importance_csv,
     write_optuna_trials_csv,
 )
@@ -150,3 +151,41 @@ def test_write_optuna_importance_csv_writes_stage_rows(tmp_path: Path) -> None:
     assert len(rows) == 3
     assert rows[0]["stage"] == "stage1"
     assert rows[-1]["stage"] == "stage2"
+
+
+def test_write_bayes_trial_phase_timing_csv_writes_compact_rows(
+    tmp_path: Path,
+) -> None:
+    """Phase timing CSV writer should flatten trial attrs into fixed columns.
+
+    Examples:
+        >>> True
+        True
+    """
+    out_path = tmp_path / "bayes_trial_phase_timing.csv"
+    rows = [
+        {
+            "timestamp_utc": "2026-02-11T12:00:00",
+            "stage": "stage1_raw",
+            "study_name": "demo_stage1",
+            "trial_index_stage": 0,
+            "trial_number_global": 1,
+            "state": "COMPLETE",
+            "objective": 0.42,
+            "duration_s": 11.2,
+            "is_best_so_far": 1,
+            "attr__trial_total_s": 11.0,
+            "attr__score_base_knn_xgb_s": 3.0,
+            "attr__score_perturb_knn_xgb_s": 5.0,
+            "attr__threshold_perturb_s": 1.0,
+            "attr__metrics_perturb_s": 0.5,
+        }
+    ]
+    write_bayes_trial_phase_timing_csv(str(out_path), rows)
+    with out_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        saved = list(reader)
+    assert len(saved) == 1
+    assert saved[0]["stage"] == "stage1_raw"
+    assert float(saved[0]["trial_total_s"]) == 11.0
+    assert float(saved[0]["perturb_share_pct"]) > 0.0
