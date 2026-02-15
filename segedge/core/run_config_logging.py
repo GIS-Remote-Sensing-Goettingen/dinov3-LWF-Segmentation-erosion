@@ -76,12 +76,15 @@ def log_training_ablation_summary(
     )
     if tuning_mode == "bayes":
         logger.info(
-            "train ablation (bayes): stage_trials=%s/%s/%s objective_w=(gt=%.3f, sh=%.3f)",
+            "train ablation (bayes): stage_trials=%s/%s/%s "
+            "objective_w=(gt=%.3f, sh=%.3f) fresh_study=%s trial_separators=%s",
             int(getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50),
             int(getattr(cfg, "BO_STAGE2_TRIALS", 40) or 40),
             int(getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30),
             float(getattr(cfg, "BO_OBJECTIVE_W_GT", 0.8)),
             float(getattr(cfg, "BO_OBJECTIVE_W_SH", 0.2)),
+            bool(getattr(cfg, "BO_FORCE_NEW_STUDY", True)),
+            bool(getattr(cfg, "BO_VERBOSE_TRIAL_SEPARATORS", True)),
         )
         logger.info(
             "train ablation (bayes ranges): k=%s neg_alpha=%s roads=%s top_p_a=%s top_p_b=%s",

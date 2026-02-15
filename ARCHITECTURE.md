@@ -52,8 +52,11 @@ interfaces, and run artifacts.
          `enqueue_trial(...)`.
      - Stage 3: bridge/skeleton continuity parameters with frozen upstream maps.
      - Sampler: configurable (`BO_SAMPLER`), default TPE.
+     - Study lifecycle: fresh-by-default namespacing with
+       `BO_FORCE_NEW_STUDY` to avoid accidental resume from old trial history.
      - Trial telemetry: each trial logs objective, proxy loss (`1-objective`),
-       IoU metrics, and best-so-far value.
+       IoU metrics, best-so-far value, and readable progress separators
+       (for example `==== Stage2 Broad Trial 3/40 ====`).
 6. Run fixed-setting inference on validation tiles (metrics + plots).
 7. Run fixed-setting inference on holdout tiles (plots + union exports + resume log).
 8. Emit per-tile explainability artifacts (XGB+kNN) during validation and capped holdout.
@@ -99,6 +102,7 @@ Telemetry controls:
 - `DEBUG_TIMING`
 - `TIMING_TILE_LOGS` (set `False` to suppress per-tile timing lines and keep
   image-level summaries)
+- `BO_VERBOSE_TRIAL_SEPARATORS` (set `True` for highly-readable Bayes trial logs)
 
 ## Explainability Architecture
 Tier-1 explainability is generated online during inference:
@@ -132,6 +136,9 @@ Run outputs are rooted at `output/run_XXX/`:
   `p = clip(a * buffer_density + b, p_min, p_max)`.
 - Robust tuning objective (Bayesian mode):
   `score = w_gt * IoU_GT + w_sh * IoU_SH`, with optional light image perturbations.
+- BO perturbation feature cache:
+  `_bo` feature prefetches now use disk cache in `FEATURE_DIR` so repeated
+  perturbation evaluations can reuse cached tiles rather than recomputing all tiles.
 - Bayesian stagnation guard:
   Optuna studies can stop early after `BO_EARLY_STOP_PATIENCE` non-improving trials
   (with tolerance `BO_EARLY_STOP_MIN_DELTA`).

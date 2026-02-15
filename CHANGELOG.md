@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.40]
+- Description: Fix Bayesian `_bo` feature caching to reuse disk cache, force fresh Optuna studies by default, and improve Bayes trial-log readability with explicit trial separators/progress counters.
+- file touched: `config.py`, `segedge/pipeline/tuning_bayes.py`, `segedge/core/optuna_feedback.py`, `segedge/core/run_config_logging.py`, `tests/test_optuna_feedback.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Long tuning runs were still recomputing perturbation features, sometimes resuming old studies unexpectedly, and producing hard-to-parse trial logs.
+- problems fixed: `_bo` prefetch now uses `feature_dir` cache, stage studies default to fresh run names (`BO_FORCE_NEW_STUDY`), and trial logging prints clearer stage separators and progress (`==== StageX Trial i/N ====`) with result lines.
+
 ## [0.2.39]
 - Description: Add per-trial Bayesian IoU/loss feedback logging, switch feature caching to on-disk Ceph storage, and reduce default Bayes trial budgets for faster iteration.
 - file touched: `config.py`, `segedge/pipeline/tuning_bayes.py`, `segedge/core/optuna_feedback.py`, `segedge/core/run_config_logging.py`, `CHANGELOG.md`

@@ -209,6 +209,12 @@ BO_TPE_GROUP = True
 BO_STORAGE_PATH = "output/optuna_tuning.db"
 BO_STUDY_NAME = "segedge_tuning"
 BO_STUDY_TAG = "v2_ranges"
+# If True, force a fresh study namespace for each run (prevents accidental resume).
+BO_FORCE_NEW_STUDY = True
+# Optional explicit run tag for fresh studies (None => auto timestamp token).
+BO_STUDY_RUN_TAG = None
+# If True, print clearer trial separators in Bayes tuning logs.
+BO_VERBOSE_TRIAL_SEPARATORS = True
 BO_IMPORTANCE_FILENAME = "bayes_hyperparam_importances.json"
 BO_IMPORTANCE_CSV_FILENAME = "bayes_hyperparam_importances.csv"
 BO_TRIALS_CSV_FILENAME = "bayes_trials_timeseries.csv"

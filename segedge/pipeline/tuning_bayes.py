@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+from datetime import datetime, timezone
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, median_filter
@@ -28,6 +30,8 @@ from .inference_utils import (
 )
 
 USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
+logger = logging.getLogger(__name__)
+_BO_STUDY_RUN_TOKEN = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def get_optuna_module():
@@ -176,15 +180,11 @@ def score_maps_for_image(
     neg_bank: np.ndarray | None,
     neg_alpha: float,
     use_prefetched: bool,
+    prefetch_image_id: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute roads-penalized kNN/XGB score maps for one image.
-
-    Examples:
-        >>> isinstance(score_maps_for_image.__name__, str)
-        True
-    """
     prefetched = ctx.get("prefetched_b") if use_prefetched else None
     if prefetched is None:
+        cache_image_id = prefetch_image_id or f"{ctx['image_id']}_bo"
         prefetched = prefetch_features_single_scale_image(
             img_b,
             model,
@@ -194,8 +194,8 @@ def score_maps_for_image(
             tile_size,
             stride,
             None,
-            None,
-            f"{ctx['image_id']}_bo",
+            feature_dir,
+            cache_image_id,
         )
     score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
         img_b=img_b,
@@ -243,12 +243,6 @@ def threshold_knn_xgb(
     top_p_min: float,
     top_p_max: float,
 ) -> dict:
-    """Threshold kNN/XGB score maps using adaptive top-p inside SH buffer.
-
-    Examples:
-        >>> isinstance(threshold_knn_xgb.__name__, str)
-        True
-    """
     p_val = _compute_top_p(buffer_density, top_p_a, top_p_b, top_p_min, top_p_max)
     knn_thr, mask_knn = _top_p_threshold(score_knn, sh_buffer_mask, p_val)
     xgb_thr, mask_xgb = _top_p_threshold(score_xgb, sh_buffer_mask, p_val)
@@ -263,12 +257,6 @@ def threshold_knn_xgb(
 
 
 def make_optuna_study(optuna_mod, stage_name: str, seed: int):
-    """Create an Optuna study with deterministic sampler/pruner settings.
-
-    Examples:
-        >>> isinstance(make_optuna_study.__name__, str)
-        True
-    """
     sampler_name = str(getattr(cfg, "BO_SAMPLER", "tpe")).strip().lower()
     if sampler_name == "cmaes":
         sampler = optuna_mod.samplers.CmaEsSampler(
@@ -290,9 +278,20 @@ def make_optuna_study(optuna_mod, stage_name: str, seed: int):
     )
     pruner_obj = pruner if bool(getattr(cfg, "BO_ENABLE_PRUNING", True)) else None
     storage_path = getattr(cfg, "BO_STORAGE_PATH", None)
+    force_new = bool(getattr(cfg, "BO_FORCE_NEW_STUDY", True))
+    run_tag = str(getattr(cfg, "BO_STUDY_RUN_TAG", "") or "").strip()
     tag = str(getattr(cfg, "BO_STUDY_TAG", "") or "").strip()
     base = f"{getattr(cfg, 'BO_STUDY_NAME', 'segedge_tuning')}_{stage_name}"
     study_name = f"{base}_{tag}" if tag else base
+    if force_new:
+        study_name = f"{study_name}_{run_tag or _BO_STUDY_RUN_TOKEN}"
+    logger.info(
+        "optuna study: stage=%s name=%s fresh=%s storage=%s",
+        stage_name,
+        study_name,
+        force_new,
+        storage_path,
+    )
     if storage_path:
         return optuna_mod.create_study(
             direction="maximize",
@@ -310,14 +309,12 @@ def make_optuna_study(optuna_mod, stage_name: str, seed: int):
 
 
 def _suggest_from_values(trial, name: str, values: list[float | int]):
-    """Suggest a value from a finite list. >>> isinstance(_suggest_from_values.__name__, str)"""
     if len(values) == 1:
         return values[0]
     return trial.suggest_categorical(name, list(values))
 
 
 def _range_spec(key: str) -> tuple | None:
-    """Return a normalized range tuple from config. >>> isinstance(_range_spec.__name__, str)"""
     value = getattr(cfg, key, None)
     if isinstance(value, (list, tuple)) and len(value) in (2, 3):
         return tuple(value)
@@ -333,12 +330,7 @@ def _suggest_int_param(
     default_values: list[int],
     override: tuple | list | None = None,
 ) -> int:
-    """Suggest an integer parameter with range-first precedence.
-
-    Examples:
-        >>> isinstance(_suggest_int_param.__name__, str)
-        True
-    """
+    """Suggest an integer parameter with range-first precedence."""
     if override is not None:
         if isinstance(override, tuple):
             if len(override) == 3:
@@ -378,12 +370,7 @@ def _suggest_float_param(
     log: bool = False,
     override: tuple | list | None = None,
 ) -> float:
-    """Suggest a float parameter with range-first precedence.
-
-    Examples:
-        >>> isinstance(_suggest_float_param.__name__, str)
-        True
-    """
+    """Suggest a float parameter with range-first precedence."""
     if override is not None:
         if isinstance(override, tuple):
             return float(
@@ -410,7 +397,6 @@ def _suggest_float_param(
 
 
 def _extract_study_importances(optuna_mod, study) -> dict[str, float]:
-    """Extract Optuna parameter importances when available."""
     try:
         raw = optuna_mod.importance.get_param_importances(study)
         out: dict[str, float] = {}
@@ -423,7 +409,6 @@ def _extract_study_importances(optuna_mod, study) -> dict[str, float]:
 
 
 def write_bo_importances_file(output_path: str, payload: dict) -> None:
-    """Write a JSON artifact with stage-wise hyperparameter importances."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
@@ -456,6 +441,7 @@ def _predict_champion_shadow(
     neg_bank: np.ndarray | None,
     neg_alpha: float,
     use_prefetched: bool,
+    prefetch_image_id: str | None = None,
     use_dynamic_f1_threshold: bool = False,
 ) -> np.ndarray:
     score_knn, score_xgb = score_maps_for_image(
@@ -476,6 +462,7 @@ def _predict_champion_shadow(
         neg_bank=neg_bank,
         neg_alpha=neg_alpha,
         use_prefetched=use_prefetched,
+        prefetch_image_id=prefetch_image_id,
     )
     thr = threshold_knn_xgb(
         score_knn,
@@ -663,7 +650,7 @@ def run_stage1_bayes(
             iou_gt = float(compute_metrics(core_mask, ctx["gt_mask_eval"])["iou"])
 
             sh_ious = []
-            for p_img in ctx.get("perturbed_imgs", []):
+            for p_idx, p_img in enumerate(ctx.get("perturbed_imgs", [])):
                 score_knn_p, score_xgb_p = score_maps_for_image(
                     img_b=p_img,
                     ctx=ctx,
@@ -682,6 +669,7 @@ def run_stage1_bayes(
                     neg_bank=neg_bank,
                     neg_alpha=neg_alpha,
                     use_prefetched=False,
+                    prefetch_image_id=f"{ctx['image_id']}_bo_p{p_idx}",
                 )
                 thr_p = threshold_knn_xgb(
                     score_knn_p,
@@ -745,13 +733,15 @@ def run_stage1_bayes(
         "stage1_raw",
         seed=int(getattr(cfg, "BO_SEED", 42) or 42),
     )
+    stage1_trials = int(getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50)
     study.optimize(
         objective,
-        n_trials=int(getattr(cfg, "BO_STAGE1_TRIALS", 50) or 50),
+        n_trials=stage1_trials,
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
         callbacks=build_optuna_callbacks_with_feedback(
             cfg,
-            stage_name="stage1_raw",
+            stage_name="Stage1 Raw",
+            trial_total=stage1_trials,
             default_patience=20,
         ),
     )
@@ -848,6 +838,12 @@ def run_stage2_bayes(
     total_trials = int(getattr(cfg, "BO_STAGE2_TRIALS", 40) or 40)
     broad_trials = max(1, int(total_trials * broad_frac))
     refine_trials = max(0, total_trials - broad_trials)
+    logger.info(
+        "bayes stage2 plan: broad=%d refine=%d total=%d",
+        broad_trials,
+        refine_trials,
+        total_trials,
+    )
 
     def _suggest_stage2(trial, refine: dict | None = None):
         def _override(key: str):
@@ -968,13 +964,14 @@ def run_stage2_bayes(
                 neg_bank=neg_bank,
                 neg_alpha=neg_alpha,
                 use_prefetched=True,
+                prefetch_image_id=f"{ctx['image_id']}_bo_base",
                 use_dynamic_f1_threshold=bool(
                     getattr(cfg, "BO_USE_DYNAMIC_F1_THRESHOLD", False)
                 ),
             )
             iou_gt = float(compute_metrics(shadow, ctx["gt_mask_eval"])["iou"])
             sh_ious = []
-            for p_img in ctx.get("perturbed_imgs", []):
+            for p_idx, p_img in enumerate(ctx.get("perturbed_imgs", [])):
                 shadow_p = _predict_champion_shadow(
                     img_b=p_img,
                     ctx=ctx,
@@ -1001,6 +998,7 @@ def run_stage2_bayes(
                     neg_bank=neg_bank,
                     neg_alpha=neg_alpha,
                     use_prefetched=False,
+                    prefetch_image_id=f"{ctx['image_id']}_bo_p{p_idx}",
                     use_dynamic_f1_threshold=bool(
                         getattr(cfg, "BO_USE_DYNAMIC_F1_THRESHOLD", False)
                     ),
@@ -1024,7 +1022,6 @@ def run_stage2_bayes(
             trial.report(float(weighted_mean(vals, weights)), step=step)
             if bool(getattr(cfg, "BO_ENABLE_PRUNING", True)) and trial.should_prune():
                 raise optuna_mod.TrialPruned()
-
         trial.set_user_attr("weighted_iou_gt", float(weighted_mean(gt_vals, weights)))
         trial.set_user_attr("weighted_iou_sh", float(weighted_mean(sh_vals, weights)))
         trial.set_user_attr("prob_softness", float(crf_cfg["prob_softness"]))
@@ -1049,7 +1046,8 @@ def run_stage2_bayes(
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
         callbacks=build_optuna_callbacks_with_feedback(
             cfg,
-            stage_name="stage2_broad",
+            stage_name="Stage2 Broad",
+            trial_total=total_trials,
             default_patience=20,
         ),
     )
@@ -1123,7 +1121,9 @@ def run_stage2_bayes(
             timeout=getattr(cfg, "BO_TIMEOUT_S", None),
             callbacks=build_optuna_callbacks_with_feedback(
                 cfg,
-                stage_name="stage2_refine",
+                stage_name="Stage2 Refine",
+                trial_total=total_trials,
+                trial_offset=broad_trials,
                 default_patience=20,
             ),
         )
@@ -1261,7 +1261,7 @@ def run_stage3_bayes(
             return_prob=True,
         )
         perturbed = []
-        for p_img in ctx.get("perturbed_imgs", []):
+        for p_idx, p_img in enumerate(ctx.get("perturbed_imgs", [])):
             s_knn_p, s_xgb_p = score_maps_for_image(
                 img_b=p_img,
                 ctx=ctx,
@@ -1280,6 +1280,7 @@ def run_stage3_bayes(
                 neg_bank=neg_bank,
                 neg_alpha=neg_alpha,
                 use_prefetched=False,
+                prefetch_image_id=f"{ctx['image_id']}_bo_p{p_idx}",
             )
             thr_p = threshold_knn_xgb(
                 s_knn_p,
@@ -1449,13 +1450,15 @@ def run_stage3_bayes(
         "stage3_bridge",
         seed=int(getattr(cfg, "BO_SEED", 42) or 42) + 202,
     )
+    stage3_trials = int(getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30)
     study.optimize(
         objective,
-        n_trials=int(getattr(cfg, "BO_STAGE3_TRIALS", 30) or 30),
+        n_trials=stage3_trials,
         timeout=getattr(cfg, "BO_TIMEOUT_S", None),
         callbacks=build_optuna_callbacks_with_feedback(
             cfg,
-            stage_name="stage3_bridge",
+            stage_name="Stage3 Bridge",
+            trial_total=stage3_trials,
             default_patience=20,
         ),
     )
