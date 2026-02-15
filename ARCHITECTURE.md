@@ -83,6 +83,19 @@ If `AUTO_SPLIT_TILES=True`, split behavior depends on `AUTO_SPLIT_MODE`:
 Common prefilter:
 - Tile candidates are filtered to those overlapping `SOURCE_LABEL_RASTER` bounds.
 
+Source supervision for bank/XGB training:
+- `SOURCE_SUPERVISION_MODE="gt_if_available"` (default): source-tile labels come
+  from GT vector rasterization when available, with fallback to
+  `SOURCE_LABEL_RASTER`.
+- `SOURCE_SUPERVISION_MODE="gt_only"`: fail fast if GT supervision is missing.
+- `SOURCE_SUPERVISION_MODE="source_raster"`: preserve legacy weak-label-only behavior.
+- Anti-leak guardrails run before tuning:
+  - detect source/validation tile identity overlap,
+  - detect source/validation spatial overlap above
+    `ANTI_LEAK_TILE_OVERLAP_MIN_RATIO`,
+  - warn when GT-based source supervision reuses evaluation GT vectors.
+  - optionally fail fast via `ANTI_LEAK_FAIL_FAST`.
+
 ## Runtime Telemetry Architecture
 Per-tile telemetry is emitted during runtime, not post-hoc parsed from logs.
 
@@ -113,6 +126,9 @@ Tier-1 explainability is generated online during inference:
 - Per-tile outputs:
   - `output/run_*/xai/{validation|holdout}/{image_id}.json`
   - `output/run_*/xai/{validation|holdout}/{image_id}_xai.png`
+- Post-training source explainability:
+  - `output/run_*/xai/training/{source_image_id}_xgb_pca_top5.png`
+  - PCA components are ranked by XGB gain relevance and overlaid on RGB using a blue/red diverging map.
 - Run summary:
   - `output/run_*/xai_summary.csv`
 - Holdout volume control:

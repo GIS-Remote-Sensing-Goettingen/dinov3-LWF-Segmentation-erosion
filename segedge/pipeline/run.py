@@ -22,6 +22,7 @@ from ..core.explainability import (
     build_dim_activation_map,
     build_xai_summary_row,
     distribution_stats,
+    emit_training_xgb_pca_plot,
     get_xgb_importance_dict,
     save_xai_tile_plot,
     select_holdout_tiles_for_xai,
@@ -38,7 +39,6 @@ from ..core.io_utils import (
     export_best_settings,
     export_run_summary,
     load_dop20_image,
-    reproject_labels_to_image,
 )
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.logging_utils import setup_logging
@@ -61,7 +61,9 @@ from .common import (
     AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT,
     AUTO_SPLIT_MODE_LEGACY,
     init_model,
+    resolve_source_training_labels,
     resolve_tile_splits_from_gt,
+    run_source_validation_anti_leak_checks,
     tile_has_gt_overlap,
 )
 from .inference_utils import (
@@ -914,13 +916,17 @@ def main():
         pending_timing_rows.extend(rows)
         _flush_timing_rows(force=False)
 
-    # ------------------------------------------------------------
-    # Resolve validation + holdout tiles (required)
-    # ------------------------------------------------------------
+    # Resolve validation + holdout tiles (required).
     if not val_tiles:
         raise ValueError("VAL_TILES must be set for main.py.")
     if not holdout_tiles:
         logger.warning("no holdout tiles resolved; skipping holdout inference")
+    if bool(getattr(cfg, "ANTI_LEAK_CHECKS_ENABLED", True)):
+        _ = run_source_validation_anti_leak_checks(
+            source_tiles=img_a_paths,
+            val_tiles=val_tiles,
+            eval_gt_vector_paths=gt_vector_paths,
+        )
 
     xai_enabled = bool(getattr(cfg, "XAI_ENABLED", True))
     xai_save_json = bool(getattr(cfg, "XAI_SAVE_JSON", True))
@@ -956,9 +962,7 @@ def main():
         xai_holdout_cap,
     )
 
-    # ------------------------------------------------------------
-    # Feature caching
-    # ------------------------------------------------------------
+    # Feature caching.
     feature_cache_mode = getattr(cfg, "FEATURE_CACHE_MODE", "disk")
     if feature_cache_mode not in {"disk", "memory"}:
         raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
@@ -980,9 +984,7 @@ def main():
 
     image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
 
-    # ------------------------------------------------------------
-    # Build DINOv3 banks + XGBoost training data from Image A sources
-    # ------------------------------------------------------------
+    # Build DINOv3 banks + XGBoost training data from Image A sources.
     _log_phase("START", "image_a_processing")
     pos_banks = []
     neg_banks = []
@@ -1029,9 +1031,13 @@ def main():
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
         source_timings["load_source_image_s"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        labels_A = reproject_labels_to_image(
-            img_a_path, lab_a_path, downsample_factor=ds
+        labels_A, supervision = resolve_source_training_labels(
+            img_a_path,
+            lab_a_path,
+            gt_vector_paths,
+            downsample_factor=ds,
         )
+        logger.info("source supervision=%s image=%s", supervision, image_id_a)
         source_timings["reproject_source_labels_s"] = time.perf_counter() - t0
         source_feature_dir = feature_dir if source_has_gt else None
         prefetched_a = None
@@ -1140,9 +1146,7 @@ def main():
         raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
     _log_phase("END", "image_a_processing")
 
-    # ------------------------------------------------------------
-    # Tune on validation tile, then infer on holdout tiles
-    # ------------------------------------------------------------
+    # Tune on validation tile, then infer on holdout tiles.
     _log_phase("START", "validation_tuning")
     tuned = tune_on_validation_multi(
         val_tiles,
@@ -1161,6 +1165,25 @@ def main():
         context_radius,
     )
     _log_phase("END", "validation_tuning")
+    if bool(getattr(cfg, "XAI_PCA_XGB_ENABLED", True)) and img_a_paths:
+        _ = emit_training_xgb_pca_plot(
+            source_tiles=img_a_paths,
+            bst=tuned.get("bst"),
+            X_train=X,
+            model=model,
+            processor=processor,
+            device=device,
+            ps=ps,
+            tile_size=tile_size,
+            stride=stride,
+            feature_dir=feature_dir,
+            context_radius=context_radius,
+            out_dir=xai_dir,
+            downsample_factor=int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1),
+            source_tile_index=int(getattr(cfg, "XAI_PCA_SOURCE_TILE_INDEX", 0) or 0),
+            top_n=int(getattr(cfg, "XAI_PCA_TOP_COMPONENTS", 5) or 5),
+            max_pca_components=int(getattr(cfg, "XAI_PCA_MAX_COMPONENTS", 32) or 32),
+        )
 
     val_phase_metrics: dict[str, list[dict]] = {}
     holdout_phase_metrics: dict[str, list[dict]] = {}

@@ -33,6 +33,23 @@ GT_PRESENCE_WORKERS = None
 
 # Label raster used to build banks on SOURCE_* tiles.
 SOURCE_LABEL_RASTER = "data/lables/planet_labels_2022.tif"
+# Source supervision mode for kNN-bank and XGB training labels:
+# - "gt_if_available": use GT vectors when available, otherwise SOURCE_LABEL_RASTER
+# - "gt_only": require GT vectors for source supervision
+# - "source_raster": always use SOURCE_LABEL_RASTER
+SOURCE_SUPERVISION_MODE = "gt_if_available"
+# Optional override of GT vectors used for source supervision; None uses EVAL_GT_VECTORS.
+SOURCE_TRAIN_GT_VECTORS = None
+# Minimum GT-positive pixels required before accepting GT supervision in gt_if_available mode.
+SOURCE_SUPERVISION_MIN_POS_PIXELS = 1
+# Anti-leak checks between source training and validation.
+ANTI_LEAK_CHECKS_ENABLED = True
+# Raise instead of warn when anti-leak checks detect problems.
+ANTI_LEAK_FAIL_FAST = False
+# Spatial overlap threshold (relative to smaller tile area) to flag source/validation overlap.
+ANTI_LEAK_TILE_OVERLAP_MIN_RATIO = 0.0
+# Limit number of overlapping source/validation tile pairs scanned/logged.
+ANTI_LEAK_MAX_LOGGED_PAIRS = 10
 
 # Evaluation GT vectors (union-merged). Use EVAL_GT_VECTORS when available,
 EVAL_GT_VECTORS = [
@@ -103,6 +120,11 @@ XAI_INCLUDE_KNN = True
 XAI_HOLDOUT_CAP_ENABLED = True
 XAI_HOLDOUT_CAP = 10
 XAI_HOLDOUT_CAP_SEED = 42
+# Post-training PCA overlays for XGB-relevant embedding components.
+XAI_PCA_XGB_ENABLED = True
+XAI_PCA_SOURCE_TILE_INDEX = 0
+XAI_PCA_TOP_COMPONENTS = 5
+XAI_PCA_MAX_COMPONENTS = 32
 # Resume previous run (requires RESUME_RUN_DIR).
 RESUME_RUN = False
 RESUME_RUN_DIR = None

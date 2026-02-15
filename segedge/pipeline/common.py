@@ -18,6 +18,7 @@ from rasterio.warp import transform_bounds
 from shapely.geometry import box, shape
 from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
+from skimage.transform import resize
 from transformers import AutoImageProcessor, AutoModel
 
 import config as cfg
@@ -551,6 +552,126 @@ def resolve_tile_splits_from_gt(
     return source_tiles, val_tiles, holdout_tiles
 
 
+def _norm_path(path: str) -> str:
+    """Normalize a path for robust overlap checks.
+
+    Examples:
+        >>> _norm_path("a/../a").endswith("a")
+        True
+    """
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _bbox_overlap_ratio(bounds_a, bounds_b) -> float:
+    """Return overlap area ratio relative to the smaller bbox area.
+
+    Examples:
+        >>> A = type("B", (), {"left": 0, "right": 2, "bottom": 0, "top": 2})
+        >>> B = type("B", (), {"left": 1, "right": 3, "bottom": 1, "top": 3})
+        >>> round(_bbox_overlap_ratio(A(), B()), 2)
+        0.25
+    """
+    left = max(float(bounds_a.left), float(bounds_b.left))
+    right = min(float(bounds_a.right), float(bounds_b.right))
+    bottom = max(float(bounds_a.bottom), float(bounds_b.bottom))
+    top = min(float(bounds_a.top), float(bounds_b.top))
+    if right <= left or top <= bottom:
+        return 0.0
+    inter = float((right - left) * (top - bottom))
+    area_a = float((bounds_a.right - bounds_a.left) * (bounds_a.top - bounds_a.bottom))
+    area_b = float((bounds_b.right - bounds_b.left) * (bounds_b.top - bounds_b.bottom))
+    denom = max(min(area_a, area_b), 1e-12)
+    return inter / denom
+
+
+def run_source_validation_anti_leak_checks(
+    source_tiles: list[str],
+    val_tiles: list[str],
+    eval_gt_vector_paths: list[str] | None,
+) -> list[str]:
+    """Run anti-leak checks and return warning strings.
+
+    Examples:
+        >>> run_source_validation_anti_leak_checks([], [], [])
+        []
+    """
+    issues: list[str] = []
+    src_set = {_norm_path(p) for p in source_tiles}
+    val_set = {_norm_path(p) for p in val_tiles}
+    duplicated = sorted(src_set.intersection(val_set))
+    if duplicated:
+        issues.append(
+            f"source/validation contain identical tile paths (count={len(duplicated)})"
+        )
+
+    mode = (
+        str(getattr(cfg, "SOURCE_SUPERVISION_MODE", "gt_if_available")).strip().lower()
+    )
+    if mode != "source_raster":
+        source_train_gt = getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+        eval_gt = list(eval_gt_vector_paths or [])
+        if source_train_gt is None and eval_gt:
+            issues.append(
+                "SOURCE_TRAIN_GT_VECTORS is unset while GT-based source supervision is enabled; "
+                "source supervision defaults to EVAL_GT_VECTORS (potential validation leakage)"
+            )
+        if source_train_gt and eval_gt:
+            source_gt_set = {_norm_path(p) for p in list(source_train_gt)}
+            eval_gt_set = {_norm_path(p) for p in eval_gt}
+            shared_vectors = sorted(source_gt_set.intersection(eval_gt_set))
+            if shared_vectors:
+                issues.append(
+                    "SOURCE_TRAIN_GT_VECTORS overlaps EVAL_GT_VECTORS "
+                    f"(shared_files={len(shared_vectors)})"
+                )
+
+    min_ratio = float(getattr(cfg, "ANTI_LEAK_TILE_OVERLAP_MIN_RATIO", 0.0) or 0.0)
+    max_pairs = int(getattr(cfg, "ANTI_LEAK_MAX_LOGGED_PAIRS", 10) or 10)
+    if source_tiles and val_tiles and max_pairs > 0:
+        src_bounds = []
+        for path in source_tiles:
+            try:
+                with rio_open(path) as src:
+                    src_bounds.append((path, src.bounds))
+            except Exception:
+                continue
+        val_bounds = []
+        for path in val_tiles:
+            try:
+                with rio_open(path) as src:
+                    val_bounds.append((path, src.bounds))
+            except Exception:
+                continue
+        overlapping_pairs = []
+        for s_path, s_bounds in src_bounds:
+            for v_path, v_bounds in val_bounds:
+                ratio = _bbox_overlap_ratio(s_bounds, v_bounds)
+                if ratio > min_ratio:
+                    overlapping_pairs.append((s_path, v_path, ratio))
+                    if len(overlapping_pairs) >= max_pairs:
+                        break
+            if len(overlapping_pairs) >= max_pairs:
+                break
+        if overlapping_pairs:
+            max_ratio = max(float(p[2]) for p in overlapping_pairs)
+            issues.append(
+                "source/validation tiles have spatial overlap above configured threshold "
+                f"(min_ratio={min_ratio:.6f}, sample_pairs={len(overlapping_pairs)}, "
+                f"max_ratio={max_ratio:.6f})"
+            )
+
+    if issues:
+        for msg in issues:
+            logger.warning("anti-leak check: %s", msg)
+        if bool(getattr(cfg, "ANTI_LEAK_FAIL_FAST", False)):
+            raise ValueError(
+                "anti-leak checks failed; set ANTI_LEAK_FAIL_FAST=False to continue"
+            )
+    else:
+        logger.info("anti-leak check: no obvious source/validation leakage detected")
+    return issues
+
+
 def init_model(model_name: str):
     """Load a DINO backbone + processor on CPU/GPU with timing.
 
@@ -584,6 +705,66 @@ def init_model(model_name: str):
     return model, processor, device
 
 
+def resolve_source_training_labels(
+    img_path: str,
+    source_label_raster: str,
+    gt_vector_paths: list[str] | None,
+    *,
+    downsample_factor: int,
+) -> tuple[np.ndarray, str]:
+    """Resolve source supervision labels for bank/XGB training.
+
+    Examples:
+        >>> isinstance(resolve_source_training_labels.__name__, str)
+        True
+    """
+    mode = (
+        str(getattr(cfg, "SOURCE_SUPERVISION_MODE", "gt_if_available")).strip().lower()
+    )
+    labels_src = reproject_labels_to_image(
+        img_path, source_label_raster, downsample_factor=downsample_factor
+    )
+    if mode == "source_raster":
+        return labels_src, "source_raster"
+
+    gt_paths_cfg = getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+    gt_paths = (
+        list(gt_paths_cfg) if gt_paths_cfg is not None else list(gt_vector_paths or [])
+    )
+    if not gt_paths:
+        if mode == "gt_only":
+            raise ValueError(
+                "SOURCE_SUPERVISION_MODE=gt_only but no GT vectors are configured "
+                "(set SOURCE_TRAIN_GT_VECTORS or EVAL_GT_VECTORS)"
+            )
+        return labels_src, "source_raster_fallback_no_gt_paths"
+
+    labels_gt = rasterize_vector_labels(
+        gt_paths, img_path, downsample_factor=downsample_factor
+    )
+    if labels_gt is None:
+        if mode == "gt_only":
+            raise ValueError(
+                f"SOURCE_SUPERVISION_MODE=gt_only but GT rasterization failed for {img_path}"
+            )
+        return labels_src, "source_raster_fallback_gt_none"
+
+    if labels_gt.shape != labels_src.shape:
+        labels_gt = resize(
+            labels_gt,
+            labels_src.shape,
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(labels_gt.dtype)
+
+    min_pos = int(getattr(cfg, "SOURCE_SUPERVISION_MIN_POS_PIXELS", 1) or 1)
+    gt_pos = int((labels_gt > 0).sum())
+    if gt_pos >= min_pos or mode == "gt_only":
+        return labels_gt, "gt_vectors"
+    return labels_src, "source_raster_fallback_low_gt_coverage"
+
+
 def build_banks_for_sources(
     model, processor, device, ps, tile_size, stride, feature_dir
 ):
@@ -607,6 +788,7 @@ def build_banks_for_sources(
     """
     img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
     lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
+    gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None)
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
@@ -616,9 +798,13 @@ def build_banks_for_sources(
         image_id_a = os.path.splitext(os.path.basename(img_a_path))[0]
         logger.info("bank source A: %s (labels: %s)", img_a_path, lab_a_path)
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
-        labels_a = reproject_labels_to_image(
-            img_a_path, lab_a_path, downsample_factor=ds
+        labels_a, supervision = resolve_source_training_labels(
+            img_a_path,
+            lab_a_path,
+            gt_vector_paths,
+            downsample_factor=ds,
         )
+        logger.info("bank source supervision=%s image=%s", supervision, image_id_a)
         pos_i, neg_i = build_banks_single_scale(
             img_a,
             labels_a,
@@ -670,6 +856,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
 
     img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
     lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
+    gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None)
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
 
@@ -678,9 +865,13 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
     for img_a_path, lab_a_path in zip(img_a_paths, lab_a_paths, strict=True):
         image_id_a = os.path.splitext(os.path.basename(img_a_path))[0]
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
-        labels_a = reproject_labels_to_image(
-            img_a_path, lab_a_path, downsample_factor=ds
+        labels_a, supervision = resolve_source_training_labels(
+            img_a_path,
+            lab_a_path,
+            gt_vector_paths,
+            downsample_factor=ds,
         )
+        logger.info("xgb source supervision=%s image=%s", supervision, image_id_a)
         X_i, y_i = build_xgb_dataset(
             img_a,
             labels_a,

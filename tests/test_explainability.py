@@ -8,9 +8,12 @@ from pathlib import Path
 import numpy as np
 
 from segedge.core.explainability import (
+    _fit_pca_components,
+    _xgb_gain_vector,
     append_xai_summary_csv,
     build_dim_activation_map,
     get_xgb_importance_dict,
+    save_xgb_pca_top_components_plot,
     select_holdout_tiles_for_xai,
     summarize_knn_signals,
 )
@@ -131,3 +134,54 @@ def test_summarize_knn_signals_with_threshold() -> None:
     assert out["buffered_positive_ratio"] == 0.5
     assert out["score_distribution"]["p95"] > 0.0
     assert out["saliency_distribution"] is not None
+
+
+def test_xgb_gain_vector_dense_alignment() -> None:
+    """Dense gain vector should align sparse XGB feature keys by index.
+
+    Examples:
+        >>> True
+        True
+    """
+    vec = _xgb_gain_vector(_FakeBooster(), 5)
+    assert vec.tolist() == [3.0, 2.0, 0.0, 1.0, 0.0]
+
+
+def test_fit_pca_components_shapes() -> None:
+    """PCA helper should return components and explained ratios.
+
+    Examples:
+        >>> True
+        True
+    """
+    X = np.array([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]], dtype=np.float32)
+    comps, var = _fit_pca_components(X, max_components=2)
+    assert comps.shape == (2, 2)
+    assert var.shape == (2,)
+    assert float(np.sum(var)) <= 1.0 + 1e-6
+
+
+def test_save_xgb_pca_top_components_plot_writes_file(tmp_path: Path) -> None:
+    """PCA explainability plot should be saved for a minimal prefetched tile.
+
+    Examples:
+        >>> True
+        True
+    """
+    feats = np.array([[[1.0, 0.0], [0.0, 1.0]]], dtype=np.float32).reshape(1, 2, 2)
+    prefetched = {(0, 0): {"feats": feats, "hp": 1, "wp": 2, "h_eff": 8, "w_eff": 16}}
+    img = np.zeros((8, 16, 3), dtype=np.uint8)
+    X = np.array([[1.0, 0.1], [0.1, 1.0], [0.9, 0.2]], dtype=np.float32)
+    out = tmp_path / "pca_plot.png"
+    result = save_xgb_pca_top_components_plot(
+        img_rgb=img,
+        prefetched_tiles=prefetched,
+        X_train=X,
+        bst=_FakeBooster(),
+        out_path=str(out),
+        top_n=2,
+        max_pca_components=2,
+        context_radius=0,
+    )
+    assert result["saved"] is True
+    assert out.exists()

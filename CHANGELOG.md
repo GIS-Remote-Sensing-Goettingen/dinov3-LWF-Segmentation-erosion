@@ -3,6 +3,24 @@
 
 ## [Unreleased]
 
+## [0.2.45]
+- Description: Add post-training PCA/XGB component explainability plot with top-5 RGB overlays.
+- file touched: `config.py`, `segedge/core/explainability.py`, `segedge/pipeline/run.py`, `tests/test_explainability.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Provide visual insight into which DINO embedding components are most relevant to trained XGB decisions.
+- problems fixed: Fits PCA on XGB training embeddings, ranks PCA components by XGB gain relevance, and saves blue/red component overlays on source RGB imagery.
+
+## [0.2.44]
+- Description: Add anti-leak checks between source training and validation with warning/fail-fast controls.
+- file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Prevent silent label/split leakage when source supervision is GT-based and evaluation uses overlapping tiles or GT vectors.
+- problems fixed: Logs duplicate source/validation tiles, source/validation spatial overlaps, and GT-vector reuse risk (`SOURCE_TRAIN_GT_VECTORS` vs `EVAL_GT_VECTORS`), with optional hard-stop via `ANTI_LEAK_FAIL_FAST`.
+
+## [0.2.43]
+- Description: Switch source-tile supervision to configurable GT-first labels for both kNN bank-building and XGBoost dataset construction.
+- file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Source training was learning from weak `SOURCE_LABEL_RASTER` only, which can cap downstream IoU when higher-quality GT vectors are available.
+- problems fixed: Adds `SOURCE_SUPERVISION_MODE` (`gt_if_available`/`gt_only`/`source_raster`), optional `SOURCE_TRAIN_GT_VECTORS`, and unified label resolution used by both bank and XGB training paths.
+
 ## [0.2.42]
 - Description: Add compact Bayesian phase-timing telemetry with one-line trial summaries, suppress per-image kNN/XGB timing spam during Bayes tuning by default, and export per-trial phase timing CSV.
 - file touched: `config.py`, `segedge/core/bayes_timing.py`, `segedge/core/knn.py`, `segedge/core/xdboost.py`, `segedge/core/optuna_feedback.py`, `segedge/core/optuna_csv.py`, `segedge/core/__init__.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/tuning_bayes.py`, `tests/test_optuna_csv.py`, `tests/test_optuna_feedback.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

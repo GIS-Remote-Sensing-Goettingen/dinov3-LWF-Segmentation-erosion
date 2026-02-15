@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from skimage.transform import resize
 
+from .features import add_local_context_mean, prefetch_features_single_scale_image
+from .io_utils import load_dop20_image
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +50,104 @@ def _parse_feature_index(feature_name: str) -> int | None:
     if feature_name.startswith("f") and feature_name[1:].isdigit():
         return int(feature_name[1:])
     return None
+
+
+def _xgb_gain_vector(bst, n_dims: int) -> np.ndarray:
+    """Return dense gain vector aligned to embedding dimensions.
+
+    Examples:
+        >>> class _B:
+        ...     def get_score(self, importance_type="gain"):
+        ...         return {"f0": 2.0, "f2": 1.0}
+        >>> _xgb_gain_vector(_B(), 4).tolist()
+        [2.0, 0.0, 1.0, 0.0]
+    """
+    gains = np.zeros((int(max(0, n_dims)),), dtype=np.float32)
+    if bst is None or not hasattr(bst, "get_score") or gains.size == 0:
+        return gains
+    gain_map = bst.get_score(importance_type="gain") or {}
+    for feat_name, gain in gain_map.items():
+        idx = _parse_feature_index(str(feat_name))
+        if idx is None or idx < 0 or idx >= gains.size:
+            continue
+        gains[idx] = float(gain)
+    return gains
+
+
+def _fit_pca_components(
+    X_train: np.ndarray, max_components: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit PCA via SVD and return component vectors + explained variance ratios.
+
+    Examples:
+        >>> X = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
+        >>> comps, var = _fit_pca_components(X, max_components=2)
+        >>> comps.shape, var.shape
+        ((2, 2), (2,))
+    """
+    X = np.asarray(X_train, dtype=np.float32)
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 1:
+        raise ValueError("X_train must be 2D with at least 2 rows and 1 feature")
+    k = int(min(max(1, max_components), X.shape[0], X.shape[1]))
+    Xc = X - np.mean(X, axis=0, keepdims=True)
+    _, svals, vt = np.linalg.svd(Xc, full_matrices=False)
+    components = vt[:k].astype(np.float32)
+    eigvals = (svals**2) / max(X.shape[0] - 1, 1)
+    eigvals_k = eigvals[:k].astype(np.float32)
+    denom = float(np.sum(eigvals))
+    if denom <= 0:
+        explained = np.zeros_like(eigvals_k)
+    else:
+        explained = eigvals_k / denom
+    return components, explained
+
+
+def _build_pca_component_map(
+    prefetched_tiles: dict | None,
+    image_shape: tuple[int, int],
+    component_vec: np.ndarray,
+    context_radius: int = 0,
+) -> np.ndarray:
+    """Project one PCA component onto a full-resolution image map.
+
+    Examples:
+        >>> feats = np.ones((1, 1, 2), dtype=np.float32)
+        >>> pref = {(0, 0): {"feats": feats, "hp": 1, "wp": 1, "h_eff": 4, "w_eff": 4}}
+        >>> _build_pca_component_map(pref, (4, 4), np.array([1.0, -1.0])).shape
+        (4, 4)
+    """
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if not prefetched_tiles or h <= 0 or w <= 0:
+        return np.zeros((h, w), dtype=np.float32)
+
+    out = np.zeros((h, w), dtype=np.float32)
+    weight = np.zeros((h, w), dtype=np.float32)
+    comp = np.asarray(component_vec, dtype=np.float32).reshape(-1)
+    for (y, x), info in prefetched_tiles.items():
+        feats = np.asarray(info["feats"], dtype=np.float32)
+        hp = int(info["hp"])
+        wp = int(info["wp"])
+        h_eff = int(info["h_eff"])
+        w_eff = int(info["w_eff"])
+        if feats.size == 0 or hp <= 0 or wp <= 0:
+            continue
+        if context_radius > 0:
+            feats = add_local_context_mean(feats, int(context_radius))
+        if feats.shape[-1] != comp.shape[0]:
+            continue
+        patch_map = np.tensordot(feats, comp, axes=([2], [0])).astype(np.float32)
+        pix_map = resize(
+            patch_map,
+            (h_eff, w_eff),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32)
+        out[y : y + h_eff, x : x + w_eff] += pix_map
+        weight[y : y + h_eff, x : x + w_eff] += 1.0
+    nz = weight > 0
+    out[nz] /= weight[nz]
+    return out
 
 
 def distribution_stats(values: np.ndarray) -> dict[str, float]:
@@ -406,6 +507,170 @@ def save_xai_tile_plot(
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("xai plot saved: %s", out_path)
+
+
+def save_xgb_pca_top_components_plot(
+    *,
+    img_rgb: np.ndarray,
+    prefetched_tiles: dict | None,
+    X_train: np.ndarray,
+    bst,
+    out_path: str,
+    top_n: int = 5,
+    max_pca_components: int = 32,
+    context_radius: int = 0,
+) -> dict:
+    """Save RGB+blue/red overlays for top PCA components ranked by XGB gain relevance.
+
+    Examples:
+        >>> isinstance(save_xgb_pca_top_components_plot.__name__, str)
+        True
+    """
+    result = {
+        "saved": False,
+        "reason": "",
+        "components": [],
+    }
+    X = np.asarray(X_train, dtype=np.float32)
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 1:
+        result["reason"] = "insufficient_x_train"
+        return result
+    if bst is None:
+        result["reason"] = "missing_xgb_model"
+        return result
+
+    pca_components, explained = _fit_pca_components(X, int(max_pca_components))
+    gains = _xgb_gain_vector(bst, X.shape[1])
+    if float(np.sum(gains)) <= 0.0:
+        gains = np.ones_like(gains, dtype=np.float32)
+
+    relevance = np.matmul(np.abs(pca_components), gains.reshape(-1, 1)).reshape(-1)
+    top_k = int(max(1, min(int(top_n), relevance.shape[0])))
+    order = np.argsort(-relevance)[:top_k]
+
+    rgb = np.asarray(img_rgb, dtype=np.float32)
+    if rgb.max() > 1.0:
+        rgb = rgb / 255.0
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    fig, axs = plt.subplots(1, top_k, figsize=(5 * top_k, 5))
+    axs_arr = np.atleast_1d(axs)
+    total_rel = float(np.sum(relevance[order])) + 1e-8
+    comp_rows = []
+    for ax, idx in zip(axs_arr, order, strict=True):
+        comp_map = _build_pca_component_map(
+            prefetched_tiles,
+            image_shape=img_rgb.shape[:2],
+            component_vec=pca_components[int(idx)],
+            context_radius=int(context_radius),
+        )
+        scale = float(np.percentile(np.abs(comp_map), 99))
+        if scale <= 1e-8:
+            scale = 1.0
+        comp_norm = np.clip(comp_map / scale, -1.0, 1.0)
+        heat = plt.get_cmap("bwr")((comp_norm + 1.0) / 2.0)[..., :3]
+        overlay = np.clip(0.6 * rgb + 0.4 * heat, 0.0, 1.0)
+        ax.imshow(overlay)
+        rel_share = float(relevance[int(idx)] / total_rel)
+        var_share = float(explained[int(idx)])
+        ax.set_title(f"PC{int(idx)+1} rel={rel_share:.3f} var={var_share:.3f}")
+        ax.axis("off")
+        comp_rows.append(
+            {
+                "pca_component": int(idx + 1),
+                "relevance_share": rel_share,
+                "explained_variance_ratio": var_share,
+            }
+        )
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("xgb pca plot saved: %s", out_path)
+    result["saved"] = True
+    result["components"] = comp_rows
+    return result
+
+
+def emit_training_xgb_pca_plot(
+    *,
+    source_tiles: list[str],
+    bst,
+    X_train: np.ndarray,
+    model,
+    processor,
+    device,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str | None,
+    context_radius: int,
+    out_dir: str,
+    downsample_factor: int = 1,
+    source_tile_index: int = 0,
+    top_n: int = 5,
+    max_pca_components: int = 32,
+) -> str | None:
+    """Generate and save source-tile PCA overlay plot after XGB training.
+
+    Examples:
+        >>> emit_training_xgb_pca_plot(
+        ...     source_tiles=[],
+        ...     bst=None,
+        ...     X_train=np.zeros((0, 0)),
+        ...     model=None,
+        ...     processor=None,
+        ...     device=None,
+        ...     ps=16,
+        ...     tile_size=16,
+        ...     stride=16,
+        ...     feature_dir=None,
+        ...     context_radius=0,
+        ...     out_dir="out",
+        ... ) is None
+        True
+    """
+    if not source_tiles:
+        return None
+    idx = max(0, min(int(source_tile_index), len(source_tiles) - 1))
+    src_path = source_tiles[idx]
+    src_image_id = os.path.splitext(os.path.basename(src_path))[0]
+    src_img = load_dop20_image(
+        src_path, downsample_factor=int(max(1, downsample_factor))
+    )
+    src_prefetch = prefetch_features_single_scale_image(
+        src_img,
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        None,
+        feature_dir,
+        f"{src_image_id}_xgb_pca",
+    )
+    out_path = os.path.join(
+        out_dir, "training", f"{src_image_id}_xgb_pca_top{int(top_n)}.png"
+    )
+    result = save_xgb_pca_top_components_plot(
+        img_rgb=src_img,
+        prefetched_tiles=src_prefetch,
+        X_train=X_train,
+        bst=bst,
+        out_path=out_path,
+        top_n=int(top_n),
+        max_pca_components=int(max_pca_components),
+        context_radius=int(context_radius),
+    )
+    if not bool(result.get("saved", False)):
+        logger.warning(
+            "xgb pca plot skipped for %s: %s",
+            src_image_id,
+            result.get("reason", "unknown"),
+        )
+        return None
+    return out_path
 
 
 def write_xai_tile_json(out_path: str, payload: dict) -> None:
