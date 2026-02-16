@@ -97,6 +97,8 @@ Source supervision for bank/XGB training:
   from `EVAL_GT_VECTORS` by clipping to source footprints after subtracting a
   buffered validation footprint (`AUTO_GT_DERIVE_EXCLUSION_BUFFER_M`), and
   written to run artifacts under `derived_gt/source_train_gt_auto.gpkg`.
+  Clipping uses robust intersection fallbacks (geometry repair + precision snap)
+  to avoid runtime crashes from invalid/non-noded geometries.
 - Anti-leak guardrails run before tuning:
   - detect source/validation tile identity overlap,
   - detect source/validation spatial overlap above

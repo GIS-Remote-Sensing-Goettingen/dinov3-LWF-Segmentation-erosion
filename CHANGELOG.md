@@ -7,7 +7,7 @@
 - Description: Add automatic source-train GT vector derivation from eval GT vectors using source/validation footprint clipping with exclusion buffer.
 - file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `segedge/core/run_config_logging.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
 - reason: Runs failed fast on anti-leak checks when only `EVAL_GT_VECTORS` was configured, requiring manual train/eval vector separation.
-- problems fixed: When `SOURCE_TRAIN_GT_VECTORS` is unset, the pipeline can now auto-derive disjoint source-train GT vectors into run artifacts (`derived_gt/source_train_gt_auto.gpkg`), use them for source supervision, and avoid default eval-vector reuse leakage.
+- problems fixed: When `SOURCE_TRAIN_GT_VECTORS` is unset, the pipeline can now auto-derive disjoint source-train GT vectors into run artifacts (`derived_gt/source_train_gt_auto.gpkg`), use them for source supervision, avoid default eval-vector reuse leakage, and tolerate topology errors during clipping via robust intersection fallbacks.
 
 ## [0.2.49]
 - Description: Harden XGB candidate selection against leakage/noise by adding tile-grouped k-fold, multi-validation-tile threshold scoring, and configurable full-data refit modes.

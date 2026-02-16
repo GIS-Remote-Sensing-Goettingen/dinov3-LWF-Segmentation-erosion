@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from shapely.errors import GEOSException
 from shapely.geometry import box
 
 import segedge.pipeline.common as common_module
@@ -397,3 +398,28 @@ def test_resolve_source_train_gt_vectors_auto_derive(monkeypatch, tmp_path) -> N
     assert out is not None and len(out) == 1
     assert out[0].endswith("source_train_gt_auto.gpkg")
     assert captured["count"] == 1
+
+
+def test_safe_intersection_falls_back_after_topology_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Safe intersection should recover from GEOS topology failures."""
+
+    class _BadGeom:
+        is_valid = False
+
+        def intersection(self, other):  # pragma: no cover - exercised in helper
+            raise GEOSException("boom")
+
+    monkeypatch.setattr(
+        common_module,
+        "_safe_make_valid",
+        lambda geom: box(0, 0, 2, 2) if isinstance(geom, _BadGeom) else geom,
+    )
+    out = common_module._safe_intersection(
+        _BadGeom(),
+        box(1, 1, 3, 3),
+        context="unit-test",
+    )
+    assert out is not None
+    assert out.area == pytest.approx(1.0)

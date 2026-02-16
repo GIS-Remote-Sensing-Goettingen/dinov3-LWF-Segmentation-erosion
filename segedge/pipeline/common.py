@@ -15,10 +15,13 @@ from pyproj import Transformer
 from rasterio import open as rio_open
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
+from shapely import set_precision
+from shapely.errors import GEOSException
 from shapely.geometry import box, shape
 from shapely.ops import transform as shp_transform
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
+from shapely.validation import make_valid as shapely_make_valid
 from skimage.transform import resize
 from transformers import AutoImageProcessor, AutoModel
 
@@ -646,6 +649,51 @@ def _write_derived_vectors_gpkg(
     return out_path
 
 
+def _safe_make_valid(geom):
+    """Return a repaired geometry when possible.
+
+    Examples:
+        >>> isinstance(_safe_make_valid.__name__, str)
+        True
+    """
+    if geom is None:
+        return None
+    try:
+        if hasattr(geom, "is_valid") and not geom.is_valid:
+            geom = shapely_make_valid(geom)
+    except Exception:
+        return geom
+    return geom
+
+
+def _safe_intersection(a, b, *, context: str):
+    """Compute intersection with robust fallbacks for topology errors.
+
+    Examples:
+        >>> isinstance(_safe_intersection.__name__, str)
+        True
+    """
+    if a is None or b is None:
+        return None
+    try:
+        return a.intersection(b)
+    except GEOSException:
+        pass
+    a_valid = _safe_make_valid(a)
+    b_valid = _safe_make_valid(b)
+    try:
+        return a_valid.intersection(b_valid)
+    except GEOSException:
+        pass
+    try:
+        a_prec = set_precision(a_valid, 0.01)
+        b_prec = set_precision(b_valid, 0.01)
+        return a_prec.intersection(b_prec)
+    except Exception as exc:
+        logger.warning("auto-derive: intersection failed (%s): %s", context, exc)
+    return None
+
+
 def resolve_source_train_gt_vectors(
     source_tiles: list[str],
     val_tiles: list[str],
@@ -703,10 +751,17 @@ def resolve_source_train_gt_vectors(
 
     eval_geoms = _load_gt_geometries(eval_paths, target_crs)
     clipped_train = []
-    for geom in eval_geoms:
-        for clipped in _explode_non_empty_geometries(
-            geom.intersection(train_footprint)
-        ):
+    dropped_topology = 0
+    for idx, geom in enumerate(eval_geoms):
+        clipped_geom = _safe_intersection(
+            geom,
+            train_footprint,
+            context=f"train_clip idx={idx}",
+        )
+        if clipped_geom is None:
+            dropped_topology += 1
+            continue
+        for clipped in _explode_non_empty_geometries(clipped_geom):
             if min_area_m2 > 0 and float(clipped.area) < min_area_m2:
                 continue
             clipped_train.append(clipped)
@@ -729,10 +784,15 @@ def resolve_source_train_gt_vectors(
     )
     if bool(getattr(cfg, "AUTO_GT_DERIVE_WRITE_EVAL_COPY", False)):
         clipped_eval = []
-        for geom in eval_geoms:
-            clipped_eval.extend(
-                _explode_non_empty_geometries(geom.intersection(val_union))
+        for idx, geom in enumerate(eval_geoms):
+            clipped_geom = _safe_intersection(
+                geom,
+                val_union,
+                context=f"eval_clip idx={idx}",
             )
+            if clipped_geom is None:
+                continue
+            clipped_eval.extend(_explode_non_empty_geometries(clipped_geom))
         if clipped_eval:
             eval_path = os.path.join(derived_dir, "eval_gt_auto.gpkg")
             _write_derived_vectors_gpkg(
@@ -751,6 +811,11 @@ def resolve_source_train_gt_vectors(
         buffer_m,
         min_area_m2,
     )
+    if dropped_topology > 0:
+        logger.warning(
+            "auto source-train GT vectors: dropped %s geometries due to topology errors",
+            dropped_topology,
+        )
     return [train_path]
 
 
