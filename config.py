@@ -51,6 +51,14 @@ ANTI_LEAK_FAIL_FAST = True
 ANTI_LEAK_TILE_OVERLAP_MIN_RATIO = 0.0
 # Limit number of overlapping source/validation tile pairs scanned/logged.
 ANTI_LEAK_MAX_LOGGED_PAIRS = 10
+# Auto-derive source-train GT vectors from EVAL_GT_VECTORS when SOURCE_TRAIN_GT_VECTORS is unset.
+AUTO_DERIVE_SOURCE_TRAIN_GT_VECTORS = True
+# Exclusion buffer (meters) around validation footprint removed from source-train GT derivation.
+AUTO_GT_DERIVE_EXCLUSION_BUFFER_M = 1.0
+# Optional area filter after clipping derived GT geometries (0 disables).
+AUTO_GT_DERIVE_MIN_GEOM_AREA_M2 = 0.0
+# Optionally write a clipped eval GT copy into the run's derived_gt directory.
+AUTO_GT_DERIVE_WRITE_EVAL_COPY = False
 
 # Evaluation GT vectors (union-merged). Use EVAL_GT_VECTORS when available,
 EVAL_GT_VECTORS = [

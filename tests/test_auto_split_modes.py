@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from shapely.geometry import box
 
 import segedge.pipeline.common as common_module
 from segedge.pipeline.common import (
@@ -12,6 +13,7 @@ from segedge.pipeline.common import (
     _bbox_overlap_ratio,
     _cap_inference_tiles,
     _split_tiles_from_gt_presence,
+    resolve_source_train_gt_vectors,
     resolve_source_training_labels,
     run_source_validation_anti_leak_checks,
     tile_has_gt_overlap,
@@ -311,3 +313,87 @@ def test_anti_leak_checks_warn_on_gt_vector_reuse_default(
         eval_gt_vector_paths=["/tmp/eval_gt.shp"],
     )
     assert any("defaults to EVAL_GT_VECTORS" in msg for msg in issues)
+
+
+def test_anti_leak_checks_use_resolved_source_train_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolved source-train GT paths should suppress default-reuse warning."""
+    monkeypatch.setattr(
+        common_module.cfg,
+        "SOURCE_SUPERVISION_MODE",
+        "gt_if_available",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        common_module.cfg,
+        "SOURCE_TRAIN_GT_VECTORS",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        common_module.cfg,
+        "ANTI_LEAK_FAIL_FAST",
+        False,
+        raising=False,
+    )
+    issues = run_source_validation_anti_leak_checks(
+        source_tiles=[],
+        val_tiles=[],
+        eval_gt_vector_paths=["/tmp/eval_gt.shp"],
+        source_train_gt_vector_paths=["/tmp/train_gt_auto.gpkg"],
+    )
+    assert all("defaults to EVAL_GT_VECTORS" not in msg for msg in issues)
+
+
+def test_resolve_source_train_gt_vectors_auto_derive(monkeypatch, tmp_path) -> None:
+    """Auto-derive should return generated train GT path when explicit paths are unset."""
+    monkeypatch.setattr(
+        common_module.cfg, "SOURCE_TRAIN_GT_VECTORS", None, raising=False
+    )
+    monkeypatch.setattr(
+        common_module.cfg, "SOURCE_SUPERVISION_MODE", "gt_if_available", raising=False
+    )
+    monkeypatch.setattr(
+        common_module.cfg, "AUTO_DERIVE_SOURCE_TRAIN_GT_VECTORS", True, raising=False
+    )
+    monkeypatch.setattr(
+        common_module.cfg, "AUTO_GT_DERIVE_EXCLUSION_BUFFER_M", 1.0, raising=False
+    )
+    monkeypatch.setattr(
+        common_module.cfg, "AUTO_GT_DERIVE_MIN_GEOM_AREA_M2", 0.0, raising=False
+    )
+    monkeypatch.setattr(
+        common_module.cfg, "AUTO_GT_DERIVE_WRITE_EVAL_COPY", False, raising=False
+    )
+    monkeypatch.setattr(
+        common_module,
+        "_tile_union_geometry",
+        lambda tiles, target_crs=None: (
+            (box(0, 0, 10, 10), "EPSG:25832")
+            if target_crs is None
+            else (box(8, 8, 20, 20), target_crs)
+        ),
+    )
+    monkeypatch.setattr(
+        common_module,
+        "_load_gt_geometries",
+        lambda paths, target_crs: [box(0, 0, 9, 9), box(30, 30, 40, 40)],
+    )
+    captured = {}
+
+    def _fake_write(path, geoms, target_crs, *, layer_name):
+        captured["path"] = path
+        captured["count"] = len(geoms)
+        return path
+
+    monkeypatch.setattr(common_module, "_write_derived_vectors_gpkg", _fake_write)
+    out = resolve_source_train_gt_vectors(
+        source_tiles=["s1.tif"],
+        val_tiles=["v1.tif"],
+        eval_gt_vector_paths=["eval.shp"],
+        run_dir=str(tmp_path),
+    )
+    assert out is not None and len(out) == 1
+    assert out[0].endswith("source_train_gt_auto.gpkg")
+    assert captured["count"] == 1

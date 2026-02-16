@@ -52,6 +52,16 @@ def log_training_ablation_summary(
         str(getattr(cfg, "AUTO_SPLIT_MODE", auto_split_mode_legacy)),
     )
     logger.info(
+        "train settings: anti_leak checks=%s fail_fast=%s overlap_min_ratio=%.6f "
+        "auto_derive_source_train_gt=%s derive_buffer_m=%.3f derive_min_area_m2=%.3f",
+        bool(getattr(cfg, "ANTI_LEAK_CHECKS_ENABLED", True)),
+        bool(getattr(cfg, "ANTI_LEAK_FAIL_FAST", False)),
+        float(getattr(cfg, "ANTI_LEAK_TILE_OVERLAP_MIN_RATIO", 0.0) or 0.0),
+        bool(getattr(cfg, "AUTO_DERIVE_SOURCE_TRAIN_GT_VECTORS", True)),
+        float(getattr(cfg, "AUTO_GT_DERIVE_EXCLUSION_BUFFER_M", 1.0) or 0.0),
+        float(getattr(cfg, "AUTO_GT_DERIVE_MIN_GEOM_AREA_M2", 0.0) or 0.0),
+    )
+    logger.info(
         "train settings: features cache_mode=%s source_prefetch_gt_only=%s "
         "batch=%s resample=%s patch=%s tile=%s stride=%s context=%s "
         "timing_tile_logs=%s feature_dir=%s bank_cache_dir=%s",

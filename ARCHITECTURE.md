@@ -91,6 +91,12 @@ Source supervision for bank/XGB training:
   `SOURCE_LABEL_RASTER`.
 - `SOURCE_SUPERVISION_MODE="gt_only"`: fail fast if GT supervision is missing.
 - `SOURCE_SUPERVISION_MODE="source_raster"`: preserve legacy weak-label-only behavior.
+- Automatic source-train GT derivation:
+  when `SOURCE_TRAIN_GT_VECTORS` is unset and
+  `AUTO_DERIVE_SOURCE_TRAIN_GT_VECTORS=True`, source-train vectors are derived
+  from `EVAL_GT_VECTORS` by clipping to source footprints after subtracting a
+  buffered validation footprint (`AUTO_GT_DERIVE_EXCLUSION_BUFFER_M`), and
+  written to run artifacts under `derived_gt/source_train_gt_auto.gpkg`.
 - Anti-leak guardrails run before tuning:
   - detect source/validation tile identity overlap,
   - detect source/validation spatial overlap above

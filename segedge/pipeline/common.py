@@ -17,6 +17,7 @@ from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
 from shapely.geometry import box, shape
 from shapely.ops import transform as shp_transform
+from shapely.ops import unary_union
 from shapely.strtree import STRtree
 from skimage.transform import resize
 from transformers import AutoImageProcessor, AutoModel
@@ -562,6 +563,197 @@ def _norm_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+def _tile_union_geometry(
+    tile_paths: list[str], target_crs: CRS | None = None
+) -> tuple[object | None, CRS | None]:
+    """Build the union footprint geometry for a tile list.
+
+    Examples:
+        >>> isinstance(_tile_union_geometry.__name__, str)
+        True
+    """
+    if not tile_paths:
+        return None, target_crs
+    geoms = []
+    resolved_crs = target_crs
+    for tile_path in tile_paths:
+        with rio_open(tile_path) as src:
+            tile_bounds = src.bounds
+            tile_crs = src.crs
+        if resolved_crs is None:
+            resolved_crs = tile_crs
+        bounds = tile_bounds
+        if (
+            resolved_crs is not None
+            and tile_crs is not None
+            and tile_crs != resolved_crs
+        ):
+            bounds = transform_bounds(
+                tile_crs,
+                resolved_crs,
+                *tile_bounds,
+                densify_pts=21,
+            )
+        geoms.append(box(bounds[0], bounds[1], bounds[2], bounds[3]))
+    if not geoms:
+        return None, resolved_crs
+    return unary_union(geoms), resolved_crs
+
+
+def _explode_non_empty_geometries(geom) -> list:
+    """Flatten geometry collections and drop empties."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "GeometryCollection":
+        out = []
+        for sub in geom.geoms:
+            out.extend(_explode_non_empty_geometries(sub))
+        return out
+    return [geom]
+
+
+def _write_derived_vectors_gpkg(
+    out_path: str,
+    geometries: list,
+    target_crs: CRS,
+    *,
+    layer_name: str,
+) -> str:
+    """Write derived vectors to a GeoPackage and return the path.
+
+    Examples:
+        >>> isinstance(_write_derived_vectors_gpkg.__name__, str)
+        True
+    """
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    schema = {"geometry": "Unknown", "properties": {"id": "int"}}
+    with fiona.open(
+        out_path,
+        "w",
+        driver="GPKG",
+        schema=schema,
+        crs=target_crs.to_dict() if target_crs is not None else None,
+        layer=layer_name,
+    ) as dst:
+        for idx, geom in enumerate(geometries, start=1):
+            dst.write(
+                {
+                    "geometry": geom.__geo_interface__,
+                    "properties": {"id": int(idx)},
+                }
+            )
+    return out_path
+
+
+def resolve_source_train_gt_vectors(
+    source_tiles: list[str],
+    val_tiles: list[str],
+    eval_gt_vector_paths: list[str] | None,
+    *,
+    run_dir: str | None = None,
+) -> list[str] | None:
+    """Resolve source-train GT vectors, deriving them automatically when configured.
+
+    Examples:
+        >>> isinstance(resolve_source_train_gt_vectors.__name__, str)
+        True
+    """
+    explicit = getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+    if explicit:
+        return list(explicit)
+    mode = (
+        str(getattr(cfg, "SOURCE_SUPERVISION_MODE", "gt_if_available")).strip().lower()
+    )
+    if mode == "source_raster":
+        return None
+    if not bool(getattr(cfg, "AUTO_DERIVE_SOURCE_TRAIN_GT_VECTORS", True)):
+        return None
+    eval_paths = list(eval_gt_vector_paths or [])
+    if not eval_paths:
+        logger.warning(
+            "auto source-train GT derivation skipped: EVAL_GT_VECTORS is empty"
+        )
+        return None
+    if not source_tiles or not val_tiles:
+        logger.warning(
+            "auto source-train GT derivation skipped: source_tiles=%s val_tiles=%s",
+            len(source_tiles),
+            len(val_tiles),
+        )
+        return None
+    source_union, target_crs = _tile_union_geometry(source_tiles, None)
+    val_union, target_crs = _tile_union_geometry(val_tiles, target_crs)
+    if source_union is None or val_union is None or target_crs is None:
+        logger.warning(
+            "auto source-train GT derivation skipped: invalid tile footprints"
+        )
+        return None
+    buffer_m = float(getattr(cfg, "AUTO_GT_DERIVE_EXCLUSION_BUFFER_M", 1.0) or 0.0)
+    min_area_m2 = float(getattr(cfg, "AUTO_GT_DERIVE_MIN_GEOM_AREA_M2", 0.0) or 0.0)
+    val_exclusion = val_union.buffer(buffer_m) if buffer_m > 0 else val_union
+    train_footprint = source_union.difference(val_exclusion)
+    if train_footprint.is_empty:
+        logger.warning(
+            "auto source-train GT derivation produced empty train footprint "
+            "(buffer_m=%.3f)",
+            buffer_m,
+        )
+        return None
+
+    eval_geoms = _load_gt_geometries(eval_paths, target_crs)
+    clipped_train = []
+    for geom in eval_geoms:
+        for clipped in _explode_non_empty_geometries(
+            geom.intersection(train_footprint)
+        ):
+            if min_area_m2 > 0 and float(clipped.area) < min_area_m2:
+                continue
+            clipped_train.append(clipped)
+    if not clipped_train:
+        logger.warning(
+            "auto source-train GT derivation produced zero geometries after clipping"
+        )
+        return None
+
+    if run_dir is None:
+        run_dir = str(getattr(cfg, "OUTPUT_DIR", "output"))
+    derived_dir = os.path.join(run_dir, "derived_gt")
+    os.makedirs(derived_dir, exist_ok=True)
+    train_path = os.path.join(derived_dir, "source_train_gt_auto.gpkg")
+    _write_derived_vectors_gpkg(
+        train_path,
+        clipped_train,
+        target_crs,
+        layer_name="source_train_gt_auto",
+    )
+    if bool(getattr(cfg, "AUTO_GT_DERIVE_WRITE_EVAL_COPY", False)):
+        clipped_eval = []
+        for geom in eval_geoms:
+            clipped_eval.extend(
+                _explode_non_empty_geometries(geom.intersection(val_union))
+            )
+        if clipped_eval:
+            eval_path = os.path.join(derived_dir, "eval_gt_auto.gpkg")
+            _write_derived_vectors_gpkg(
+                eval_path,
+                clipped_eval,
+                target_crs,
+                layer_name="eval_gt_auto",
+            )
+    logger.info(
+        "auto source-train GT vectors: output=%s features=%s source_tiles=%s val_tiles=%s "
+        "buffer_m=%.3f min_area_m2=%.3f",
+        train_path,
+        len(clipped_train),
+        len(source_tiles),
+        len(val_tiles),
+        buffer_m,
+        min_area_m2,
+    )
+    return [train_path]
+
+
 def _bbox_overlap_ratio(bounds_a, bounds_b) -> float:
     """Return overlap area ratio relative to the smaller bbox area.
 
@@ -588,6 +780,7 @@ def run_source_validation_anti_leak_checks(
     source_tiles: list[str],
     val_tiles: list[str],
     eval_gt_vector_paths: list[str] | None,
+    source_train_gt_vector_paths: list[str] | None = None,
 ) -> list[str]:
     """Run anti-leak checks and return warning strings.
 
@@ -608,7 +801,11 @@ def run_source_validation_anti_leak_checks(
         str(getattr(cfg, "SOURCE_SUPERVISION_MODE", "gt_if_available")).strip().lower()
     )
     if mode != "source_raster":
-        source_train_gt = getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+        source_train_gt = (
+            list(source_train_gt_vector_paths)
+            if source_train_gt_vector_paths is not None
+            else getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+        )
         eval_gt = list(eval_gt_vector_paths or [])
         if source_train_gt is None and eval_gt:
             issues.append(
@@ -711,6 +908,7 @@ def resolve_source_training_labels(
     gt_vector_paths: list[str] | None,
     *,
     downsample_factor: int,
+    source_train_gt_vector_paths: list[str] | None = None,
 ) -> tuple[np.ndarray, str]:
     """Resolve source supervision labels for bank/XGB training.
 
@@ -727,7 +925,11 @@ def resolve_source_training_labels(
     if mode == "source_raster":
         return labels_src, "source_raster"
 
-    gt_paths_cfg = getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+    gt_paths_cfg = (
+        list(source_train_gt_vector_paths)
+        if source_train_gt_vector_paths is not None
+        else getattr(cfg, "SOURCE_TRAIN_GT_VECTORS", None)
+    )
     gt_paths = (
         list(gt_paths_cfg) if gt_paths_cfg is not None else list(gt_vector_paths or [])
     )

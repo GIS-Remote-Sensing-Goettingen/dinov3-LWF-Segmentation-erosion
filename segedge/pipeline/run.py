@@ -61,6 +61,7 @@ from .common import (
     AUTO_SPLIT_MODE_GT_TO_VAL_CAP_HOLDOUT,
     AUTO_SPLIT_MODE_LEGACY,
     init_model,
+    resolve_source_train_gt_vectors,
     resolve_source_training_labels,
     resolve_tile_splits_from_gt,
     run_source_validation_anti_leak_checks,
@@ -76,7 +77,6 @@ from .inference_utils import (
 )
 from .tuning import tune_on_validation_multi
 
-# Config-driven flags
 USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
 logger = logging.getLogger(__name__)
 
@@ -916,16 +916,16 @@ def main():
         pending_timing_rows.extend(rows)
         _flush_timing_rows(force=False)
 
-    # Resolve validation + holdout tiles (required).
     if not val_tiles:
         raise ValueError("VAL_TILES must be set for main.py.")
     if not holdout_tiles:
         logger.warning("no holdout tiles resolved; skipping holdout inference")
+    source_train_gt_vector_paths = resolve_source_train_gt_vectors(
+        img_a_paths, val_tiles, gt_vector_paths, run_dir=run_dir
+    )
     if bool(getattr(cfg, "ANTI_LEAK_CHECKS_ENABLED", True)):
         _ = run_source_validation_anti_leak_checks(
-            source_tiles=img_a_paths,
-            val_tiles=val_tiles,
-            eval_gt_vector_paths=gt_vector_paths,
+            img_a_paths, val_tiles, gt_vector_paths, source_train_gt_vector_paths
         )
 
     xai_enabled = bool(getattr(cfg, "XAI_ENABLED", True))
@@ -962,7 +962,6 @@ def main():
         xai_holdout_cap,
     )
 
-    # Feature caching.
     feature_cache_mode = getattr(cfg, "FEATURE_CACHE_MODE", "disk")
     if feature_cache_mode not in {"disk", "memory"}:
         raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
@@ -1034,6 +1033,7 @@ def main():
             lab_a_path,
             gt_vector_paths,
             downsample_factor=ds,
+            source_train_gt_vector_paths=source_train_gt_vector_paths,
         )
         logger.info("source supervision=%s image=%s", supervision, image_id_a)
         source_timings["reproject_source_labels_s"] = time.perf_counter() - t0
