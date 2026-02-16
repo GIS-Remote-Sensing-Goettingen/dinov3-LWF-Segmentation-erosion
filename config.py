@@ -321,8 +321,10 @@ XGB_EARLY_STOP = 100
 XGB_VERBOSE_EVAL = 20
 # Optional k-fold selection for XGB candidate robustness checks.
 XGB_USE_KFOLD = True
-XGB_KFOLD_SPLITS = 3
-XGB_KFOLD_GROUP_BY_TILE = True
+# With only a few source tiles, grouped folds are capped by group count.
+# Set group_by_tile=False to allow higher effective fold counts.
+XGB_KFOLD_SPLITS = 15
+XGB_KFOLD_GROUP_BY_TILE = False
 XGB_KFOLD_SHUFFLE = True
 # Candidate screening controls (pre-grid/Bayes downstream scoring).
 XGB_CANDIDATE_THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7]

@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.51]
+- Description: Increase effective XGBoost candidate-selection k-fold count for low-source-tile runs.
+- file touched: `config.py`, `CHANGELOG.md`
+- reason: Requested higher k-fold robustness checks, but grouped-by-tile folds were capped by available source groups.
+- problems fixed: Raises `XGB_KFOLD_SPLITS` from `3` to `5` and disables tile-grouped folding so effective sample-level k-fold evaluation can use more than three folds.
+
 ## [0.2.50]
 - Description: Add automatic source-train GT vector derivation from eval GT vectors using source/validation footprint clipping with exclusion buffer.
 - file touched: `config.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `segedge/core/run_config_logging.py`, `tests/test_auto_split_modes.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
