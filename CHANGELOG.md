@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.49]
+- Description: Harden XGB candidate selection against leakage/noise by adding tile-grouped k-fold, multi-validation-tile threshold scoring, and configurable full-data refit modes.
+- file touched: `config.py`, `segedge/core/xdboost.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/run.py`, `segedge/core/run_config_logging.py`, `tests/test_xgb_training_controls.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Later-stage IoU was collapsing because candidate screening was based on patch-level fold leakage, single-tile proxy metrics, and fixed-round refits.
+- problems fixed: Adds grouped folds via source-tile IDs, evaluates XGB candidates on configurable threshold sweeps over all validation tiles, introduces `XGB_REFIT_MODE`/`XGB_REFIT_HOLDOUT_FRACTION`, and logs the new selection/refit controls.
+
 ## [0.2.48]
 - Description: Add optional XGBoost k-fold candidate selection with final full-source refit.
 - file touched: `config.py`, `segedge/core/xdboost.py`, `segedge/pipeline/tuning.py`, `segedge/core/run_config_logging.py`, `tests/test_xgb_training_controls.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

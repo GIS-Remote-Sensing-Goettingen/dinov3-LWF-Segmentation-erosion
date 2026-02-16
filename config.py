@@ -314,6 +314,14 @@ XGB_VERBOSE_EVAL = 20
 # Optional k-fold selection for XGB candidate robustness checks.
 XGB_USE_KFOLD = True
 XGB_KFOLD_SPLITS = 3
+XGB_KFOLD_GROUP_BY_TILE = True
+XGB_KFOLD_SHUFFLE = True
+# Candidate screening controls (pre-grid/Bayes downstream scoring).
+XGB_CANDIDATE_THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7]
+XGB_SELECTION_USE_ALL_VAL_TILES = True
+# Final refit after candidate selection: best_round_mean | holdout_es | fixed_rounds.
+XGB_REFIT_MODE = "best_round_mean"
+XGB_REFIT_HOLDOUT_FRACTION = 0.1
 # Override patch-purity threshold for XGB supervision (None => POS_FRAC_THRESH).
 XGB_POS_FRAC_THRESH = 0.1
 # Mark a patch as negative only if positive fraction is <= this threshold.

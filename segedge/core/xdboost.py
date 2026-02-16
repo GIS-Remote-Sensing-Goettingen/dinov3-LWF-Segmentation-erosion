@@ -145,6 +145,150 @@ def _kfold_index_splits(
     return splits
 
 
+def _group_kfold_index_splits(
+    groups: np.ndarray,
+    n_splits: int,
+    seed: int,
+    shuffle: bool = True,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build k-fold splits where entire groups stay in the same fold.
+
+    Examples:
+        >>> groups = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)
+        >>> splits = _group_kfold_index_splits(groups, n_splits=3, seed=42, shuffle=True)
+        >>> len(splits)
+        3
+        >>> all(len(np.intersect1d(tr, va)) == 0 for tr, va in splits)
+        True
+    """
+    g = np.asarray(groups)
+    n_samples = int(g.size)
+    if n_samples < 2:
+        return []
+    unique_groups = np.unique(g)
+    if unique_groups.size < 2:
+        return []
+    k = max(2, int(n_splits or 2))
+    k = min(k, int(unique_groups.size))
+    if shuffle:
+        unique_groups = np.array(unique_groups, copy=True)
+        np.random.default_rng(seed).shuffle(unique_groups)
+    fold_sizes = np.full(k, unique_groups.size // k, dtype=np.int64)
+    fold_sizes[: unique_groups.size % k] += 1
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    start = 0
+    for fold_size in fold_sizes.tolist():
+        end = start + int(fold_size)
+        val_groups = unique_groups[start:end]
+        val_mask = np.isin(g, val_groups)
+        val_idx = np.nonzero(val_mask)[0]
+        train_idx = np.nonzero(~val_mask)[0]
+        if len(train_idx) > 0 and len(val_idx) > 0:
+            splits.append((train_idx, val_idx))
+        start = end
+    return splits
+
+
+def _best_boost_round(model: xgb.Booster, fallback_rounds: int) -> int:
+    """Return the best boosting round count for a trained model.
+
+    Examples:
+        >>> _best_boost_round.__name__
+        '_best_boost_round'
+    """
+    best_iter = getattr(model, "best_iteration", None)
+    if isinstance(best_iter, (int, np.integer)) and int(best_iter) >= 0:
+        return int(best_iter) + 1
+    best_ntree = getattr(model, "best_ntree_limit", None)
+    if isinstance(best_ntree, (int, np.integer)) and int(best_ntree) > 0:
+        return int(best_ntree)
+    return max(1, int(fallback_rounds))
+
+
+def _compute_metrics_for_thresholds(
+    score_map: np.ndarray,
+    thresholds,
+    sh_buffer_mask: np.ndarray,
+    gt_mask_eval: np.ndarray,
+    *,
+    device=None,
+) -> list[dict]:
+    """Compute threshold metrics for a single score map."""
+    if device is not None:
+        try:
+            return compute_metrics_batch_gpu(
+                score_map,
+                thresholds,
+                sh_buffer_mask,
+                gt_mask_eval,
+                device=device,
+            )
+        except Exception:
+            pass
+    return compute_metrics_batch_cpu(
+        score_map,
+        thresholds,
+        sh_buffer_mask,
+        gt_mask_eval,
+    )
+
+
+def _aggregate_threshold_metrics(
+    thresholds,
+    val_contexts: list[dict],
+    score_maps: list[np.ndarray],
+    *,
+    device=None,
+) -> dict:
+    """Aggregate threshold metrics across validation contexts with GT weights."""
+    stats: dict[float, dict[str, float]] = {}
+    for ctx, score_map in zip(val_contexts, score_maps, strict=True):
+        metrics_list = _compute_metrics_for_thresholds(
+            score_map,
+            thresholds,
+            ctx["sh_buffer_mask"],
+            ctx["gt_mask_eval"],
+            device=device,
+        )
+        weight = float(ctx.get("gt_weight", 1.0) or 1.0)
+        for metrics in metrics_list:
+            thr = float(metrics["threshold"])
+            bucket = stats.setdefault(
+                thr,
+                {
+                    "w": 0.0,
+                    "iou": 0.0,
+                    "f1": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                },
+            )
+            bucket["w"] += weight
+            bucket["iou"] += float(metrics["iou"]) * weight
+            bucket["f1"] += float(metrics["f1"]) * weight
+            bucket["precision"] += float(metrics["precision"]) * weight
+            bucket["recall"] += float(metrics["recall"]) * weight
+    if not stats:
+        raise ValueError("no threshold metrics were produced for validation contexts")
+    best_thr = None
+    best_payload = None
+    for thr, agg in stats.items():
+        w = max(float(agg["w"]), 1e-8)
+        payload = {
+            "threshold": float(thr),
+            "iou": float(agg["iou"] / w),
+            "f1": float(agg["f1"] / w),
+            "precision": float(agg["precision"] / w),
+            "recall": float(agg["recall"] / w),
+        }
+        if best_payload is None or payload["iou"] > float(best_payload["iou"]):
+            best_thr = thr
+            best_payload = payload
+    if best_payload is None or best_thr is None:
+        raise ValueError("failed to select a best threshold")
+    return best_payload
+
+
 def build_xgb_dataset(
     img,
     labels,
@@ -516,14 +660,14 @@ def hyperparam_search_xgb_iou(
     X,
     y,
     thresholds,
-    sh_buffer_mask_b,
-    gt_mask_b,
-    img_b,
-    ps,
-    tile_size,
-    stride,
-    feature_dir,
-    image_id_b,
+    sh_buffer_mask_b=None,
+    gt_mask_b=None,
+    img_b=None,
+    ps=16,
+    tile_size=1024,
+    stride=1024,
+    feature_dir=None,
+    image_id_b=None,
     prefetched_tiles=None,
     device=None,
     use_gpu=False,
@@ -536,21 +680,27 @@ def hyperparam_search_xgb_iou(
     context_radius: int = 0,
     use_kfold: bool | None = None,
     kfold_splits: int | None = None,
+    val_contexts: list[dict] | None = None,
+    groups: np.ndarray | None = None,
+    kfold_group_by_tile: bool | None = None,
+    kfold_shuffle: bool | None = None,
+    refit_mode: str | None = None,
+    refit_holdout_fraction: float | None = None,
 ):
-    """Search hyperparameters using IoU on Image B as the selection metric.
+    """Search hyperparameters using weighted IoU across validation contexts.
 
     Args:
         X (np.ndarray): Feature matrix from Image A.
         y (np.ndarray): Binary labels from Image A.
-        thresholds (list[float]): Thresholds to sweep on Image B scores.
-        sh_buffer_mask_b (np.ndarray): SH buffer mask for Image B.
-        gt_mask_b (np.ndarray): Ground-truth mask for Image B.
-        img_b (np.ndarray): Image B array.
+        thresholds (list[float]): Thresholds to sweep on validation score maps.
+        sh_buffer_mask_b (np.ndarray | None): Legacy single-tile SH buffer mask.
+        gt_mask_b (np.ndarray | None): Legacy single-tile GT mask.
+        img_b (np.ndarray | None): Legacy single-tile image.
         ps (int): Patch size.
         tile_size (int): Tile size in pixels.
         stride (int): Tile stride.
-        feature_dir (str): Feature cache directory.
-        image_id_b (str): Image B identifier.
+        feature_dir (str | None): Feature cache directory.
+        image_id_b (str | None): Legacy single-tile image id.
         prefetched_tiles (dict | None): Optional in-memory cache.
         device: Torch device for metrics (optional).
         use_gpu (bool): Use GPU histogram algorithm when available.
@@ -563,6 +713,12 @@ def hyperparam_search_xgb_iou(
         context_radius (int): Feature context radius.
         use_kfold (bool | None): Enable k-fold selection (None uses config).
         kfold_splits (int | None): Number of folds when k-fold is enabled.
+        val_contexts (list[dict] | None): Validation context list (multi-tile).
+        groups (np.ndarray | None): Optional source-sample grouping ids.
+        kfold_group_by_tile (bool | None): Keep groups disjoint across folds.
+        kfold_shuffle (bool | None): Shuffle groups before grouped k-fold split.
+        refit_mode (str | None): Refit strategy after selection.
+        refit_holdout_fraction (float | None): Holdout ratio for refit mode `holdout_es`.
 
     Returns:
         tuple[xgb.Booster | None, dict | None, float, float | None, dict | None]:
@@ -572,11 +728,39 @@ def hyperparam_search_xgb_iou(
         >>> isinstance(hyperparam_search_xgb_iou.__name__, str)
         True
     """
+    if thresholds is None or len(thresholds) == 0:
+        raise ValueError("thresholds must be non-empty")
+    thresholds = sorted({float(t) for t in thresholds})
+    if val_contexts is None:
+        if (
+            sh_buffer_mask_b is None
+            or gt_mask_b is None
+            or img_b is None
+            or image_id_b is None
+        ):
+            raise ValueError(
+                "val_contexts is required when legacy single-tile inputs are omitted"
+            )
+        gt_weight = float(np.count_nonzero(gt_mask_b))
+        val_contexts = [
+            {
+                "image_id": str(image_id_b),
+                "img_b": img_b,
+                "sh_buffer_mask": sh_buffer_mask_b,
+                "gt_mask_eval": gt_mask_b,
+                "prefetched_b": prefetched_tiles,
+                "gt_weight": gt_weight if gt_weight > 0 else 1.0,
+            }
+        ]
+    if not val_contexts:
+        raise ValueError("val_contexts must be non-empty")
+
     best_model = None
     best_params = None
     best_iou = -1.0
     best_metrics = None
     best_thr = None
+    best_refit_rounds: list[int] = []
 
     base_params = {
         "objective": "binary:logistic",
@@ -590,7 +774,7 @@ def hyperparam_search_xgb_iou(
         "tree_method": "gpu_hist" if use_gpu else "hist",
     }
     if param_grid is None:
-        param_grid = [base_params]
+        param_grid = [{}]
 
     n = len(X)
     if n == 0:
@@ -601,12 +785,43 @@ def hyperparam_search_xgb_iou(
         use_kfold = bool(getattr(cfg, "XGB_USE_KFOLD", False))
     if kfold_splits is None:
         kfold_splits = int(getattr(cfg, "XGB_KFOLD_SPLITS", 3) or 3)
+    if kfold_group_by_tile is None:
+        kfold_group_by_tile = bool(getattr(cfg, "XGB_KFOLD_GROUP_BY_TILE", True))
+    if kfold_shuffle is None:
+        kfold_shuffle = bool(getattr(cfg, "XGB_KFOLD_SHUFFLE", True))
+
     fold_splits: list[tuple[np.ndarray, np.ndarray]] = []
     if use_kfold:
-        fold_splits = _kfold_index_splits(n, kfold_splits, seed)
+        if groups is not None and bool(kfold_group_by_tile):
+            groups_arr = np.asarray(groups)
+            if groups_arr.shape[0] != n:
+                raise ValueError(
+                    f"xgb groups length mismatch: expected {n}, got {groups_arr.shape[0]}"
+                )
+            fold_splits = _group_kfold_index_splits(
+                groups_arr,
+                kfold_splits,
+                seed,
+                shuffle=bool(kfold_shuffle),
+            )
+            if fold_splits:
+                logger.info(
+                    "xgb-search-iou: grouped kfold folds=%s groups=%s samples=%s seed=%s shuffle=%s",
+                    len(fold_splits),
+                    len(np.unique(groups_arr)),
+                    n,
+                    seed,
+                    bool(kfold_shuffle),
+                )
+            else:
+                logger.warning(
+                    "xgb-search-iou: grouped kfold unavailable; falling back to sample kfold"
+                )
+        if not fold_splits:
+            fold_splits = _kfold_index_splits(n, kfold_splits, seed)
         if len(fold_splits) > 1:
             logger.info(
-                "xgb-search-iou: kfold enabled (folds=%s, samples=%s, seed=%s)",
+                "xgb-search-iou: sample kfold enabled (folds=%s, samples=%s, seed=%s)",
                 len(fold_splits),
                 n,
                 seed,
@@ -628,11 +843,12 @@ def hyperparam_search_xgb_iou(
 
     for i, overrides in enumerate(param_grid):
         params = base_params.copy()
-        params.update(overrides)
+        params.update(overrides or {})
         params["tree_method"] = "gpu_hist" if use_gpu else "hist"
         logger.info("xgb-search-iou cfg %s/%s: %s", i + 1, len(param_grid), params)
         fold_metrics: list[dict] = []
         fold_models = []
+        fold_rounds: list[int] = []
         for fold_idx, (train_idx, val_idx) in enumerate(fold_splits, start=1):
             y_train = np.asarray(y[train_idx], dtype=np.float32)
             y_val = np.asarray(y[val_idx], dtype=np.float32)
@@ -675,41 +891,31 @@ def hyperparam_search_xgb_iou(
                 else:
                     raise
 
-            score_full_xgb = xgb_score_image_b(
-                img_b,
-                model,
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                image_id_b,
-                prefetched_tiles=prefetched_tiles,
-                context_radius=context_radius,
-            )
-            if device is not None:
-                try:
-                    metrics_list = compute_metrics_batch_gpu(
-                        score_full_xgb,
-                        thresholds,
-                        sh_buffer_mask_b,
-                        gt_mask_b,
-                        device=device,
-                    )
-                except Exception:
-                    metrics_list = compute_metrics_batch_cpu(
-                        score_full_xgb,
-                        thresholds,
-                        sh_buffer_mask_b,
-                        gt_mask_b,
-                    )
-            else:
-                metrics_list = compute_metrics_batch_cpu(
-                    score_full_xgb,
-                    thresholds,
-                    sh_buffer_mask_b,
-                    gt_mask_b,
+            fold_rounds.append(_best_boost_round(model, num_boost_round))
+            score_maps = []
+            for ctx_idx, ctx in enumerate(val_contexts):
+                image_id_ctx = str(
+                    ctx.get("image_id") or image_id_b or f"val_tile_{ctx_idx}"
                 )
-            best_local = max(metrics_list, key=lambda m: m["iou"])
+                score_maps.append(
+                    xgb_score_image_b(
+                        ctx["img_b"],
+                        model,
+                        ps,
+                        tile_size,
+                        stride,
+                        feature_dir,
+                        image_id_ctx,
+                        prefetched_tiles=ctx.get("prefetched_b", prefetched_tiles),
+                        context_radius=context_radius,
+                    )
+                )
+            best_local = _aggregate_threshold_metrics(
+                thresholds,
+                val_contexts,
+                score_maps,
+                device=device,
+            )
             if len(fold_splits) > 1:
                 logger.info(
                     "xgb-search-iou cfg %s fold %s/%s: thr=%.3f, IoU=%.3f, F1=%.3f",
@@ -751,73 +957,145 @@ def hyperparam_search_xgb_iou(
             best_params = params.copy()
             best_thr = fold_metrics[best_fold_idx]["threshold"]
             best_metrics = fold_metrics[best_fold_idx]
+            best_refit_rounds = fold_rounds
 
-    # Refit the best configuration on all source samples when k-fold is enabled.
-    if len(fold_splits) > 1 and best_params is not None:
+    if best_params is not None:
         y_full = np.asarray(y, dtype=np.float32)
         params_full = best_params.copy()
         if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
             params_full["scale_pos_weight"] = _auto_scale_pos_weight(y_full)
-        dtrain_full = xgb.DMatrix(
-            X,
-            label=y_full,
-            weight=_build_binary_sample_weights(y_full),
-        )
-        logger.info("xgb-search-iou: refit best config on full source dataset")
-        try:
-            model_full = xgb.train(
-                params_full,
-                dtrain_full,
-                num_boost_round=num_boost_round,
-                verbose_eval=False,
+
+        if refit_mode is None:
+            refit_mode = str(getattr(cfg, "XGB_REFIT_MODE", "best_round_mean"))
+        refit_mode = str(refit_mode).strip().lower()
+        if refit_mode not in {"best_round_mean", "holdout_es", "fixed_rounds"}:
+            logger.warning(
+                "xgb-search-iou: invalid XGB_REFIT_MODE=%s; using best_round_mean",
+                refit_mode,
             )
-        except xgb.core.XGBoostError as e:
-            if use_gpu and "gpu_hist" in str(e):
-                logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
-                params_full["tree_method"] = "hist"
+            refit_mode = "best_round_mean"
+        if refit_holdout_fraction is None:
+            refit_holdout_fraction = float(
+                getattr(cfg, "XGB_REFIT_HOLDOUT_FRACTION", 0.1) or 0.1
+            )
+
+        model_full = None
+        if refit_mode == "holdout_es":
+            frac = float(np.clip(float(refit_holdout_fraction), 0.05, 0.5))
+            rng = np.random.default_rng(seed + 17)
+            idx = rng.permutation(n)
+            holdout_n = max(1, int(round(n * frac)))
+            if holdout_n >= n:
+                holdout_n = n - 1
+            train_idx = idx[:-holdout_n]
+            val_idx = idx[-holdout_n:]
+            if len(train_idx) > 0 and len(val_idx) > 0:
+                dtrain_refit = xgb.DMatrix(
+                    X[train_idx],
+                    label=y_full[train_idx],
+                    weight=_build_binary_sample_weights(y_full[train_idx]),
+                )
+                dval_refit = xgb.DMatrix(
+                    X[val_idx],
+                    label=y_full[val_idx],
+                    weight=_build_binary_sample_weights(y_full[val_idx]),
+                )
+                logger.info(
+                    "xgb-search-iou: refit mode=holdout_es train=%s val=%s frac=%.3f",
+                    len(train_idx),
+                    len(val_idx),
+                    frac,
+                )
+                try:
+                    model_full = xgb.train(
+                        params_full,
+                        dtrain_refit,
+                        num_boost_round=num_boost_round,
+                        evals=[(dtrain_refit, "train"), (dval_refit, "val")],
+                        early_stopping_rounds=early_stopping_rounds,
+                        verbose_eval=False,
+                    )
+                except xgb.core.XGBoostError as e:
+                    if use_gpu and "gpu_hist" in str(e):
+                        logger.warning(
+                            "xgboost build lacks GPU; retrying with CPU hist."
+                        )
+                        params_full["tree_method"] = "hist"
+                        model_full = xgb.train(
+                            params_full,
+                            dtrain_refit,
+                            num_boost_round=num_boost_round,
+                            evals=[(dtrain_refit, "train"), (dval_refit, "val")],
+                            early_stopping_rounds=early_stopping_rounds,
+                            verbose_eval=False,
+                        )
+                    else:
+                        raise
+            else:
+                refit_mode = "best_round_mean"
+
+        if model_full is None:
+            if refit_mode == "best_round_mean" and best_refit_rounds:
+                rounds = int(
+                    np.clip(np.round(np.mean(best_refit_rounds)), 1, num_boost_round)
+                )
+            else:
+                rounds = int(num_boost_round)
+            dtrain_full = xgb.DMatrix(
+                X,
+                label=y_full,
+                weight=_build_binary_sample_weights(y_full),
+            )
+            logger.info(
+                "xgb-search-iou: refit mode=%s rounds=%s samples=%s",
+                refit_mode,
+                rounds,
+                n,
+            )
+            try:
                 model_full = xgb.train(
                     params_full,
                     dtrain_full,
-                    num_boost_round=num_boost_round,
+                    num_boost_round=rounds,
                     verbose_eval=False,
                 )
-            else:
-                raise
-        score_full_xgb = xgb_score_image_b(
-            img_b,
-            model_full,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            image_id_b,
-            prefetched_tiles=prefetched_tiles,
-            context_radius=context_radius,
-        )
-        if device is not None:
-            try:
-                metrics_list = compute_metrics_batch_gpu(
-                    score_full_xgb,
-                    thresholds,
-                    sh_buffer_mask_b,
-                    gt_mask_b,
-                    device=device,
-                )
-            except Exception:
-                metrics_list = compute_metrics_batch_cpu(
-                    score_full_xgb,
-                    thresholds,
-                    sh_buffer_mask_b,
-                    gt_mask_b,
-                )
-        else:
-            metrics_list = compute_metrics_batch_cpu(
-                score_full_xgb,
-                thresholds,
-                sh_buffer_mask_b,
-                gt_mask_b,
+            except xgb.core.XGBoostError as e:
+                if use_gpu and "gpu_hist" in str(e):
+                    logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
+                    params_full["tree_method"] = "hist"
+                    model_full = xgb.train(
+                        params_full,
+                        dtrain_full,
+                        num_boost_round=rounds,
+                        verbose_eval=False,
+                    )
+                else:
+                    raise
+
+        score_maps_full = []
+        for ctx_idx, ctx in enumerate(val_contexts):
+            image_id_ctx = str(
+                ctx.get("image_id") or image_id_b or f"val_tile_{ctx_idx}"
             )
-        best_local = max(metrics_list, key=lambda m: m["iou"])
+            score_maps_full.append(
+                xgb_score_image_b(
+                    ctx["img_b"],
+                    model_full,
+                    ps,
+                    tile_size,
+                    stride,
+                    feature_dir,
+                    image_id_ctx,
+                    prefetched_tiles=ctx.get("prefetched_b", prefetched_tiles),
+                    context_radius=context_radius,
+                )
+            )
+        best_local = _aggregate_threshold_metrics(
+            thresholds,
+            val_contexts,
+            score_maps_full,
+            device=device,
+        )
         logger.info(
             "xgb-search-iou final-refit: thr=%.3f, IoU=%.3f, F1=%.3f",
             best_local["threshold"],

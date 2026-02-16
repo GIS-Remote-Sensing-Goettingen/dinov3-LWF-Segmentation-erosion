@@ -9,6 +9,7 @@ from segedge.core.features import labels_to_patch_masks
 from segedge.core.xdboost import (
     _auto_scale_pos_weight,
     _build_binary_sample_weights,
+    _group_kfold_index_splits,
     _kfold_index_splits,
     build_xgb_dataset,
 )
@@ -139,3 +140,21 @@ def test_kfold_index_splits_are_disjoint_and_cover_all_samples() -> None:
     assert sorted(val_all.tolist()) == list(range(10))
     for train_idx, val_idx in splits:
         assert len(np.intersect1d(train_idx, val_idx)) == 0
+
+
+def test_group_kfold_index_splits_keep_groups_isolated() -> None:
+    """Grouped folds should never split a group across train and validation."""
+    groups = np.array([0, 0, 1, 1, 2, 2, 3, 3], dtype=np.int32)
+    splits = _group_kfold_index_splits(groups, n_splits=3, seed=42, shuffle=True)
+    assert len(splits) == 3
+    for train_idx, val_idx in splits:
+        train_groups = set(groups[train_idx].tolist())
+        val_groups = set(groups[val_idx].tolist())
+        assert train_groups.isdisjoint(val_groups)
+
+
+def test_group_kfold_index_splits_returns_empty_for_single_group() -> None:
+    """Grouped k-fold requires at least two unique groups."""
+    groups = np.zeros((6,), dtype=np.int32)
+    splits = _group_kfold_index_splits(groups, n_splits=3, seed=42, shuffle=True)
+    assert splits == []

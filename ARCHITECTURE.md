@@ -111,7 +111,14 @@ XGB training-label and imbalance controls:
 - Negative domination can be reduced with `XGB_MAX_NEG_PER_TILE` before global
   `MAX_NEG_BANK` subsampling.
 - Candidate robustness can be estimated with shuffled k-fold source splits
-  (`XGB_USE_KFOLD`, `XGB_KFOLD_SPLITS`) before refitting the selected config.
+  (`XGB_USE_KFOLD`, `XGB_KFOLD_SPLITS`) and optional source-tile grouped folds
+  (`XGB_KFOLD_GROUP_BY_TILE`, `XGB_KFOLD_SHUFFLE`) before refitting.
+- Candidate screening can evaluate weighted IoU/F1 over all validation tiles
+  (`XGB_SELECTION_USE_ALL_VAL_TILES`) using configurable threshold sweeps
+  (`XGB_CANDIDATE_THRESHOLDS`).
+- Final refit strategy is configurable via `XGB_REFIT_MODE`
+  (`best_round_mean`, `holdout_es`, `fixed_rounds`) and
+  `XGB_REFIT_HOLDOUT_FRACTION`.
 
 ## Runtime Telemetry Architecture
 Per-tile telemetry is emitted during runtime, not post-hoc parsed from logs.
@@ -182,8 +189,8 @@ Run outputs are rooted at `output/run_XXX/`:
   `xgb_score_image_b` now logs image-level total/predict/resize timings,
   mirroring kNN timing introspection.
 - XGB proxy metric scope:
-  `xgb-search-iou` lines are single-tile proxy metrics used for fast candidate
-  screening before full multi-tile Bayesian objective scoring.
+  `xgb-search-iou` can score candidates on one tile or all validation tiles;
+  default behavior is weighted multi-tile selection before downstream scoring.
 - Bayesian stagnation guard:
   Optuna studies can stop early after `BO_EARLY_STOP_PATIENCE` non-improving trials
   (with tolerance `BO_EARLY_STOP_MIN_DELTA`).

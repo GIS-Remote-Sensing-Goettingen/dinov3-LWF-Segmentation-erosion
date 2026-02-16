@@ -983,21 +983,20 @@ def main():
     )
 
     image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
-
-    # Build DINOv3 banks + XGBoost training data from Image A sources.
     _log_phase("START", "image_a_processing")
     pos_banks = []
     neg_banks = []
     X_list = []
     y_list = []
+    xgb_group_list = []
     source_cache_eligible = 0
     source_cache_skipped_no_gt = 0
     source_prefetch_attempted = 0
     source_prefetch_completed = 0
     source_gt_overlap_cache: dict[str, bool] = {}
     source_prefetch_warned_no_gt_vectors = False
-    for img_a_path, lab_a_path, image_id_a in zip(
-        img_a_paths, lab_a_paths, image_id_a_list, strict=True
+    for source_idx, (img_a_path, lab_a_path, image_id_a) in enumerate(
+        zip(img_a_paths, lab_a_paths, image_id_a_list, strict=True)
     ):
         source_timings: dict[str, float] = {}
         t0_source_total = time.perf_counter()
@@ -1026,7 +1025,6 @@ def main():
             source_cache_eligible += 1
         else:
             source_cache_skipped_no_gt += 1
-
         t0 = time.perf_counter()
         img_a = load_dop20_image(img_a_path, downsample_factor=ds)
         source_timings["load_source_image_s"] = time.perf_counter() - t0
@@ -1116,6 +1114,7 @@ def main():
         if X_i.size > 0 and y_i.size > 0:
             X_list.append(X_i)
             y_list.append(y_i)
+            xgb_group_list.append(np.full(y_i.shape[0], source_idx, dtype=np.int32))
     if source_prefetch_gt_only:
         logger.info(
             "source cache gate: eligible=%s skipped_no_gt=%s total=%s",
@@ -1143,11 +1142,11 @@ def main():
 
     X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
+    xgb_groups = np.concatenate(xgb_group_list) if xgb_group_list else None
     if X.size == 0 or y.size == 0:
         raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
     _log_phase("END", "image_a_processing")
 
-    # Tune on validation tile, then infer on holdout tiles.
     _log_phase("START", "validation_tuning")
     tuned = tune_on_validation_multi(
         val_tiles,
@@ -1159,6 +1158,7 @@ def main():
         neg_bank,
         X,
         y,
+        xgb_groups,
         ps,
         tile_size,
         stride,

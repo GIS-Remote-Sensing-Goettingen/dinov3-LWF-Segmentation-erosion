@@ -23,11 +23,7 @@ from ..core.optuna_csv import (
 )
 from ..core.plotting import save_unified_plot
 from ..core.summary_utils import weighted_mean
-from ..core.xdboost import (
-    hyperparam_search_xgb_iou,
-    train_xgb_classifier,
-    xgb_score_image_b,
-)
+from ..core.xdboost import hyperparam_search_xgb_iou, xgb_score_image_b
 from .inference_utils import (
     _apply_roads_penalty,
     _apply_shadow_filter,
@@ -322,6 +318,7 @@ def tune_on_validation_multi(
     neg_bank: np.ndarray | None,
     X: np.ndarray,
     y: np.ndarray,
+    xgb_groups: np.ndarray | None,
     ps: int,
     tile_size: int,
     stride: int,
@@ -340,6 +337,7 @@ def tune_on_validation_multi(
         neg_bank (np.ndarray | None): Negative bank.
         X (np.ndarray): XGB feature matrix.
         y (np.ndarray): XGB labels.
+        xgb_groups (np.ndarray | None): Optional group id per XGB sample.
         ps (int): Patch size.
         tile_size (int): Tile size in pixels.
         stride (int): Tile stride.
@@ -415,48 +413,63 @@ def tune_on_validation_multi(
     val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
     use_kfold_xgb = bool(getattr(cfg, "XGB_USE_KFOLD", False))
     kfold_splits_xgb = int(getattr(cfg, "XGB_KFOLD_SPLITS", 3) or 3)
+    kfold_group_by_tile_xgb = bool(getattr(cfg, "XGB_KFOLD_GROUP_BY_TILE", True))
+    xgb_candidate_thresholds = sorted(
+        {float(t) for t in (getattr(cfg, "XGB_CANDIDATE_THRESHOLDS", [0.5]) or [0.5])}
+    )
+    selection_use_all_val_tiles = bool(
+        getattr(cfg, "XGB_SELECTION_USE_ALL_VAL_TILES", True)
+    )
+    candidate_val_contexts = (
+        val_contexts if selection_use_all_val_tiles else val_contexts[:1]
+    )
+    refit_mode_xgb = str(getattr(cfg, "XGB_REFIT_MODE", "best_round_mean"))
+    refit_holdout_fraction_xgb = float(
+        getattr(cfg, "XGB_REFIT_HOLDOUT_FRACTION", 0.1) or 0.1
+    )
     if param_grid is None:
         param_grid = [None]
+    logger.info(
+        "tune: xgb candidate selection val_tiles=%s thresholds=%s kfold=%s/%s group_by_tile=%s refit_mode=%s",
+        len(candidate_val_contexts),
+        xgb_candidate_thresholds,
+        use_kfold_xgb,
+        kfold_splits_xgb,
+        kfold_group_by_tile_xgb,
+        refit_mode_xgb,
+    )
 
     xgb_candidates = []
     for overrides in param_grid:
-        if overrides is None and not use_kfold_xgb:
-            bst = train_xgb_classifier(
-                X,
-                y,
-                use_gpu=use_gpu_xgb,
-                num_boost_round=num_boost_round,
-                verbose_eval=verbose_eval,
-            )
-            params_used = None
-        else:
-            search_grid = [overrides] if overrides is not None else [{}]
-            bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
-                X,
-                y,
-                [0.5],
-                val_contexts[0]["sh_buffer_mask"],
-                val_contexts[0]["gt_mask_eval"],
-                val_contexts[0]["img_b"],
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                val_contexts[0]["image_id"],
-                prefetched_tiles=val_contexts[0]["prefetched_b"],
-                device=device,
-                use_gpu=use_gpu_xgb,
-                param_grid=search_grid,
-                num_boost_round=num_boost_round,
-                val_fraction=val_fraction,
-                early_stopping_rounds=early_stop,
-                verbose_eval=verbose_eval,
-                seed=42,
-                context_radius=context_radius,
-                use_kfold=use_kfold_xgb,
-                kfold_splits=kfold_splits_xgb,
-            )
-        xgb_candidates.append({"bst": bst, "params": params_used})
+        search_grid = [overrides] if overrides is not None else [{}]
+        bst, params_used, _, best_thr, _ = hyperparam_search_xgb_iou(
+            X,
+            y,
+            xgb_candidate_thresholds,
+            ps=ps,
+            tile_size=tile_size,
+            stride=stride,
+            feature_dir=feature_dir,
+            device=device,
+            use_gpu=use_gpu_xgb,
+            param_grid=search_grid,
+            num_boost_round=num_boost_round,
+            val_fraction=val_fraction,
+            early_stopping_rounds=early_stop,
+            verbose_eval=verbose_eval,
+            seed=42,
+            context_radius=context_radius,
+            use_kfold=use_kfold_xgb,
+            kfold_splits=kfold_splits_xgb,
+            val_contexts=candidate_val_contexts,
+            groups=xgb_groups,
+            kfold_group_by_tile=kfold_group_by_tile_xgb,
+            refit_mode=refit_mode_xgb,
+            refit_holdout_fraction=refit_holdout_fraction_xgb,
+        )
+        xgb_candidates.append(
+            {"bst": bst, "params": params_used, "candidate_threshold": best_thr}
+        )
 
     tuning_mode = str(getattr(cfg, "TUNING_MODE", "grid")).strip().lower()
     if tuning_mode == "bayes":
