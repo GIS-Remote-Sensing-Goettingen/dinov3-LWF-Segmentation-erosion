@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [0.2.46]
+- Description: Add root-cause XGB robustness controls (clean patch labeling + class-imbalance weighting) and safer defaults for anti-leak and late-stage tuning pressure.
+- file touched: `config.py`, `segedge/core/features.py`, `segedge/core/xdboost.py`, `segedge/core/run_config_logging.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_xgb_training_controls.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Later-stage IoU collapsed despite high proxy XGB scores; improve training signal quality and class-imbalance handling in XGB training while tightening anti-leak defaults.
+- problems fixed: Adds `XGB_POS_FRAC_THRESH`/`XGB_NEG_FRAC_MAX` ignore-band patch labeling, optional `scale_pos_weight` and sample weights with clamp, dataset sparsity warnings, clearer single-tile proxy logging in XGB search output, and safer defaults for anti-leak and late-stage tuning pressure.
+
 ## [0.2.45]
 - Description: Add post-training PCA/XGB component explainability plot with top-5 RGB overlays.
 - file touched: `config.py`, `segedge/core/explainability.py`, `segedge/pipeline/run.py`, `tests/test_explainability.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

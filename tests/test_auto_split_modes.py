@@ -264,6 +264,12 @@ def test_anti_leak_checks_detect_duplicate_source_validation_paths(
         "source_raster",
         raising=False,
     )
+    monkeypatch.setattr(
+        common_module.cfg,
+        "ANTI_LEAK_FAIL_FAST",
+        False,
+        raising=False,
+    )
     issues = run_source_validation_anti_leak_checks(
         source_tiles=["/tmp/tile_a.tif"],
         val_tiles=["/tmp/tile_a.tif"],
@@ -291,6 +297,12 @@ def test_anti_leak_checks_warn_on_gt_vector_reuse_default(
         common_module.cfg,
         "SOURCE_TRAIN_GT_VECTORS",
         None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        common_module.cfg,
+        "ANTI_LEAK_FAIL_FAST",
+        False,
         raising=False,
     )
     issues = run_source_validation_anti_leak_checks(

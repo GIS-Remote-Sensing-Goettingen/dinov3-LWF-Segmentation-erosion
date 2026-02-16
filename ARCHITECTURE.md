@@ -96,6 +96,17 @@ Source supervision for bank/XGB training:
   - warn when GT-based source supervision reuses evaluation GT vectors.
   - optionally fail fast via `ANTI_LEAK_FAIL_FAST`.
 
+XGB training-label and imbalance controls:
+- XGB can use a stricter patch-positive threshold via `XGB_POS_FRAC_THRESH`
+  (fallback: `POS_FRAC_THRESH`).
+- Clean negatives are controlled by `XGB_NEG_FRAC_MAX`; patches in
+  `(XGB_NEG_FRAC_MAX, XGB_POS_FRAC_THRESH)` are ignored.
+- Class imbalance mitigation uses optional `scale_pos_weight`
+  (`XGB_USE_SCALE_POS_WEIGHT`) and per-sample weights
+  (`XGB_USE_SAMPLE_WEIGHTS`), with ratio clamp `XGB_CLASS_WEIGHT_MAX`.
+- Sparse training sets are surfaced via warnings controlled by
+  `XGB_MIN_POS_SAMPLES_WARN` and `XGB_MIN_POS_RATIO_WARN`.
+
 ## Runtime Telemetry Architecture
 Per-tile telemetry is emitted during runtime, not post-hoc parsed from logs.
 
@@ -164,6 +175,9 @@ Run outputs are rooted at `output/run_XXX/`:
 - XGB runtime diagnostics:
   `xgb_score_image_b` now logs image-level total/predict/resize timings,
   mirroring kNN timing introspection.
+- XGB proxy metric scope:
+  `xgb-search-iou` lines are single-tile proxy metrics used for fast candidate
+  screening before full multi-tile Bayesian objective scoring.
 - Bayesian stagnation guard:
   Optuna studies can stop early after `BO_EARLY_STOP_PATIENCE` non-improving trials
   (with tolerance `BO_EARLY_STOP_MIN_DELTA`).

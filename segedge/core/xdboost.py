@@ -64,6 +64,53 @@ def _resize_patch_map(
     ).astype(np.float32)
 
 
+def _class_balance(y: np.ndarray) -> tuple[int, int]:
+    """Return positive and negative sample counts for binary labels.
+
+    Examples:
+        >>> _class_balance(np.array([1, 0, 1, 0], dtype=np.float32))
+        (2, 2)
+    """
+    yb = np.asarray(y) > 0.5
+    pos = int(np.count_nonzero(yb))
+    neg = int(yb.size - pos)
+    return pos, neg
+
+
+def _auto_scale_pos_weight(y: np.ndarray) -> float:
+    """Compute a clamped negative/positive ratio for XGBoost class balancing.
+
+    Examples:
+        >>> round(_auto_scale_pos_weight(np.array([1, 0, 0], dtype=np.float32)), 2)
+        2.0
+    """
+    pos, neg = _class_balance(y)
+    if pos <= 0:
+        return 1.0
+    ratio = float(neg) / float(max(pos, 1))
+    max_ratio = float(getattr(cfg, "XGB_CLASS_WEIGHT_MAX", 25.0) or 25.0)
+    return float(np.clip(ratio, 1.0, max_ratio))
+
+
+def _build_binary_sample_weights(y: np.ndarray) -> np.ndarray | None:
+    """Build per-sample weights for imbalanced binary training.
+
+    Examples:
+        >>> w = _build_binary_sample_weights(np.array([1, 0, 0], dtype=np.float32))
+        >>> bool(w is None or (w[0] > 1.0 and w[1] == 1.0))
+        True
+    """
+    if not bool(getattr(cfg, "XGB_USE_SAMPLE_WEIGHTS", True)):
+        return None
+    yb = np.asarray(y) > 0.5
+    if yb.size == 0:
+        return None
+    w_pos = _auto_scale_pos_weight(y)
+    weights = np.ones(yb.size, dtype=np.float32)
+    weights[yb] = np.float32(w_pos)
+    return weights
+
+
 def build_xgb_dataset(
     img,
     labels,
@@ -73,6 +120,7 @@ def build_xgb_dataset(
     feature_dir,
     image_id,
     pos_frac,
+    neg_frac_max: float = 0.0,
     max_neg=8000,
     context_radius: int = 0,
     prefetched_tiles: dict | None = None,
@@ -88,6 +136,7 @@ def build_xgb_dataset(
         feature_dir (str | None): Directory containing precomputed features.
         image_id (str): Identifier for the image.
         pos_frac (float): Fraction threshold for positive patches.
+        neg_frac_max (float): Maximum positive fraction for negative patches.
         max_neg (int): Maximum number of negative samples.
         context_radius (int): Feature context radius.
         prefetched_tiles (dict | None): Optional in-memory tile feature cache.
@@ -103,6 +152,9 @@ def build_xgb_dataset(
         raise ValueError("feature_dir or prefetched_tiles must be provided")
 
     X_pos, X_neg = [], []
+    patch_pos_total = 0
+    patch_neg_total = 0
+    patch_ignored_total = 0
     missing_feature_tiles = 0
     resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
@@ -154,8 +206,19 @@ def build_xgb_dataset(
             )
             continue
         pos_mask, neg_mask = labels_to_patch_masks(
-            lab_c, hp, wp, pos_frac_thresh=pos_frac
+            lab_c,
+            hp,
+            wp,
+            pos_frac_thresh=float(pos_frac),
+            neg_frac_thresh=float(neg_frac_max),
         )
+        patch_count = int(pos_mask.size)
+        pos_count = int(np.count_nonzero(pos_mask))
+        neg_count = int(np.count_nonzero(neg_mask))
+        ignored_count = max(0, patch_count - pos_count - neg_count)
+        patch_pos_total += pos_count
+        patch_neg_total += neg_count
+        patch_ignored_total += ignored_count
         if pos_mask.any():
             X_pos.append(feats_tile[pos_mask])
         if neg_mask.any():
@@ -170,8 +233,12 @@ def build_xgb_dataset(
 
     if not X_pos:
         logger.warning(
-            "build_xgb_dataset produced no positive samples for image_id=%s; skipping this source tile",
+            "build_xgb_dataset produced no positive samples for image_id=%s; "
+            "skipping this source tile (patches: pos=%s neg=%s ignored=%s)",
             image_id,
+            patch_pos_total,
+            patch_neg_total,
+            patch_ignored_total,
         )
         return np.empty((0, 0), dtype=np.float32), np.empty((0,), dtype=np.float32)
 
@@ -183,7 +250,38 @@ def build_xgb_dataset(
         X_neg = X_neg[idx]
 
     X = np.vstack([X_pos, X_neg])
-    y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))])
+    y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))]).astype(np.float32)
+    pos_count, neg_count = _class_balance(y)
+    total = int(y.size)
+    pos_ratio = float(pos_count / max(total, 1))
+    min_pos = int(getattr(cfg, "XGB_MIN_POS_SAMPLES_WARN", 200) or 200)
+    min_pos_ratio = float(getattr(cfg, "XGB_MIN_POS_RATIO_WARN", 0.02) or 0.02)
+    if pos_count < min_pos or pos_ratio < min_pos_ratio:
+        logger.warning(
+            "xgb-dataset sparsity image=%s samples(pos=%s neg=%s pos_ratio=%.4f) "
+            "patches(pos=%s neg=%s ignored=%s) thresholds(min_pos=%s min_ratio=%.4f)",
+            image_id,
+            pos_count,
+            neg_count,
+            pos_ratio,
+            patch_pos_total,
+            patch_neg_total,
+            patch_ignored_total,
+            min_pos,
+            min_pos_ratio,
+        )
+    else:
+        logger.info(
+            "xgb-dataset image=%s samples(pos=%s neg=%s pos_ratio=%.4f) "
+            "patches(pos=%s neg=%s ignored=%s)",
+            image_id,
+            pos_count,
+            neg_count,
+            pos_ratio,
+            patch_pos_total,
+            patch_neg_total,
+            patch_ignored_total,
+        )
     return X, y
 
 
@@ -204,7 +302,8 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         >>> isinstance(train_xgb_classifier.__name__, str)
         True
     """
-    dtrain = xgb.DMatrix(X, label=y)
+    y_arr = np.asarray(y, dtype=np.float32)
+    dtrain = xgb.DMatrix(X, label=y_arr, weight=_build_binary_sample_weights(y_arr))
     params = {
         "objective": "binary:logistic",
         "eval_metric": "logloss",
@@ -216,6 +315,8 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         "min_child_weight": 3,
         "tree_method": "gpu_hist" if use_gpu else "hist",
     }
+    if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
+        params["scale_pos_weight"] = _auto_scale_pos_weight(y_arr)
     try:
         bst = xgb.train(
             params,
@@ -281,9 +382,18 @@ def hyperparam_search_xgb(
     idx = rng.permutation(n)
     split = max(1, int(n * (1 - val_fraction)))
     train_idx, val_idx = idx[:split], idx[split:]
-
-    dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
-    dval = xgb.DMatrix(X[val_idx], label=y[val_idx])
+    y_train = np.asarray(y[train_idx], dtype=np.float32)
+    y_val = np.asarray(y[val_idx], dtype=np.float32)
+    dtrain = xgb.DMatrix(
+        X[train_idx],
+        label=y_train,
+        weight=_build_binary_sample_weights(y_train),
+    )
+    dval = xgb.DMatrix(
+        X[val_idx],
+        label=y_val,
+        weight=_build_binary_sample_weights(y_val),
+    )
 
     base_params = {
         "objective": "binary:logistic",
@@ -307,6 +417,8 @@ def hyperparam_search_xgb(
         params = base_params.copy()
         params.update(overrides)
         params["tree_method"] = "gpu_hist" if use_gpu else "hist"
+        if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
+            params.setdefault("scale_pos_weight", _auto_scale_pos_weight(y_train))
         logger.info("xgb-search cfg %s/%s: %s", i + 1, len(param_grid), params)
         try:
             model = xgb.train(
@@ -439,13 +551,25 @@ def hyperparam_search_xgb_iou(
     idx = rng.permutation(n)
     split = max(1, int(n * (1 - val_fraction)))
     train_idx, val_idx = idx[:split], idx[split:]
-    dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
-    dval = xgb.DMatrix(X[val_idx], label=y[val_idx])
+    y_train = np.asarray(y[train_idx], dtype=np.float32)
+    y_val = np.asarray(y[val_idx], dtype=np.float32)
+    dtrain = xgb.DMatrix(
+        X[train_idx],
+        label=y_train,
+        weight=_build_binary_sample_weights(y_train),
+    )
+    dval = xgb.DMatrix(
+        X[val_idx],
+        label=y_val,
+        weight=_build_binary_sample_weights(y_val),
+    )
 
     for i, overrides in enumerate(param_grid):
         params = base_params.copy()
         params.update(overrides)
         params["tree_method"] = "gpu_hist" if use_gpu else "hist"
+        if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
+            params.setdefault("scale_pos_weight", _auto_scale_pos_weight(y_train))
         logger.info("xgb-search-iou cfg %s/%s: %s", i + 1, len(param_grid), params)
         try:
             model = xgb.train(
@@ -509,7 +633,7 @@ def hyperparam_search_xgb_iou(
 
         best_local = max(metrics_list, key=lambda m: m["iou"])
         logger.info(
-            "xgb-search-iou cfg %s: thr=%.3f, IoU=%.3f, F1=%.3f",
+            "xgb-search-iou cfg %s (single-tile proxy): thr=%.3f, IoU=%.3f, F1=%.3f",
             i + 1,
             best_local["threshold"],
             best_local["iou"],

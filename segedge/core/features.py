@@ -150,7 +150,11 @@ def crop_to_multiple_of_ps(
 
 
 def labels_to_patch_masks(
-    labels_tile: np.ndarray, hp: int, wp: int, pos_frac_thresh: float = 0.1
+    labels_tile: np.ndarray,
+    hp: int,
+    wp: int,
+    pos_frac_thresh: float = 0.1,
+    neg_frac_thresh: float = 0.0,
 ):
     """Convert pixel labels to patch-level positive/negative masks.
 
@@ -159,6 +163,7 @@ def labels_to_patch_masks(
         hp (int): Patch grid height.
         wp (int): Patch grid width.
         pos_frac_thresh (float): Fraction of positive pixels to mark a patch as positive.
+        neg_frac_thresh (float): Maximum positive fraction to mark a patch as negative.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: Boolean positive mask, boolean negative mask.
@@ -174,6 +179,12 @@ def labels_to_patch_masks(
         >>> pos, neg = labels_to_patch_masks(labels, hp=2, wp=2, pos_frac_thresh=0.5)
         >>> pos.tolist(), neg.tolist()
         ([[True, False], [False, False]], [[False, True], [True, True]])
+        >>> labels2 = np.array([[1, 0], [0, 0]], dtype=np.uint8)
+        >>> pos2, neg2 = labels_to_patch_masks(
+        ...     labels2, hp=1, wp=1, pos_frac_thresh=0.6, neg_frac_thresh=0.2
+        ... )
+        >>> pos2.item(), neg2.item()
+        (False, False)
     """
     t0 = time.perf_counter() if DEBUG_TIMING and DEBUG_TIMING_VERBOSE else None
     h_eff, w_eff = labels_tile.shape
@@ -183,8 +194,12 @@ def labels_to_patch_masks(
     labels_bin = (labels_c > 0).astype(np.float32)
     blocks = labels_bin.reshape(hp, patch_h, wp, patch_w)
     frac_pos = blocks.mean(axis=(1, 3))
+    if neg_frac_thresh > pos_frac_thresh:
+        raise ValueError(
+            "neg_frac_thresh must be <= pos_frac_thresh to keep a valid ignore band"
+        )
     pos_mask = frac_pos >= pos_frac_thresh
-    neg_mask = frac_pos == 0.0
+    neg_mask = frac_pos <= neg_frac_thresh
     if DEBUG_TIMING and DEBUG_TIMING_VERBOSE:
         time_end("labels_to_patch_masks", t0)
     return pos_mask, neg_mask

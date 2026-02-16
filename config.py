@@ -45,7 +45,7 @@ SOURCE_SUPERVISION_MIN_POS_PIXELS = 1
 # Anti-leak checks between source training and validation.
 ANTI_LEAK_CHECKS_ENABLED = True
 # Raise instead of warn when anti-leak checks detect problems.
-ANTI_LEAK_FAIL_FAST = False
+ANTI_LEAK_FAIL_FAST = True
 # Spatial overlap threshold (relative to smaller tile area) to flag source/validation overlap.
 ANTI_LEAK_TILE_OVERLAP_MIN_RATIO = 0.0
 # Limit number of overlapping source/validation tile pairs scanned/logged.
@@ -217,7 +217,7 @@ TUNING_MODE = "bayes"
 # Bayesian optimization controls
 BO_SEED = 42
 BO_STAGE1_TRIALS = 40
-BO_STAGE2_TRIALS = 40
+BO_STAGE2_TRIALS = 20
 BO_STAGE3_TRIALS = 20
 BO_TIMEOUT_S = None
 BO_ENABLE_PRUNING = True
@@ -261,7 +261,7 @@ BO_DYNAMIC_THRESHOLD_BINS = 64
 BO_STAGE2_TOP_N = 10
 BO_STAGE2_BROAD_FRACTION = 0.6
 # Bridge optimization gate.
-BO_TUNE_BRIDGE = True
+BO_TUNE_BRIDGE = False
 
 # Range-first Optuna search space (if set, takes precedence over *_VALUES).
 BO_K_RANGE = (10, 300)
@@ -308,6 +308,19 @@ XGB_VAL_FRACTION = 0.2
 XGB_NUM_BOOST_ROUND = 15
 XGB_EARLY_STOP = 100
 XGB_VERBOSE_EVAL = 20
+# Override patch-purity threshold for XGB supervision (None => POS_FRAC_THRESH).
+XGB_POS_FRAC_THRESH = 0.1
+# Mark a patch as negative only if positive fraction is <= this threshold.
+# Values > 0 add a strict "ignore band" between negatives and positives.
+XGB_NEG_FRAC_MAX = 0.0
+# Class-imbalance controls for XGB training.
+XGB_USE_SCALE_POS_WEIGHT = True
+XGB_USE_SAMPLE_WEIGHTS = True
+# Clamp auto class weight ratio to avoid unstable overweighting on sparse GT tiles.
+XGB_CLASS_WEIGHT_MAX = 25.0
+# Warn when per-tile or merged XGB datasets are too sparse in positives.
+XGB_MIN_POS_SAMPLES_WARN = 200
+XGB_MIN_POS_RATIO_WARN = 0.02
 XGB_PARAM_GRID = [
     # 1) Baseline
     {

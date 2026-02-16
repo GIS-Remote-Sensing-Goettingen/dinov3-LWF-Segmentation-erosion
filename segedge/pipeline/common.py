@@ -859,6 +859,10 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
     gt_vector_paths = getattr(cfg, "EVAL_GT_VECTORS", None)
     context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
     ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    xgb_pos_frac = getattr(cfg, "XGB_POS_FRAC_THRESH", None)
+    if xgb_pos_frac is None:
+        xgb_pos_frac = getattr(cfg, "POS_FRAC_THRESH", 0.1)
+    xgb_neg_frac_max = float(getattr(cfg, "XGB_NEG_FRAC_MAX", 0.0) or 0.0)
 
     X_list = []
     y_list = []
@@ -880,7 +884,8 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
             stride,
             feature_dir,
             image_id_a,
-            pos_frac=cfg.POS_FRAC_THRESH,
+            pos_frac=float(xgb_pos_frac),
+            neg_frac_max=xgb_neg_frac_max,
             max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
             context_radius=context_radius,
         )

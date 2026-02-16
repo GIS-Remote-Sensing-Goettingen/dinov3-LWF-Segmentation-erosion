@@ -74,6 +74,19 @@ def log_training_ablation_summary(
         _fmt_values(getattr(cfg, "SHADOW_THRESHOLDS", []), max_items=6),
         _fmt_values(getattr(cfg, "ROADS_PENALTY_VALUES", [1.0]), max_items=6),
     )
+    logger.info(
+        "train settings: xgb_labels pos_frac=%s neg_frac_max=%.4f "
+        "scale_pos_weight=%s sample_weights=%s class_weight_max=%.2f",
+        (
+            getattr(cfg, "XGB_POS_FRAC_THRESH", None)
+            if getattr(cfg, "XGB_POS_FRAC_THRESH", None) is not None
+            else getattr(cfg, "POS_FRAC_THRESH", 0.1)
+        ),
+        float(getattr(cfg, "XGB_NEG_FRAC_MAX", 0.0) or 0.0),
+        bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)),
+        bool(getattr(cfg, "XGB_USE_SAMPLE_WEIGHTS", True)),
+        float(getattr(cfg, "XGB_CLASS_WEIGHT_MAX", 25.0) or 25.0),
+    )
     if tuning_mode == "bayes":
         logger.info(
             "train ablation (bayes): stage_trials=%s/%s/%s "
