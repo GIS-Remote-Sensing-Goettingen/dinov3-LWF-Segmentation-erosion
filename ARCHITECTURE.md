@@ -79,6 +79,8 @@ If `AUTO_SPLIT_TILES=True`, split behavior depends on `AUTO_SPLIT_MODE`:
   - GT-overlap tiles are split into source/validation using
     `VAL_SPLIT_FRACTION` and `SPLIT_SEED`.
   - Non-GT tiles are holdout.
+  - Recommended for XGB generalization because most GT-overlap tiles become
+    trainable source data.
 
 Common prefilter:
 - Tile candidates are filtered to those overlapping `SOURCE_LABEL_RASTER` bounds.
@@ -106,6 +108,10 @@ XGB training-label and imbalance controls:
   (`XGB_USE_SAMPLE_WEIGHTS`), with ratio clamp `XGB_CLASS_WEIGHT_MAX`.
 - Sparse training sets are surfaced via warnings controlled by
   `XGB_MIN_POS_SAMPLES_WARN` and `XGB_MIN_POS_RATIO_WARN`.
+- Negative domination can be reduced with `XGB_MAX_NEG_PER_TILE` before global
+  `MAX_NEG_BANK` subsampling.
+- Candidate robustness can be estimated with shuffled k-fold source splits
+  (`XGB_USE_KFOLD`, `XGB_KFOLD_SPLITS`) before refitting the selected config.
 
 ## Runtime Telemetry Architecture
 Per-tile telemetry is emitted during runtime, not post-hoc parsed from logs.

@@ -111,6 +111,40 @@ def _build_binary_sample_weights(y: np.ndarray) -> np.ndarray | None:
     return weights
 
 
+def _kfold_index_splits(
+    n_samples: int,
+    n_splits: int,
+    seed: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build deterministic shuffled k-fold index splits.
+
+    Examples:
+        >>> splits = _kfold_index_splits(5, 3, 42)
+        >>> len(splits)
+        3
+        >>> all(len(np.intersect1d(tr, va)) == 0 for tr, va in splits)
+        True
+    """
+    if n_samples < 2:
+        return []
+    k = max(2, int(n_splits or 2))
+    k = min(k, int(n_samples))
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(n_samples)
+    fold_sizes = np.full(k, n_samples // k, dtype=np.int64)
+    fold_sizes[: n_samples % k] += 1
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    start = 0
+    for fold_size in fold_sizes.tolist():
+        end = start + int(fold_size)
+        val_idx = indices[start:end]
+        train_idx = np.concatenate([indices[:start], indices[end:]])
+        if len(train_idx) > 0 and len(val_idx) > 0:
+            splits.append((train_idx, val_idx))
+        start = end
+    return splits
+
+
 def build_xgb_dataset(
     img,
     labels,
@@ -152,6 +186,8 @@ def build_xgb_dataset(
         raise ValueError("feature_dir or prefetched_tiles must be provided")
 
     X_pos, X_neg = [], []
+    rng = np.random.default_rng(42)
+    tile_neg_cap = int(getattr(cfg, "XGB_MAX_NEG_PER_TILE", 0) or 0)
     patch_pos_total = 0
     patch_neg_total = 0
     patch_ignored_total = 0
@@ -222,7 +258,11 @@ def build_xgb_dataset(
         if pos_mask.any():
             X_pos.append(feats_tile[pos_mask])
         if neg_mask.any():
-            X_neg.append(feats_tile[neg_mask])
+            neg_tile = feats_tile[neg_mask]
+            if tile_neg_cap > 0 and len(neg_tile) > tile_neg_cap:
+                idx = rng.choice(len(neg_tile), size=tile_neg_cap, replace=False)
+                neg_tile = neg_tile[idx]
+            X_neg.append(neg_tile)
 
     if missing_feature_tiles > 0:
         logger.warning(
@@ -259,7 +299,8 @@ def build_xgb_dataset(
     if pos_count < min_pos or pos_ratio < min_pos_ratio:
         logger.warning(
             "xgb-dataset sparsity image=%s samples(pos=%s neg=%s pos_ratio=%.4f) "
-            "patches(pos=%s neg=%s ignored=%s) thresholds(min_pos=%s min_ratio=%.4f)",
+            "patches(pos=%s neg=%s ignored=%s) thresholds(min_pos=%s min_ratio=%.4f) "
+            "neg_caps(tile=%s total=%s)",
             image_id,
             pos_count,
             neg_count,
@@ -269,11 +310,13 @@ def build_xgb_dataset(
             patch_ignored_total,
             min_pos,
             min_pos_ratio,
+            tile_neg_cap,
+            max_neg,
         )
     else:
         logger.info(
             "xgb-dataset image=%s samples(pos=%s neg=%s pos_ratio=%.4f) "
-            "patches(pos=%s neg=%s ignored=%s)",
+            "patches(pos=%s neg=%s ignored=%s) neg_caps(tile=%s total=%s)",
             image_id,
             pos_count,
             neg_count,
@@ -281,6 +324,8 @@ def build_xgb_dataset(
             patch_pos_total,
             patch_neg_total,
             patch_ignored_total,
+            tile_neg_cap,
+            max_neg,
         )
     return X, y
 
@@ -489,6 +534,8 @@ def hyperparam_search_xgb_iou(
     verbose_eval=50,
     seed: int = 42,
     context_radius: int = 0,
+    use_kfold: bool | None = None,
+    kfold_splits: int | None = None,
 ):
     """Search hyperparameters using IoU on Image B as the selection metric.
 
@@ -514,6 +561,8 @@ def hyperparam_search_xgb_iou(
         verbose_eval (int): Verbosity interval.
         seed (int): RNG seed.
         context_radius (int): Feature context radius.
+        use_kfold (bool | None): Enable k-fold selection (None uses config).
+        kfold_splits (int | None): Number of folds when k-fold is enabled.
 
     Returns:
         tuple[xgb.Booster | None, dict | None, float, float | None, dict | None]:
@@ -543,62 +592,200 @@ def hyperparam_search_xgb_iou(
     if param_grid is None:
         param_grid = [base_params]
 
-    # simple train/val split (used only for early stopping)
     n = len(X)
     if n == 0:
         raise ValueError("Empty dataset for XGBoost.")
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    split = max(1, int(n * (1 - val_fraction)))
-    train_idx, val_idx = idx[:split], idx[split:]
-    y_train = np.asarray(y[train_idx], dtype=np.float32)
-    y_val = np.asarray(y[val_idx], dtype=np.float32)
-    dtrain = xgb.DMatrix(
-        X[train_idx],
-        label=y_train,
-        weight=_build_binary_sample_weights(y_train),
-    )
-    dval = xgb.DMatrix(
-        X[val_idx],
-        label=y_val,
-        weight=_build_binary_sample_weights(y_val),
-    )
+    if n < 2:
+        raise ValueError("Need at least 2 samples for XGBoost validation splits.")
+    if use_kfold is None:
+        use_kfold = bool(getattr(cfg, "XGB_USE_KFOLD", False))
+    if kfold_splits is None:
+        kfold_splits = int(getattr(cfg, "XGB_KFOLD_SPLITS", 3) or 3)
+    fold_splits: list[tuple[np.ndarray, np.ndarray]] = []
+    if use_kfold:
+        fold_splits = _kfold_index_splits(n, kfold_splits, seed)
+        if len(fold_splits) > 1:
+            logger.info(
+                "xgb-search-iou: kfold enabled (folds=%s, samples=%s, seed=%s)",
+                len(fold_splits),
+                n,
+                seed,
+            )
+    if not fold_splits:
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(n)
+        split = max(1, int(n * (1 - val_fraction)))
+        if split >= n:
+            split = n - 1
+        train_idx, val_idx = idx[:split], idx[split:]
+        fold_splits = [(train_idx, val_idx)]
+        logger.info(
+            "xgb-search-iou: using single split (val_fraction=%.3f, train=%s, val=%s)",
+            float(val_fraction),
+            len(train_idx),
+            len(val_idx),
+        )
 
     for i, overrides in enumerate(param_grid):
         params = base_params.copy()
         params.update(overrides)
         params["tree_method"] = "gpu_hist" if use_gpu else "hist"
-        if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
-            params.setdefault("scale_pos_weight", _auto_scale_pos_weight(y_train))
         logger.info("xgb-search-iou cfg %s/%s: %s", i + 1, len(param_grid), params)
-        try:
-            model = xgb.train(
-                params,
-                dtrain,
-                num_boost_round=num_boost_round,
-                evals=[(dtrain, "train"), (dval, "val")],
-                early_stopping_rounds=early_stopping_rounds,
-                verbose_eval=verbose_eval,
+        fold_metrics: list[dict] = []
+        fold_models = []
+        for fold_idx, (train_idx, val_idx) in enumerate(fold_splits, start=1):
+            y_train = np.asarray(y[train_idx], dtype=np.float32)
+            y_val = np.asarray(y[val_idx], dtype=np.float32)
+            dtrain = xgb.DMatrix(
+                X[train_idx],
+                label=y_train,
+                weight=_build_binary_sample_weights(y_train),
             )
-        except xgb.core.XGBoostError as e:
-            if use_gpu and "gpu_hist" in str(e):
-                logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
-                params["tree_method"] = "hist"
+            dval = xgb.DMatrix(
+                X[val_idx],
+                label=y_val,
+                weight=_build_binary_sample_weights(y_val),
+            )
+            params_fold = params.copy()
+            if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
+                params_fold.setdefault(
+                    "scale_pos_weight", _auto_scale_pos_weight(y_train)
+                )
+            try:
                 model = xgb.train(
-                    params,
+                    params_fold,
                     dtrain,
                     num_boost_round=num_boost_round,
                     evals=[(dtrain, "train"), (dval, "val")],
                     early_stopping_rounds=early_stopping_rounds,
                     verbose_eval=verbose_eval,
                 )
+            except xgb.core.XGBoostError as e:
+                if use_gpu and "gpu_hist" in str(e):
+                    logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
+                    params_fold["tree_method"] = "hist"
+                    model = xgb.train(
+                        params_fold,
+                        dtrain,
+                        num_boost_round=num_boost_round,
+                        evals=[(dtrain, "train"), (dval, "val")],
+                        early_stopping_rounds=early_stopping_rounds,
+                        verbose_eval=verbose_eval,
+                    )
+                else:
+                    raise
+
+            score_full_xgb = xgb_score_image_b(
+                img_b,
+                model,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                image_id_b,
+                prefetched_tiles=prefetched_tiles,
+                context_radius=context_radius,
+            )
+            if device is not None:
+                try:
+                    metrics_list = compute_metrics_batch_gpu(
+                        score_full_xgb,
+                        thresholds,
+                        sh_buffer_mask_b,
+                        gt_mask_b,
+                        device=device,
+                    )
+                except Exception:
+                    metrics_list = compute_metrics_batch_cpu(
+                        score_full_xgb,
+                        thresholds,
+                        sh_buffer_mask_b,
+                        gt_mask_b,
+                    )
+            else:
+                metrics_list = compute_metrics_batch_cpu(
+                    score_full_xgb,
+                    thresholds,
+                    sh_buffer_mask_b,
+                    gt_mask_b,
+                )
+            best_local = max(metrics_list, key=lambda m: m["iou"])
+            if len(fold_splits) > 1:
+                logger.info(
+                    "xgb-search-iou cfg %s fold %s/%s: thr=%.3f, IoU=%.3f, F1=%.3f",
+                    i + 1,
+                    fold_idx,
+                    len(fold_splits),
+                    best_local["threshold"],
+                    best_local["iou"],
+                    best_local["f1"],
+                )
+            else:
+                logger.info(
+                    "xgb-search-iou cfg %s (single-tile proxy): thr=%.3f, IoU=%.3f, F1=%.3f",
+                    i + 1,
+                    best_local["threshold"],
+                    best_local["iou"],
+                    best_local["f1"],
+                )
+            fold_metrics.append(best_local)
+            fold_models.append(model)
+
+        fold_ious = np.asarray(
+            [float(m["iou"]) for m in fold_metrics], dtype=np.float32
+        )
+        fold_f1s = np.asarray([float(m["f1"]) for m in fold_metrics], dtype=np.float32)
+        score_iou = float(fold_ious.mean())
+        if len(fold_splits) > 1:
+            logger.info(
+                "xgb-search-iou cfg %s kfold summary: folds=%s mean_IoU=%.3f mean_F1=%.3f",
+                i + 1,
+                len(fold_splits),
+                score_iou,
+                float(fold_f1s.mean()),
+            )
+        best_fold_idx = int(np.argmax(fold_ious))
+        if score_iou > best_iou:
+            best_iou = score_iou
+            best_model = fold_models[best_fold_idx]
+            best_params = params.copy()
+            best_thr = fold_metrics[best_fold_idx]["threshold"]
+            best_metrics = fold_metrics[best_fold_idx]
+
+    # Refit the best configuration on all source samples when k-fold is enabled.
+    if len(fold_splits) > 1 and best_params is not None:
+        y_full = np.asarray(y, dtype=np.float32)
+        params_full = best_params.copy()
+        if bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)):
+            params_full["scale_pos_weight"] = _auto_scale_pos_weight(y_full)
+        dtrain_full = xgb.DMatrix(
+            X,
+            label=y_full,
+            weight=_build_binary_sample_weights(y_full),
+        )
+        logger.info("xgb-search-iou: refit best config on full source dataset")
+        try:
+            model_full = xgb.train(
+                params_full,
+                dtrain_full,
+                num_boost_round=num_boost_round,
+                verbose_eval=False,
+            )
+        except xgb.core.XGBoostError as e:
+            if use_gpu and "gpu_hist" in str(e):
+                logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
+                params_full["tree_method"] = "hist"
+                model_full = xgb.train(
+                    params_full,
+                    dtrain_full,
+                    num_boost_round=num_boost_round,
+                    verbose_eval=False,
+                )
             else:
                 raise
-
-        # Evaluate IoU on Image B
         score_full_xgb = xgb_score_image_b(
             img_b,
-            model,
+            model_full,
             ps,
             tile_size,
             stride,
@@ -630,22 +817,17 @@ def hyperparam_search_xgb_iou(
                 sh_buffer_mask_b,
                 gt_mask_b,
             )
-
         best_local = max(metrics_list, key=lambda m: m["iou"])
         logger.info(
-            "xgb-search-iou cfg %s (single-tile proxy): thr=%.3f, IoU=%.3f, F1=%.3f",
-            i + 1,
+            "xgb-search-iou final-refit: thr=%.3f, IoU=%.3f, F1=%.3f",
             best_local["threshold"],
             best_local["iou"],
             best_local["f1"],
         )
-
-        if best_local["iou"] > best_iou:
-            best_iou = best_local["iou"]
-            best_thr = best_local["threshold"]
-            best_metrics = best_local
-            best_params = params.copy()
-            best_model = model
+        best_model = model_full
+        best_thr = best_local["threshold"]
+        best_metrics = best_local
+        best_iou = float(best_local["iou"])
 
     return best_model, best_params, best_iou, best_thr, best_metrics
 

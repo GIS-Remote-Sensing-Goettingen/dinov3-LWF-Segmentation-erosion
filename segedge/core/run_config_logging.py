@@ -76,7 +76,8 @@ def log_training_ablation_summary(
     )
     logger.info(
         "train settings: xgb_labels pos_frac=%s neg_frac_max=%.4f "
-        "scale_pos_weight=%s sample_weights=%s class_weight_max=%.2f",
+        "scale_pos_weight=%s sample_weights=%s class_weight_max=%.2f "
+        "max_neg_bank=%s max_neg_per_tile=%s kfold=%s/%s",
         (
             getattr(cfg, "XGB_POS_FRAC_THRESH", None)
             if getattr(cfg, "XGB_POS_FRAC_THRESH", None) is not None
@@ -86,6 +87,10 @@ def log_training_ablation_summary(
         bool(getattr(cfg, "XGB_USE_SCALE_POS_WEIGHT", True)),
         bool(getattr(cfg, "XGB_USE_SAMPLE_WEIGHTS", True)),
         float(getattr(cfg, "XGB_CLASS_WEIGHT_MAX", 25.0) or 25.0),
+        int(getattr(cfg, "MAX_NEG_BANK", 8000) or 8000),
+        int(getattr(cfg, "XGB_MAX_NEG_PER_TILE", 0) or 0),
+        bool(getattr(cfg, "XGB_USE_KFOLD", False)),
+        int(getattr(cfg, "XGB_KFOLD_SPLITS", 3) or 3),
     )
     if tuning_mode == "bayes":
         logger.info(

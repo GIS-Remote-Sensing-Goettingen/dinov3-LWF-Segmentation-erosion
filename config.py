@@ -19,8 +19,9 @@ AUTO_SPLIT_TILES = True
 # - "gt_to_val_cap_holdout": all GT-overlap tiles are validation; source comes from
 #   SOURCE_TILES; holdout (non-GT) can be capped.
 # - "legacy_gt_source_val_holdout": split GT-overlap tiles into source/validation.
-AUTO_SPLIT_MODE = "gt_to_val_cap_holdout"
-VAL_SPLIT_FRACTION = 0.5
+# For XGB generalization, prefer legacy mode so training uses most GT-overlap tiles.
+AUTO_SPLIT_MODE = "legacy_gt_source_val_holdout"
+VAL_SPLIT_FRACTION = 0.2
 SPLIT_SEED = 42
 # Holdout cap (applies in gt_to_val_cap_holdout mode).
 INFERENCE_TILE_CAP_ENABLED = True
@@ -152,6 +153,8 @@ BUFFER_M = 5.0  # spatial prior buffer (meters)
 # Patch labeling for banks.
 POS_FRAC_THRESH = 0.05  # patch is positive if FG fraction >= this
 NEG_ALPHA = 1.0  # kNN negative bank weight
+# Global cap for negative samples in banks/XGB dataset building.
+MAX_NEG_BANK = 40000
 
 # Optional patch-context smoothing (applies to banks, kNN, XGB).
 FEAT_CONTEXT_RADIUS = 0  # 0 disables; try 1 or 2 for more context
@@ -308,6 +311,9 @@ XGB_VAL_FRACTION = 0.2
 XGB_NUM_BOOST_ROUND = 15
 XGB_EARLY_STOP = 100
 XGB_VERBOSE_EVAL = 20
+# Optional k-fold selection for XGB candidate robustness checks.
+XGB_USE_KFOLD = True
+XGB_KFOLD_SPLITS = 3
 # Override patch-purity threshold for XGB supervision (None => POS_FRAC_THRESH).
 XGB_POS_FRAC_THRESH = 0.1
 # Mark a patch as negative only if positive fraction is <= this threshold.
@@ -321,6 +327,8 @@ XGB_CLASS_WEIGHT_MAX = 25.0
 # Warn when per-tile or merged XGB datasets are too sparse in positives.
 XGB_MIN_POS_SAMPLES_WARN = 200
 XGB_MIN_POS_RATIO_WARN = 0.02
+# Optional per-tile cap before global MAX_NEG_BANK subsampling (0 disables).
+XGB_MAX_NEG_PER_TILE = 5000
 XGB_PARAM_GRID = [
     # 1) Baseline
     {

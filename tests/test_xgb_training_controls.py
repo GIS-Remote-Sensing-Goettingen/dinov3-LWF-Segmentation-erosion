@@ -9,6 +9,7 @@ from segedge.core.features import labels_to_patch_masks
 from segedge.core.xdboost import (
     _auto_scale_pos_weight,
     _build_binary_sample_weights,
+    _kfold_index_splits,
     build_xgb_dataset,
 )
 
@@ -87,3 +88,54 @@ def test_build_xgb_dataset_uses_neg_frac_max_with_prefetched_features() -> None:
     assert y.shape == (3,)
     assert int(np.count_nonzero(y > 0.5)) == 1
     assert int(np.count_nonzero(y <= 0.5)) == 2
+
+
+def test_build_xgb_dataset_applies_per_tile_negative_cap() -> None:
+    """Per-tile negative caps should limit local class domination."""
+    img = np.zeros((8, 8, 3), dtype=np.uint8)
+    labels = np.zeros((8, 8), dtype=np.uint8)
+    labels[:2, :2] = 1  # one positive patch, all others negative
+    feats = np.arange(4 * 4 * 2, dtype=np.float32).reshape(4, 4, 2)
+    prefetched = {
+        (0, 0): {
+            "h_eff": 8,
+            "w_eff": 8,
+            "feats": feats,
+            "hp": 4,
+            "wp": 4,
+        }
+    }
+
+    original_cap = xdboost_module.cfg.XGB_MAX_NEG_PER_TILE
+    try:
+        xdboost_module.cfg.XGB_MAX_NEG_PER_TILE = 3
+        X, y = build_xgb_dataset(
+            img,
+            labels,
+            ps=2,
+            tile_size=8,
+            stride=8,
+            feature_dir=None,
+            image_id="tile",
+            pos_frac=0.5,
+            neg_frac_max=0.0,
+            max_neg=100,
+            context_radius=0,
+            prefetched_tiles=prefetched,
+        )
+    finally:
+        xdboost_module.cfg.XGB_MAX_NEG_PER_TILE = original_cap
+
+    assert X.shape[0] == 4
+    assert int(np.count_nonzero(y > 0.5)) == 1
+    assert int(np.count_nonzero(y <= 0.5)) == 3
+
+
+def test_kfold_index_splits_are_disjoint_and_cover_all_samples() -> None:
+    """K-fold helper should produce disjoint folds that cover each sample once."""
+    splits = _kfold_index_splits(n_samples=10, n_splits=3, seed=42)
+    assert len(splits) == 3
+    val_all = np.concatenate([va for _, va in splits])
+    assert sorted(val_all.tolist()) == list(range(10))
+    for train_idx, val_idx in splits:
+        assert len(np.intersect1d(train_idx, val_idx)) == 0

@@ -3,6 +3,18 @@
 
 ## [Unreleased]
 
+## [0.2.48]
+- Description: Add optional XGBoost k-fold candidate selection with final full-source refit.
+- file touched: `config.py`, `segedge/core/xdboost.py`, `segedge/pipeline/tuning.py`, `segedge/core/run_config_logging.py`, `tests/test_xgb_training_controls.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Single split candidate selection was noisy and could overfit patch-level splits, reducing confidence in generalization.
+- problems fixed: Adds `XGB_USE_KFOLD`/`XGB_KFOLD_SPLITS`, evaluates candidate params across multiple shuffled folds, refits best params on the full source dataset, logs fold summaries, and tests deterministic split behavior.
+
+## [0.2.47]
+- Description: Shift auto-split defaults toward GT source training coverage and add per-tile XGB negative capping to reduce class-domination.
+- file touched: `config.py`, `segedge/core/xdboost.py`, `segedge/core/run_config_logging.py`, `tests/test_xgb_training_controls.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: XGB was overfitting limited manual source tiles and late-stage IoU remained unstable when negatives dominated sampled training data.
+- problems fixed: Default auto split now favors GT source/validation splitting (`legacy_gt_source_val_holdout`, `VAL_SPLIT_FRACTION=0.2`), introduces `MAX_NEG_BANK` and `XGB_MAX_NEG_PER_TILE` controls to reduce negative domination, and validates per-tile negative capping with regression tests.
+
 ## [0.2.46]
 - Description: Add root-cause XGB robustness controls (clean patch labeling + class-imbalance weighting) and safer defaults for anti-leak and late-stage tuning pressure.
 - file touched: `config.py`, `segedge/core/features.py`, `segedge/core/xdboost.py`, `segedge/core/run_config_logging.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `tests/test_xgb_training_controls.py`, `ARCHITECTURE.md`, `CHANGELOG.md`

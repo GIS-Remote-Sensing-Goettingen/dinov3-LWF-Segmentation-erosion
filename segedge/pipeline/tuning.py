@@ -413,12 +413,14 @@ def tune_on_validation_multi(
     early_stop = getattr(cfg, "XGB_EARLY_STOP", 40)
     verbose_eval = getattr(cfg, "XGB_VERBOSE_EVAL", 50)
     val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
+    use_kfold_xgb = bool(getattr(cfg, "XGB_USE_KFOLD", False))
+    kfold_splits_xgb = int(getattr(cfg, "XGB_KFOLD_SPLITS", 3) or 3)
     if param_grid is None:
         param_grid = [None]
 
     xgb_candidates = []
     for overrides in param_grid:
-        if overrides is None:
+        if overrides is None and not use_kfold_xgb:
             bst = train_xgb_classifier(
                 X,
                 y,
@@ -428,6 +430,7 @@ def tune_on_validation_multi(
             )
             params_used = None
         else:
+            search_grid = [overrides] if overrides is not None else [{}]
             bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
                 X,
                 y,
@@ -443,13 +446,15 @@ def tune_on_validation_multi(
                 prefetched_tiles=val_contexts[0]["prefetched_b"],
                 device=device,
                 use_gpu=use_gpu_xgb,
-                param_grid=[overrides],
+                param_grid=search_grid,
                 num_boost_round=num_boost_round,
                 val_fraction=val_fraction,
                 early_stopping_rounds=early_stop,
                 verbose_eval=verbose_eval,
                 seed=42,
                 context_radius=context_radius,
+                use_kfold=use_kfold_xgb,
+                kfold_splits=kfold_splits_xgb,
             )
         xgb_candidates.append({"bst": bst, "params": params_used})
 
