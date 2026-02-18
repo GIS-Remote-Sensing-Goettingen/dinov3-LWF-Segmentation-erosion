@@ -18,6 +18,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 
 ## Workflow
 1. Configure paths and hyperparameters in `config.yml`.
-2. If `io.auto_split.enabled=true`, tiles are discovered from `io.auto_split.tiles_dir`
-   and split into source/validation using `io.paths.eval_gt_vectors`; tiles without GT become holdout.
+2. If `io.auto_split.enabled=true`, tiles are discovered from `io.auto_split.tiles_dir`.
+   GT-overlap tiles are used for leave-one-out (LOO) folds (`training.loo`), and tiles
+   without GT are treated as inference-only holdout tiles.
 3. Run `python main.py` for the full pipeline.
+4. During execution, `rolling_best_setting.yml` is updated incrementally so best-known settings survive interruptions.

@@ -146,7 +146,14 @@ def build_xgb_dataset(
     return X, y
 
 
-def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=50):
+def train_xgb_classifier(
+    X,
+    y,
+    use_gpu=False,
+    num_boost_round=300,
+    verbose_eval=50,
+    param_overrides: dict | None = None,
+):
     """Train a binary XGBoost classifier for patch embeddings.
 
     Args:
@@ -155,6 +162,7 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         use_gpu (bool): Use GPU histogram algorithm when available.
         num_boost_round (int): Number of boosting rounds.
         verbose_eval (int): Verbosity interval.
+        param_overrides (dict | None): Optional parameter overrides.
 
     Returns:
         xgb.Booster: Trained XGBoost booster.
@@ -175,6 +183,9 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         "min_child_weight": 3,
         "tree_method": "gpu_hist" if use_gpu else "hist",
     }
+    if param_overrides:
+        params.update(param_overrides)
+        params["tree_method"] = "gpu_hist" if use_gpu else "hist"
     try:
         bst = xgb.train(
             params,

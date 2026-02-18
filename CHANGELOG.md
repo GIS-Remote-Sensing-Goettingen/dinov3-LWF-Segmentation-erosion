@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Add interruption-safe rolling best-config checkpoints during LOO tuning and holdout inference.
+- file touched: `segedge/pipeline/run.py`, `segedge/pipeline/common.py`, `CHANGELOG.md`
+- reason: Persist the current best configuration while long runs are still in progress.
+- problems fixed: If a run stops early, `rolling_best_setting.yml` preserves the best-known config and progress counters (folds/holdout tiles).
+
+- Description: Switch training/search to directory-driven leave-one-out (LOO) folds and export fold mean/std summaries in inference settings.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `segedge/core/xdboost.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Replace manual tile split flow with robust GT-presence discovery plus LOO validation.
+- problems fixed: Removes dependency on manual source/val lists, trains final model from all GT tiles after LOO selection, and reports process variability (mean/std) in `inference_best_setting.yml`.
+
 - Description: Add source-tile augmentation (flip + 90-degree rotations), compact repetitive timing logs, and richer best-settings YAML model details.
 - file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/timing_utils.py`, `segedge/pipeline/run.py`, `segedge/core/io_utils.py`, `KB.md`, `CHANGELOG.md`
 - reason: Improve source diversity during bank/XGB building, reduce log spam from per-tile timers, and export clearer model/tuning context.

@@ -43,7 +43,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - Tiling: default `TILE_SIZE=1024`, `STRIDE=512`; tiles cropped to multiples of patch size (16).
 - Patch labeling for A: `labels_to_patch_masks` marks a patch positive if FG fraction ≥ `POS_FRAC_THRESH` (default 0.1); negative if zero FG.
 - CRS: Vector CRS is reprojected to raster CRS when needed; if vector CRS missing, assumes EPSG:4326 with a warning.
-- Auto split: `AUTO_SPLIT_TILES=True` scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then splits GT-positive tiles into source/val and the rest into holdout.
+- Auto split: `io.auto_split.enabled=true` scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then separates GT-positive tiles (for LOO folds) from inference-only tiles (no GT overlap).
 - GT presence scan uses cached vector intersection (no per-tile rasterization) and can run in parallel.
 - All downstream masks can be clipped to the SH buffer to enforce spatial priors.
 - Typical buffer: 8 m → at 0.2 m/pixel, buffer_pixels ≈ 40 (configurable).
@@ -156,16 +156,17 @@ This document gives a complete, self-contained description of the SegEdge zero-s
     - Rolling unions in `output/run_*/shapes/unions/{knn|xgb|champion}/{raw|crf|shadow}/union.shp` (holdout-only).
     - Union backups every N tiles in `.../backups/` when `UNION_BACKUP_EVERY > 0`.
     - Processed tile log: `output/run_*/processed_tiles.jsonl` for resume.
+    - Rolling checkpoint: `output/run_*/rolling_best_setting.yml` updated during LOO folds and holdout inference.
     - Phase summary logs: mean/median metrics per phase and deltas for champion chain.
     - Best settings YAML in `output/run_*/best_settings.yml` (or `BEST_SETTINGS_PATH`).
     - Consolidated features: `FEATURE_DIR/{image_id}_features_full.npy`.
 5. Evaluation metric: IoU (primary), plus F1/P/R—computed on B; if `CLIP_GT_TO_BUFFER=True`, GT is masked to SH buffer so max IoU can reach 1.0.
 6. Champion selection: compare best IoU from kNN vs XGB (after median filter); champion feeds CRF; shadow filter runs after CRF.
-7. Tuning objective: configs are selected by weighted-mean IoU across validation tiles, weighted by GT-positive pixel count.
+7. Tuning objective: configs are selected with leave-one-out (LOO) folds over GT-positive tiles; fold metrics are summarized with weighted means plus mean/std across folds.
 - Plots to inspect:
 - `*_unified.png`: RGB, source label raster, GT (if available), DINO similarity, kNN/XGB score heatmaps, and phase masks.
 - Shapefiles to consume: rolling unions under `shapes/unions/` (kNN/XGB/Champion × raw/CRF/shadow).
-- `inference_best_setting.yml` records the frozen configs and weighted-mean metrics after validation.
+- `inference_best_setting.yml` records the selected configs, fold-level summaries, and mean/std metrics from the LOO process.
 - Typical run flow in main: build banks → prefetch B → kNN grid → fine-tune → median filter → XGB IoU search → overlays → CRF → shadow → exports.
 - Roads penalty: if configured, kNN/XGB score maps are multiplied by a roads mask penalty before thresholds/CRF.
 - Roads masking: per-tile rasterization using a cached spatial index (no global raster build).

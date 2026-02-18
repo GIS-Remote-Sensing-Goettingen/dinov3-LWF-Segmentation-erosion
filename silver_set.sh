@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=segmentation
+#SBATCH --job-name=Erosion
 #SBATCH --output=segmentation_%j.out
 #SBATCH --error=segmentation_%j.err
 #SBATCH --mem=128G

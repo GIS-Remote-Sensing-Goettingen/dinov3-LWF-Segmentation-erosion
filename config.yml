@@ -3,7 +3,7 @@
 
 io:
   paths:
-    # Single-tile fallbacks (used when tile lists are null).
+    # Single-tile fallbacks (kept for compatibility; LOO uses auto_split tiles).
     source_tile: data/tiles/dop20_596000_5974000_1km_20cm.tif
     target_tile: data/dop20_592000_5982000_1km_20cm.tif
 
@@ -15,20 +15,10 @@ io:
       - data/lables/lables_3.shp
       - data/lables/labels_final.shp
 
-    # Multi-tile input lists (used when auto_split.enabled is false).
-    source_tiles:
-      - data/tiles/dop20_596000_5974000_1km_20cm.tif
-      - data/tiles/dop20_596000_5975000_1km_20cm.tif
-      - data/tiles/dop20_596000_5976000_1km_20cm.tif
-      - data/tiles/dop20_596000_5977000_1km_20cm.tif
-      - data/tiles/dop20_596000_5983000_1km_20cm.tif
-    val_tiles:
-      - data/tiles/dop20_596000_5974000_1km_20cm.tif
-      - data/tiles/dop20_596000_5977000_1km_20cm.tif
-      - data/tiles/dop20_596000_5983000_1km_20cm.tif
-    holdout_tiles:
-      - data/tiles/dop20_596000_5975000_1km_20cm.tif
-      - data/tiles/dop20_596000_5976000_1km_20cm.tif
+    # Manual tile lists are deprecated when using directory-driven LOO.
+    source_tiles: []
+    val_tiles: []
+    holdout_tiles: []
 
     # Outputs and caches.
     feature_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/features
@@ -43,8 +33,10 @@ io:
 
   auto_split:
     enabled: true
+    # Input directory scanned for tiles.
     tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
     tile_glob: "*.tif"
+    # Kept for backward compatibility with non-LOO mode.
     val_split_fraction: 0.5
     split_seed: 42
     # null -> fallback to model.backbone.resample_factor
@@ -81,6 +73,13 @@ model:
     vertical_flip: true
     # Use right-angle rotations to avoid interpolation artifacts.
     rotations_deg: [90, 180, 270]
+
+training:
+  loo:
+    # Leave-one-out over all GT-positive tiles discovered from auto_split.tiles_dir.
+    enabled: true
+    # Minimum train tiles per fold (warning only when not met).
+    min_train_tiles: 1
 
 search:
   knn:

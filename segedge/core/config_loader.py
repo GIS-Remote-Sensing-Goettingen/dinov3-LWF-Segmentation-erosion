@@ -129,6 +129,21 @@ class ModelConfig:
 
 
 @dataclass
+class LOOConfig:
+    """Leave-one-out training settings."""
+
+    enabled: bool
+    min_train_tiles: int
+
+
+@dataclass
+class TrainingConfig:
+    """Training strategy settings."""
+
+    loo: LOOConfig
+
+
+@dataclass
 class KNNConfig:
     """kNN search settings."""
 
@@ -220,6 +235,7 @@ class Config:
 
     io: IOConfig
     model: ModelConfig
+    training: TrainingConfig
     search: SearchConfig
     postprocess: PostprocessConfig
     runtime: RuntimeConfig
@@ -278,6 +294,8 @@ def load_config(path: str | Path | None = None) -> Config:
     model_augmentation = _require_mapping(
         model.get("augmentation", {}), "model.augmentation"
     )
+    training = _require_mapping(root.get("training", {}), "training")
+    training_loo = _require_mapping(training.get("loo", {}), "training.loo")
 
     search = _require_mapping(root["search"], "search")
     search_knn = _require_mapping(search["knn"], "search.knn")
@@ -366,6 +384,12 @@ def load_config(path: str | Path | None = None) -> Config:
                 "model.augmentation.rotations_deg",
             ),
         ),
+    )
+    training_cfg = TrainingConfig(
+        loo=LOOConfig(
+            enabled=bool(training_loo.get("enabled", True)),
+            min_train_tiles=int(training_loo.get("min_train_tiles", 1)),
+        )
     )
 
     search_cfg = SearchConfig(
@@ -458,6 +482,7 @@ def load_config(path: str | Path | None = None) -> Config:
     return Config(
         io=IOConfig(paths=io_paths_cfg, auto_split=io_auto_split_cfg),
         model=model_cfg,
+        training=training_cfg,
         search=search_cfg,
         postprocess=postprocess_cfg,
         runtime=runtime_cfg,

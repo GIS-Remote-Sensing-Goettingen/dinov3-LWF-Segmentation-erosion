@@ -13,6 +13,7 @@ import numpy as np
 import rasterio
 import rasterio.features as rfeatures
 import torch
+import yaml
 from pyproj import CRS, Transformer
 from scipy.ndimage import median_filter
 from shapely.geometry import box, mapping, shape
@@ -20,7 +21,6 @@ from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
 from skimage.transform import resize
 
-from ..core.banks import build_banks_single_scale
 from ..core.config_loader import cfg
 from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
@@ -46,12 +46,15 @@ from ..core.metrics_utils import (
 from ..core.plotting import save_unified_plot
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import (
-    build_xgb_dataset,
     hyperparam_search_xgb_iou,
     train_xgb_classifier,
     xgb_score_image_b,
 )
-from .common import init_model, resolve_tile_splits_from_gt
+from .common import (
+    build_training_artifacts_for_tiles,
+    init_model,
+    resolve_tiles_from_gt_presence,
+)
 
 # Config-driven flags
 USE_FP16_KNN = cfg.search.knn.use_fp16_knn
@@ -390,59 +393,86 @@ def _apply_shadow_filter(
     return np.logical_and(base_mask, shadow_pass | (score_full >= protect_score))
 
 
-def _source_augmentation_modes() -> list[str]:
-    """Return enabled source augmentation modes from config."""
-    aug = cfg.model.augmentation
-    if not aug.enabled:
-        return ["orig"]
-    modes: list[str] = []
-    if aug.include_identity:
-        modes.append("orig")
-    if aug.horizontal_flip:
-        modes.append("flip_lr")
-    if aug.vertical_flip:
-        modes.append("flip_ud")
-    for deg in aug.rotations_deg:
-        d = int(deg) % 360
-        if d == 0:
-            if not aug.include_identity:
-                modes.append("orig")
+def summarize_phase_metrics_mean_std(
+    phase_metrics: dict[str, list[dict]],
+) -> dict[str, dict[str, float]]:
+    """Summarize phase metrics as mean/std pairs across runs.
+
+    Args:
+        phase_metrics (dict[str, list[dict]]): Phase metrics keyed by phase.
+
+    Returns:
+        dict[str, dict[str, float]]: Per-phase metric summary.
+
+    Examples:
+        >>> summarize_phase_metrics_mean_std({}) == {}
+        True
+    """
+    out: dict[str, dict[str, float]] = {}
+    metric_keys = ["iou", "f1", "precision", "recall"]
+    for phase, rows in phase_metrics.items():
+        if not rows:
             continue
-        if d not in {90, 180, 270}:
-            logger.warning("skipping unsupported augmentation rotation: %s", deg)
-            continue
-        modes.append(f"rot{d}")
-    if not modes:
-        modes = ["orig"]
-    deduped = []
-    seen: set[str] = set()
-    for mode in modes:
-        if mode in seen:
-            continue
-        deduped.append(mode)
-        seen.add(mode)
-    return deduped
+        phase_summary: dict[str, float] = {}
+        for key in metric_keys:
+            vals = [float(r.get(key, 0.0)) for r in rows]
+            phase_summary[f"{key}_mean"] = float(np.mean(vals))
+            phase_summary[f"{key}_std"] = float(np.std(vals))
+        out[phase] = phase_summary
+    return out
 
 
-def _apply_source_augmentation(
-    img: np.ndarray,
-    labels: np.ndarray,
-    mode: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply a geometric augmentation to source image and labels."""
-    if mode == "orig":
-        return img, labels
-    if mode == "flip_lr":
-        return np.flip(img, axis=1).copy(), np.flip(labels, axis=1).copy()
-    if mode == "flip_ud":
-        return np.flip(img, axis=0).copy(), np.flip(labels, axis=0).copy()
-    if mode.startswith("rot"):
-        deg = int(mode.replace("rot", ""))
-        if deg % 90 != 0:
-            raise ValueError(f"rotation must be multiple of 90, got {deg}")
-        k = (deg // 90) % 4
-        return np.rot90(img, k).copy(), np.rot90(labels, k).copy()
-    raise ValueError(f"unknown augmentation mode: {mode}")
+def write_rolling_best_config(
+    out_path: str,
+    stage: str,
+    tuned: dict,
+    fold_done: int,
+    fold_total: int,
+    holdout_done: int,
+    holdout_total: int,
+    best_fold: dict | None = None,
+) -> None:
+    """Write rolling best config checkpoint for interruption-safe resume context.
+
+    Args:
+        out_path (str): Destination YAML path.
+        stage (str): Current pipeline stage.
+        tuned (dict): Tuned settings bundle.
+        fold_done (int): Completed LOO folds.
+        fold_total (int): Total LOO folds.
+        holdout_done (int): Processed holdout tiles.
+        holdout_total (int): Total holdout tiles.
+        best_fold (dict | None): Optional best-fold metadata.
+
+    Examples:
+        >>> callable(write_rolling_best_config)
+        True
+    """
+    payload = {
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "stage": stage,
+        "progress": {
+            "loo_folds_done": int(fold_done),
+            "loo_folds_total": int(fold_total),
+            "holdout_done": int(holdout_done),
+            "holdout_total": int(holdout_total),
+        },
+        "best_raw_config": tuned.get("best_raw_config"),
+        "best_xgb_config": tuned.get("best_xgb_config"),
+        "best_crf_config": tuned.get("best_crf_config"),
+        "best_shadow_config": tuned.get("shadow_cfg"),
+        "champion_source": tuned.get("champion_source"),
+        "roads_penalty": tuned.get("roads_penalty"),
+    }
+    if best_fold is not None:
+        payload["selected_fold"] = {
+            "fold_index": int(best_fold["fold_index"]),
+            "val_tile": best_fold["val_tile"],
+            "val_champion_shadow_iou": float(best_fold["val_champion_shadow_iou"]),
+        }
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(payload, fh, sort_keys=False, default_flow_style=False)
 
 
 def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
@@ -1378,6 +1408,7 @@ def main():
     setup_logging(cfg.io.paths.log_path)
     processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
     processed_tiles: set[str] = set()
+    rolling_best_settings_path = os.path.join(run_dir, "rolling_best_setting.yml")
     if resume_run and os.path.exists(processed_log_path):
         with open(processed_log_path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -1450,51 +1481,44 @@ def main():
     # ------------------------------------------------------------
     # Resolve paths to imagery + SH_2022 + GT vector labels
     # ------------------------------------------------------------
-    source_tile_default = cfg.io.paths.source_tile
     source_label_raster = cfg.io.paths.source_label_raster
     gt_vector_paths = cfg.io.paths.eval_gt_vectors
     auto_split_tiles = cfg.io.auto_split.enabled
 
     # ------------------------------------------------------------
-    # Resolve one or more labeled source images (Image A list)
+    # Resolve GT-positive tiles (LOO set) and inference-only tiles
     # ------------------------------------------------------------
-    if auto_split_tiles:
-        tiles_dir = cfg.io.auto_split.tiles_dir
-        tile_glob = cfg.io.auto_split.tile_glob
-        val_fraction = float(cfg.io.auto_split.val_split_fraction)
-        seed = int(cfg.io.auto_split.split_seed)
-        downsample_factor = cfg.io.auto_split.gt_presence_downsample
-        num_workers = cfg.io.auto_split.gt_presence_workers
-        img_a_paths, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
-            tiles_dir,
-            tile_glob,
-            gt_vector_paths,
-            val_fraction,
-            seed,
-            downsample_factor=downsample_factor,
-            num_workers=num_workers,
+    if not auto_split_tiles:
+        raise ValueError(
+            "io.auto_split.enabled must be true: directory-driven LOO training is required"
         )
-        logger.info(
-            "auto split tiles: source=%s val=%s holdout=%s",
-            len(img_a_paths),
-            len(val_tiles),
-            len(holdout_tiles),
-        )
-    else:
-        img_a_paths = cfg.io.paths.source_tiles or [source_tile_default]
-        val_tiles = cfg.io.paths.val_tiles
-        holdout_tiles = cfg.io.paths.holdout_tiles
-    lab_a_paths = [source_label_raster] * len(img_a_paths)
+    tiles_dir = cfg.io.auto_split.tiles_dir
+    tile_glob = cfg.io.auto_split.tile_glob
+    downsample_factor = cfg.io.auto_split.gt_presence_downsample
+    num_workers = cfg.io.auto_split.gt_presence_workers
+    gt_tiles, holdout_tiles = resolve_tiles_from_gt_presence(
+        tiles_dir,
+        tile_glob,
+        gt_vector_paths,
+        downsample_factor=downsample_factor,
+        num_workers=num_workers,
+    )
+    val_tiles = list(gt_tiles)
+    logger.info(
+        "auto split tiles: gt_tiles=%s inference_tiles=%s",
+        len(val_tiles),
+        len(holdout_tiles),
+    )
 
     context_radius = int(cfg.model.banks.feat_context_radius or 0)
+    min_train_tiles = int(cfg.training.loo.min_train_tiles or 1)
 
-    # ------------------------------------------------------------
-    # Resolve validation + holdout tiles (required)
+    # Resolve required tile sets
     # ------------------------------------------------------------
     if not val_tiles:
-        raise ValueError("VAL_TILES must be set for main.py.")
+        raise ValueError("no GT-positive tiles resolved for LOO training")
     if not holdout_tiles:
-        logger.warning("no holdout tiles resolved; skipping holdout inference")
+        logger.warning("no inference-only tiles resolved; skipping holdout inference")
 
     # ------------------------------------------------------------
     # Feature caching
@@ -1509,150 +1533,80 @@ def main():
         feature_dir = None
     logger.info("feature cache mode: %s", feature_cache_mode)
 
-    image_id_a_list = [os.path.splitext(os.path.basename(p))[0] for p in img_a_paths]
+    val_phase_metrics: dict[str, list[dict]] = {}
+    holdout_phase_metrics: dict[str, list[dict]] = {}
+    val_buffer_m = None
+    val_pixel_size_m = None
+    loo_fold_records = []
 
     # ------------------------------------------------------------
-    # Build DINOv3 banks + XGBoost training data from Image A sources
+    # LOO tuning/search: train on N-1 GT tiles, validate on the left-out tile
     # ------------------------------------------------------------
-    _log_phase("START", "image_a_processing")
-    pos_banks = []
-    neg_banks = []
-    X_list = []
-    y_list = []
-    aug_modes = _source_augmentation_modes()
-    logger.info("source augmentations: %s", ", ".join(aug_modes))
-    for img_a_path, lab_a_path, image_id_a in zip(
-        img_a_paths, lab_a_paths, image_id_a_list, strict=True
-    ):
-        logger.info("source A base: %s (labels: %s)", img_a_path, lab_a_path)
-        ds = int(cfg.model.backbone.resample_factor or 1)
-        img_a_base = load_dop20_image(img_a_path, downsample_factor=ds)
-        labels_a_base = reproject_labels_to_image(
-            img_a_path, lab_a_path, downsample_factor=ds
+    if not cfg.training.loo.enabled:
+        raise ValueError("training.loo.enabled must be true for this pipeline")
+    _log_phase("START", "loo_validation_tuning")
+    for fold_idx, val_path in enumerate(val_tiles, start=1):
+        train_tiles = [p for p in gt_tiles if p != val_path]
+        if not train_tiles:
+            logger.warning(
+                "LOO fold %s has no train tiles; reusing validation tile as source",
+                fold_idx,
+            )
+            train_tiles = [val_path]
+        if len(train_tiles) < min_train_tiles:
+            logger.warning(
+                "LOO fold %s train tiles=%s < min_train_tiles=%s",
+                fold_idx,
+                len(train_tiles),
+                min_train_tiles,
+            )
+        logger.info(
+            "LOO fold %s/%s train_tiles=%s val_tile=%s",
+            fold_idx,
+            len(val_tiles),
+            len(train_tiles),
+            val_path,
         )
-        for aug_mode in aug_modes:
-            image_id_aug = (
-                image_id_a if aug_mode == "orig" else f"{image_id_a}_{aug_mode}"
-            )
-            img_a, labels_a = _apply_source_augmentation(
-                img_a_base, labels_a_base, aug_mode
-            )
-            logger.info(
-                "source A augmented: %s mode=%s image_id=%s",
-                img_a_path,
-                aug_mode,
-                image_id_aug,
-            )
-            prefetched_a = None
-            if feature_cache_mode == "memory":
-                logger.info("prefetch: Image A %s", image_id_aug)
-                prefetched_a = prefetch_features_single_scale_image(
-                    img_a,
-                    model,
-                    processor,
-                    device,
-                    ps,
-                    tile_size,
-                    stride,
-                    None,
-                    None,
-                    image_id_aug,
-                )
-
-            pos_bank_i, neg_bank_i = build_banks_single_scale(
-                img_a,
-                labels_a,
+        pos_bank_fold, neg_bank_fold, x_fold, y_fold, _, _ = (
+            build_training_artifacts_for_tiles(
+                train_tiles,
+                source_label_raster,
                 model,
                 processor,
                 device,
                 ps,
                 tile_size,
                 stride,
-                cfg.model.banks.pos_frac_thresh,
-                None,
+                feature_cache_mode,
                 feature_dir,
-                image_id_aug,
-                cfg.io.paths.bank_cache_dir,
-                context_radius=context_radius,
-                prefetched_tiles=prefetched_a,
+                context_radius,
             )
-            if pos_bank_i.size > 0:
-                pos_banks.append(pos_bank_i)
-            if neg_bank_i is not None and len(neg_bank_i) > 0:
-                neg_banks.append(neg_bank_i)
-
-            x_i, y_i = build_xgb_dataset(
-                img_a,
-                labels_a,
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                image_id_aug,
-                pos_frac=cfg.model.banks.pos_frac_thresh,
-                max_neg=cfg.model.banks.max_neg_bank,
-                context_radius=context_radius,
-                prefetched_tiles=prefetched_a,
-            )
-            if x_i.size > 0 and y_i.size > 0:
-                X_list.append(x_i)
-                y_list.append(y_i)
-
-    if not pos_banks:
-        raise ValueError("no positive banks were built; check SOURCE_TILES and labels")
-    pos_bank = np.concatenate(pos_banks, axis=0)
-    neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
-    logger.info(
-        "combined banks: pos=%s, neg=%s",
-        len(pos_bank),
-        0 if neg_bank is None else len(neg_bank),
-    )
-
-    X = np.vstack(X_list) if X_list else np.empty((0, 0), dtype=np.float32)
-    y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
-    if X.size == 0 or y.size == 0:
-        raise ValueError("XGBoost dataset is empty; check SOURCE_TILES and labels")
-    _log_phase("END", "image_a_processing")
-
-    # ------------------------------------------------------------
-    # Tune on validation tile, then infer on holdout tiles
-    # ------------------------------------------------------------
-    _log_phase("START", "validation_tuning")
-    tuned = tune_on_validation_multi(
-        val_tiles,
-        gt_vector_paths,
-        model,
-        processor,
-        device,
-        pos_bank,
-        neg_bank,
-        X,
-        y,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        context_radius,
-    )
-    _log_phase("END", "validation_tuning")
-
-    val_phase_metrics: dict[str, list[dict]] = {}
-    holdout_phase_metrics: dict[str, list[dict]] = {}
-    val_buffer_m = None
-    val_pixel_size_m = None
-
-    # Run inference on validation tiles with fixed settings (for plots/metrics)
-    _log_phase("START", "validation_inference")
-    for val_path in val_tiles:
-        result = infer_on_holdout(
+        )
+        tuned_fold = tune_on_validation_multi(
+            [val_path],
+            gt_vector_paths,
+            model,
+            processor,
+            device,
+            pos_bank_fold,
+            neg_bank_fold,
+            x_fold,
+            y_fold,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            context_radius,
+        )
+        fold_result = infer_on_holdout(
             val_path,
             gt_vector_paths,
             model,
             processor,
             device,
-            pos_bank,
-            neg_bank,
-            tuned,
+            pos_bank_fold,
+            neg_bank_fold,
+            tuned_fold,
             ps,
             tile_size,
             stride,
@@ -1661,12 +1615,117 @@ def main():
             context_radius,
             plot_with_metrics=True,
         )
-        if result["gt_available"]:
-            _update_phase_metrics(val_phase_metrics, result["metrics"])
+        if fold_result["gt_available"]:
+            _update_phase_metrics(val_phase_metrics, fold_result["metrics"])
         if val_buffer_m is None:
-            val_buffer_m = result["buffer_m"]
-            val_pixel_size_m = result["pixel_size_m"]
-    _log_phase("END", "validation_inference")
+            val_buffer_m = fold_result["buffer_m"]
+            val_pixel_size_m = fold_result["pixel_size_m"]
+        loo_fold_records.append(
+            {
+                "fold_index": fold_idx,
+                "val_tile": val_path,
+                "train_tiles_count": len(train_tiles),
+                "val_champion_shadow_iou": float(
+                    fold_result["metrics"]["champion_shadow"]["iou"]
+                ),
+                "roads_penalty": float(tuned_fold.get("roads_penalty", 1.0)),
+                "champion_source": tuned_fold["champion_source"],
+                "best_raw_config": tuned_fold["best_raw_config"],
+                "best_xgb_config": tuned_fold["best_xgb_config"],
+                "best_crf_config": tuned_fold["best_crf_config"],
+                "best_shadow_config": tuned_fold["shadow_cfg"],
+                "phase_metrics": fold_result["metrics"],
+                "tuned": tuned_fold,
+            }
+        )
+        current_best_fold = max(
+            loo_fold_records,
+            key=lambda r: float(r["val_champion_shadow_iou"]),
+        )
+        write_rolling_best_config(
+            rolling_best_settings_path,
+            stage="loo_validation_tuning",
+            tuned=current_best_fold["tuned"],
+            fold_done=len(loo_fold_records),
+            fold_total=len(val_tiles),
+            holdout_done=len(processed_tiles),
+            holdout_total=len(holdout_tiles),
+            best_fold=current_best_fold,
+        )
+    _log_phase("END", "loo_validation_tuning")
+    if not loo_fold_records:
+        raise ValueError("LOO tuning produced no fold records")
+
+    best_fold = max(
+        loo_fold_records,
+        key=lambda r: float(r["val_champion_shadow_iou"]),
+    )
+    selected_tuned = best_fold["tuned"]
+    logger.info(
+        "LOO selected fold=%s val_tile=%s champion_shadow_iou=%.3f",
+        best_fold["fold_index"],
+        best_fold["val_tile"],
+        float(best_fold["val_champion_shadow_iou"]),
+    )
+
+    # ------------------------------------------------------------
+    # Final training on all GT tiles with selected LOO hyperparameters
+    # ------------------------------------------------------------
+    _log_phase("START", "final_all_gt_training")
+    pos_bank, neg_bank, X, y, image_id_a_list, aug_modes = (
+        build_training_artifacts_for_tiles(
+            gt_tiles,
+            source_label_raster,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_cache_mode,
+            feature_dir,
+            context_radius,
+        )
+    )
+    best_xgb_params = selected_tuned["best_xgb_config"].get("params")
+    final_bst = train_xgb_classifier(
+        X,
+        y,
+        use_gpu=cfg.search.xgb.use_gpu,
+        num_boost_round=cfg.search.xgb.num_boost_round,
+        verbose_eval=cfg.search.xgb.verbose_eval,
+        param_overrides=best_xgb_params,
+    )
+    tuned = {**selected_tuned, "bst": final_bst}
+    _log_phase("END", "final_all_gt_training")
+    write_rolling_best_config(
+        rolling_best_settings_path,
+        stage="final_model_ready",
+        tuned=tuned,
+        fold_done=len(loo_fold_records),
+        fold_total=len(val_tiles),
+        holdout_done=len(processed_tiles),
+        holdout_total=len(holdout_tiles),
+        best_fold=best_fold,
+    )
+
+    loo_fold_export = []
+    for fold in loo_fold_records:
+        loo_fold_export.append(
+            {
+                "fold_index": int(fold["fold_index"]),
+                "val_tile": fold["val_tile"],
+                "train_tiles_count": int(fold["train_tiles_count"]),
+                "val_champion_shadow_iou": float(fold["val_champion_shadow_iou"]),
+                "roads_penalty": float(fold["roads_penalty"]),
+                "champion_source": fold["champion_source"],
+                "best_raw_config": fold["best_raw_config"],
+                "best_xgb_config": fold["best_xgb_config"],
+                "best_crf_config": fold["best_crf_config"],
+                "best_shadow_config": fold["best_shadow_config"],
+            }
+        )
+    loo_phase_mean_std = summarize_phase_metrics_mean_std(val_phase_metrics)
 
     weighted_phase_metrics: dict[str, dict[str, float]] = {}
     metric_keys = ["iou", "f1", "precision", "recall"]
@@ -1719,8 +1778,8 @@ def main():
         tuned["best_raw_config"],
         tuned["best_crf_config"],
         cfg.model.backbone.name,
-        cfg.io.paths.source_tiles or cfg.io.paths.source_tile,
-        f"holdout_tiles={len(holdout_tiles)}",
+        gt_tiles,
+        f"inference_tiles={len(holdout_tiles)}",
         float(val_buffer_m) if val_buffer_m is not None else 0.0,
         float(val_pixel_size_m) if val_pixel_size_m is not None else 0.0,
         shadow_cfg=tuned["shadow_cfg"],
@@ -1740,6 +1799,15 @@ def main():
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,
+            "loo": {
+                "enabled": True,
+                "fold_count": len(loo_fold_export),
+                "min_train_tiles": min_train_tiles,
+                "selected_fold_index": int(best_fold["fold_index"]),
+                "selected_val_tile": best_fold["val_tile"],
+                "phase_metrics_mean_std": loo_phase_mean_std,
+                "folds": loo_fold_export,
+            },
         },
         best_settings_path=inference_best_settings_path,
     )
@@ -1791,9 +1859,19 @@ def main():
         }
         with open(processed_log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
+        write_rolling_best_config(
+            rolling_best_settings_path,
+            stage="holdout_inference",
+            tuned=tuned,
+            fold_done=len(loo_fold_records),
+            fold_total=len(val_tiles),
+            holdout_done=holdout_tiles_processed,
+            holdout_total=len(holdout_tiles),
+            best_fold=best_fold,
+        )
     _log_phase("END", "holdout_inference")
 
-    _summarize_phase_metrics(val_phase_metrics, "validation")
+    _summarize_phase_metrics(val_phase_metrics, "loo_validation")
     _summarize_phase_metrics(holdout_phase_metrics, "holdout")
 
     # ------------------------------------------------------------
