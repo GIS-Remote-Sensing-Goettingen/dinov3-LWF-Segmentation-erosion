@@ -103,6 +103,7 @@ class BanksConfig:
     neg_alpha: float
     feat_context_radius: int
     bank_erosion_radius: int
+    max_pos_bank: int
     max_neg_bank: int
 
 
@@ -118,6 +119,39 @@ class AugmentationConfig:
 
 
 @dataclass
+class HybridBlockConfig:
+    """Single hybrid feature block settings."""
+
+    enabled: bool
+    weight_knn: float
+    weight_xgb: float
+    bins: int | None = None
+
+
+@dataclass
+class HybridBlocksConfig:
+    """Hybrid feature block bundle."""
+
+    dino: HybridBlockConfig
+    rgb_stats: HybridBlockConfig
+    hsv_mean: HybridBlockConfig
+    grad_stats: HybridBlockConfig
+    grad_orient_hist: HybridBlockConfig
+    lbp_hist: HybridBlockConfig
+
+
+@dataclass
+class HybridFeaturesConfig:
+    """Hybrid DINO + image feature fusion settings."""
+
+    enabled: bool
+    knn_l2_normalize: bool
+    xgb_zscore: bool
+    zscore_eps: float
+    blocks: HybridBlocksConfig
+
+
+@dataclass
 class ModelConfig:
     """Model and representation settings."""
 
@@ -126,6 +160,7 @@ class ModelConfig:
     priors: PriorsConfig
     banks: BanksConfig
     augmentation: AugmentationConfig
+    hybrid_features: HybridFeaturesConfig
 
 
 @dataclass
@@ -207,11 +242,38 @@ class RoadsConfig:
 
 
 @dataclass
+class NovelProposalsConfig:
+    """Shape-based proposal filtering for novel candidate objects."""
+
+    enabled: bool
+    min_area_px: int
+    min_length_m: float
+    max_width_m: float
+    min_skeleton_ratio: float
+    min_pca_ratio: float
+    max_circularity: float
+    min_mean_score: float
+    max_road_overlap: float
+    connectivity: int
+
+
+@dataclass
 class PostprocessConfig:
     """Postprocess config group."""
 
     shadow: ShadowConfig
     roads: RoadsConfig
+    novel_proposals: NovelProposalsConfig
+
+
+@dataclass
+class PlottingConfig:
+    """Runtime plotting diagnostics settings."""
+
+    boundary_band_px: int
+    proposal_accept_rgb: tuple[int, int, int]
+    proposal_reject_rgb: tuple[int, int, int]
+    proposal_candidate_rgb: tuple[int, int, int]
 
 
 @dataclass
@@ -227,6 +289,7 @@ class RuntimeConfig:
     debug_timing: bool
     debug_timing_verbose: bool
     compact_timing_logs: bool
+    plotting: PlottingConfig
 
 
 @dataclass
@@ -274,6 +337,37 @@ def _load_thresholds(data: dict[str, Any]) -> ThresholdRangeConfig:
     )
 
 
+def _as_rgb_tuple(value: Any, field_name: str) -> tuple[int, int, int]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"'{field_name}' must be a list of 3 integers")
+    rgb = tuple(int(v) for v in value)
+    if any(v < 0 or v > 255 for v in rgb):
+        raise ValueError(f"'{field_name}' values must be in [0, 255]")
+    return rgb
+
+
+def _load_hybrid_block(
+    blocks: dict[str, Any],
+    key: str,
+    *,
+    default_enabled: bool,
+    default_weight_knn: float,
+    default_weight_xgb: float,
+    default_bins: int | None = None,
+) -> HybridBlockConfig:
+    raw = _require_mapping(blocks.get(key, {}), f"model.hybrid_features.blocks.{key}")
+    return HybridBlockConfig(
+        enabled=bool(raw.get("enabled", default_enabled)),
+        weight_knn=float(raw.get("weight_knn", default_weight_knn)),
+        weight_xgb=float(raw.get("weight_xgb", default_weight_xgb)),
+        bins=(
+            int(raw.get("bins", default_bins))
+            if raw.get("bins", default_bins) is not None
+            else None
+        ),
+    )
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load the repository config YAML into a typed config object."""
     if path is None:
@@ -294,6 +388,12 @@ def load_config(path: str | Path | None = None) -> Config:
     model_augmentation = _require_mapping(
         model.get("augmentation", {}), "model.augmentation"
     )
+    model_hybrid = _require_mapping(
+        model.get("hybrid_features", {}), "model.hybrid_features"
+    )
+    model_hybrid_blocks = _require_mapping(
+        model_hybrid.get("blocks", {}), "model.hybrid_features.blocks"
+    )
     training = _require_mapping(root.get("training", {}), "training")
     training_loo = _require_mapping(training.get("loo", {}), "training.loo")
 
@@ -305,8 +405,12 @@ def load_config(path: str | Path | None = None) -> Config:
     postprocess = _require_mapping(root["postprocess"], "postprocess")
     post_shadow = _require_mapping(postprocess["shadow"], "postprocess.shadow")
     post_roads = _require_mapping(postprocess["roads"], "postprocess.roads")
+    post_novel = _require_mapping(
+        postprocess.get("novel_proposals", {}), "postprocess.novel_proposals"
+    )
 
     runtime = _require_mapping(root["runtime"], "runtime")
+    runtime_plotting = _require_mapping(runtime.get("plotting", {}), "runtime.plotting")
 
     io_paths_cfg = IOPathsConfig(
         source_tile=str(io_paths["source_tile"]),
@@ -372,6 +476,7 @@ def load_config(path: str | Path | None = None) -> Config:
             neg_alpha=float(model_banks["neg_alpha"]),
             feat_context_radius=int(model_banks["feat_context_radius"]),
             bank_erosion_radius=int(model_banks["bank_erosion_radius"]),
+            max_pos_bank=int(model_banks.get("max_pos_bank", 120000)),
             max_neg_bank=int(model_banks["max_neg_bank"]),
         ),
         augmentation=AugmentationConfig(
@@ -382,6 +487,58 @@ def load_config(path: str | Path | None = None) -> Config:
             rotations_deg=_as_list_int(
                 model_augmentation.get("rotations_deg", []),
                 "model.augmentation.rotations_deg",
+            ),
+        ),
+        hybrid_features=HybridFeaturesConfig(
+            enabled=bool(model_hybrid.get("enabled", False)),
+            knn_l2_normalize=bool(model_hybrid.get("knn_l2_normalize", True)),
+            xgb_zscore=bool(model_hybrid.get("xgb_zscore", True)),
+            zscore_eps=float(model_hybrid.get("zscore_eps", 1e-6)),
+            blocks=HybridBlocksConfig(
+                dino=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "dino",
+                    default_enabled=True,
+                    default_weight_knn=1.0,
+                    default_weight_xgb=1.0,
+                ),
+                rgb_stats=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "rgb_stats",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                ),
+                hsv_mean=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "hsv_mean",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                ),
+                grad_stats=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "grad_stats",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                ),
+                grad_orient_hist=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "grad_orient_hist",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                    default_bins=8,
+                ),
+                lbp_hist=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "lbp_hist",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                    default_bins=16,
+                ),
             ),
         ),
     )
@@ -457,6 +614,18 @@ def load_config(path: str | Path | None = None) -> Config:
                 post_roads["penalty_values"], "postprocess.roads.penalty_values"
             )
         ),
+        novel_proposals=NovelProposalsConfig(
+            enabled=bool(post_novel.get("enabled", False)),
+            min_area_px=int(post_novel.get("min_area_px", 100)),
+            min_length_m=float(post_novel.get("min_length_m", 30.0)),
+            max_width_m=float(post_novel.get("max_width_m", 12.0)),
+            min_skeleton_ratio=float(post_novel.get("min_skeleton_ratio", 8.0)),
+            min_pca_ratio=float(post_novel.get("min_pca_ratio", 3.0)),
+            max_circularity=float(post_novel.get("max_circularity", 0.6)),
+            min_mean_score=float(post_novel.get("min_mean_score", 0.5)),
+            max_road_overlap=float(post_novel.get("max_road_overlap", 1.0)),
+            connectivity=int(post_novel.get("connectivity", 2)),
+        ),
     )
 
     runtime_cfg = RuntimeConfig(
@@ -477,6 +646,21 @@ def load_config(path: str | Path | None = None) -> Config:
         debug_timing=bool(runtime["debug_timing"]),
         debug_timing_verbose=bool(runtime["debug_timing_verbose"]),
         compact_timing_logs=bool(runtime.get("compact_timing_logs", True)),
+        plotting=PlottingConfig(
+            boundary_band_px=int(runtime_plotting.get("boundary_band_px", 10)),
+            proposal_accept_rgb=_as_rgb_tuple(
+                runtime_plotting.get("proposal_accept_rgb", [0, 255, 255]),
+                "runtime.plotting.proposal_accept_rgb",
+            ),
+            proposal_reject_rgb=_as_rgb_tuple(
+                runtime_plotting.get("proposal_reject_rgb", [255, 165, 0]),
+                "runtime.plotting.proposal_reject_rgb",
+            ),
+            proposal_candidate_rgb=_as_rgb_tuple(
+                runtime_plotting.get("proposal_candidate_rgb", [255, 255, 0]),
+                "runtime.plotting.proposal_candidate_rgb",
+            ),
+        ),
     )
 
     return Config(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import numpy as np
 import xgboost as xgb
@@ -13,14 +12,48 @@ from .config_loader import cfg
 from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
+    fuse_patch_features,
     labels_to_patch_masks,
     load_tile_features_if_valid,
-    tile_feature_path,
     tile_iterator,
 )
 from .metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
 
 logger = logging.getLogger(__name__)
+
+
+def _gpu_error_message(exc: Exception) -> str:
+    return str(exc).lower()
+
+
+def _is_gpu_unavailable_error(exc: Exception) -> bool:
+    msg = _gpu_error_message(exc)
+    markers = [
+        "cuda",
+        "gpu",
+        "gpu_hist",
+        "no visible gpu",
+        "not compiled with",
+        "device",
+    ]
+    return any(m in msg for m in markers)
+
+
+def _base_xgb_params(use_gpu: bool) -> dict[str, object]:
+    params: dict[str, object] = {
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "max_depth": 6,
+        "eta": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.2,
+        "reg_alpha": 0.1,
+        "min_child_weight": 3,
+        "tree_method": "hist",
+    }
+    if use_gpu:
+        params["device"] = "cuda"
+    return params
 
 
 def build_xgb_dataset(
@@ -32,9 +65,12 @@ def build_xgb_dataset(
     feature_dir,
     image_id,
     pos_frac,
+    max_pos=120000,
     max_neg=8000,
     context_radius: int = 0,
     prefetched_tiles: dict | None = None,
+    xgb_feature_stats: dict | None = None,
+    return_layout: bool = False,
 ):
     """Build an XGBoost dataset from tiled features and labels.
 
@@ -47,12 +83,14 @@ def build_xgb_dataset(
         feature_dir (str | None): Directory containing precomputed features.
         image_id (str): Identifier for the image.
         pos_frac (float): Fraction threshold for positive patches.
+        max_pos (int): Maximum number of positive samples.
         max_neg (int): Maximum number of negative samples.
         context_radius (int): Feature context radius.
         prefetched_tiles (dict | None): Optional in-memory tile feature cache.
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: Feature matrix X and labels y.
+        tuple[np.ndarray, np.ndarray, dict | None]: Feature matrix X, labels y, and
+            optional feature layout info.
 
     Examples:
         >>> callable(build_xgb_dataset)
@@ -62,6 +100,7 @@ def build_xgb_dataset(
         raise ValueError("feature_dir or prefetched_tiles must be provided")
 
     X_pos, X_neg = [], []
+    feature_layout: dict | None = None
     missing_feature_tiles = 0
     resample_factor = int(cfg.model.backbone.resample_factor or 1)
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
@@ -71,6 +110,7 @@ def build_xgb_dataset(
             w_eff = prefetched["w_eff"]
             if h_eff < ps or w_eff < ps:
                 continue
+            img_c = img_tile[:h_eff, :w_eff]
             lab_c = lab_tile[:h_eff, :w_eff] if lab_tile is not None else None
             feats_tile = prefetched["feats"]
             hp = prefetched["hp"]
@@ -81,10 +121,6 @@ def build_xgb_dataset(
                 continue
             img_c, lab_c, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, lab_tile, ps)
             if h_eff < ps or w_eff < ps:
-                continue
-            fpath = tile_feature_path(feature_dir, image_id, y, x)
-            if not os.path.exists(fpath):
-                missing_feature_tiles += 1
                 continue
             hp = h_eff // ps
             wp = w_eff // ps
@@ -101,12 +137,23 @@ def build_xgb_dataset(
             if feats_tile is None:
                 missing_feature_tiles += 1
                 continue
+            img_c = img_c[:h_eff, :w_eff]
 
         if lab_c is None:
             logger.warning("missing labels for tile y=%s x=%s; skipping", y, x)
             continue
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
+        feats_tile, layout_i = fuse_patch_features(
+            feats_tile,
+            img_c,
+            ps,
+            mode="xgb",
+            xgb_feature_stats=xgb_feature_stats,
+            return_layout=return_layout and feature_layout is None,
+        )
+        if feature_layout is None and layout_i is not None:
+            feature_layout = layout_i
         if hp is None or wp is None:
             logger.warning(
                 "missing patch dimensions for tile y=%s x=%s; skipping", y, x
@@ -132,9 +179,22 @@ def build_xgb_dataset(
             "build_xgb_dataset produced no positive samples for image_id=%s; skipping this source tile",
             image_id,
         )
-        return np.empty((0, 0), dtype=np.float32), np.empty((0,), dtype=np.float32)
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            feature_layout,
+        )
 
     X_pos = np.concatenate(X_pos, axis=0)
+    if len(X_pos) > max_pos:
+        idx = np.random.default_rng(42).choice(len(X_pos), size=max_pos, replace=False)
+        X_pos = X_pos[idx]
+        logger.info(
+            "build_xgb_dataset: subsampled positives to %s (max_pos=%s) for image_id=%s",
+            len(X_pos),
+            max_pos,
+            image_id,
+        )
     X_neg = np.concatenate(X_neg, axis=0) if X_neg else np.empty((0, X_pos.shape[1]))
     # Subsample negatives
     if len(X_neg) > max_neg:
@@ -143,7 +203,7 @@ def build_xgb_dataset(
 
     X = np.vstack([X_pos, X_neg])
     y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))])
-    return X, y
+    return X, y, feature_layout
 
 
 def train_xgb_classifier(
@@ -153,6 +213,7 @@ def train_xgb_classifier(
     num_boost_round=300,
     verbose_eval=50,
     param_overrides: dict | None = None,
+    feature_names: list[str] | None = None,
 ):
     """Train a binary XGBoost classifier for patch embeddings.
 
@@ -171,21 +232,15 @@ def train_xgb_classifier(
         >>> callable(train_xgb_classifier)
         True
     """
-    dtrain = xgb.DMatrix(X, label=y)
-    params = {
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "max_depth": 6,
-        "eta": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.2,
-        "reg_alpha": 0.1,
-        "min_child_weight": 3,
-        "tree_method": "gpu_hist" if use_gpu else "hist",
-    }
+    dtrain = xgb.DMatrix(X, label=y, feature_names=feature_names)
+    params = _base_xgb_params(use_gpu=use_gpu)
     if param_overrides:
         params.update(param_overrides)
-        params["tree_method"] = "gpu_hist" if use_gpu else "hist"
+        params["tree_method"] = "hist"
+        if use_gpu:
+            params["device"] = "cuda"
+        else:
+            params.pop("device", None)
     try:
         bst = xgb.train(
             params,
@@ -195,11 +250,10 @@ def train_xgb_classifier(
             verbose_eval=verbose_eval,
         )
     except xgb.core.XGBoostError as e:
-        if use_gpu and "gpu_hist" in str(e):
-            logger.warning(
-                "xgboost build does not support GPU; falling back to CPU hist."
-            )
+        if use_gpu and _is_gpu_unavailable_error(e):
+            logger.warning("xgboost GPU unavailable; falling back to CPU hist.")
             params["tree_method"] = "hist"
+            params.pop("device", None)
             bst = xgb.train(
                 params,
                 dtrain,
@@ -222,6 +276,7 @@ def hyperparam_search_xgb(
     early_stopping_rounds=40,
     verbose_eval=50,
     seed: int = 42,
+    feature_names: list[str] | None = None,
 ):
     """Run hyperparameter search, selecting by validation logloss.
 
@@ -252,31 +307,26 @@ def hyperparam_search_xgb(
     split = max(1, int(n * (1 - val_fraction)))
     train_idx, val_idx = idx[:split], idx[split:]
 
-    dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
-    dval = xgb.DMatrix(X[val_idx], label=y[val_idx])
+    dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx], feature_names=feature_names)
+    dval = xgb.DMatrix(X[val_idx], label=y[val_idx], feature_names=feature_names)
 
-    base_params = {
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "max_depth": 6,
-        "eta": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.2,
-        "reg_alpha": 0.1,
-        "min_child_weight": 3,
-        "tree_method": "gpu_hist" if use_gpu else "hist",
-    }
+    base_params = _base_xgb_params(use_gpu=use_gpu)
     if param_grid is None:
         param_grid = [base_params]
 
     best_model = None
     best_params = None
     best_score = float("inf")  # logloss: lower is better
+    gpu_enabled = bool(use_gpu)
 
     for i, overrides in enumerate(param_grid):
-        params = base_params.copy()
+        params = _base_xgb_params(use_gpu=gpu_enabled)
         params.update(overrides)
-        params["tree_method"] = "gpu_hist" if use_gpu else "hist"
+        params["tree_method"] = "hist"
+        if gpu_enabled:
+            params["device"] = "cuda"
+        else:
+            params.pop("device", None)
         logger.info("xgb-search cfg %s/%s: %s", i + 1, len(param_grid), params)
         try:
             model = xgb.train(
@@ -288,9 +338,11 @@ def hyperparam_search_xgb(
                 verbose_eval=verbose_eval,
             )
         except xgb.core.XGBoostError as e:
-            if use_gpu and "gpu_hist" in str(e):
-                logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
+            if gpu_enabled and _is_gpu_unavailable_error(e):
+                logger.warning("xgboost GPU unavailable; retrying with CPU hist.")
+                gpu_enabled = False
                 params["tree_method"] = "hist"
+                params.pop("device", None)
                 model = xgb.train(
                     params,
                     dtrain,
@@ -347,6 +399,8 @@ def hyperparam_search_xgb_iou(
     verbose_eval=50,
     seed: int = 42,
     context_radius: int = 0,
+    xgb_feature_stats: dict | None = None,
+    feature_names: list[str] | None = None,
 ):
     """Search hyperparameters using IoU on Image B as the selection metric.
 
@@ -387,19 +441,10 @@ def hyperparam_search_xgb_iou(
     best_metrics = None
     best_thr = None
 
-    base_params = {
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "max_depth": 6,
-        "eta": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.2,
-        "reg_alpha": 0.1,
-        "min_child_weight": 3,
-        "tree_method": "gpu_hist" if use_gpu else "hist",
-    }
+    base_params = _base_xgb_params(use_gpu=use_gpu)
     if param_grid is None:
         param_grid = [base_params]
+    gpu_enabled = bool(use_gpu)
 
     # simple train/val split (used only for early stopping)
     n = len(X)
@@ -409,13 +454,17 @@ def hyperparam_search_xgb_iou(
     idx = rng.permutation(n)
     split = max(1, int(n * (1 - val_fraction)))
     train_idx, val_idx = idx[:split], idx[split:]
-    dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
-    dval = xgb.DMatrix(X[val_idx], label=y[val_idx])
+    dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx], feature_names=feature_names)
+    dval = xgb.DMatrix(X[val_idx], label=y[val_idx], feature_names=feature_names)
 
     for i, overrides in enumerate(param_grid):
-        params = base_params.copy()
+        params = _base_xgb_params(use_gpu=gpu_enabled)
         params.update(overrides)
-        params["tree_method"] = "gpu_hist" if use_gpu else "hist"
+        params["tree_method"] = "hist"
+        if gpu_enabled:
+            params["device"] = "cuda"
+        else:
+            params.pop("device", None)
         logger.info("xgb-search-iou cfg %s/%s: %s", i + 1, len(param_grid), params)
         try:
             model = xgb.train(
@@ -427,9 +476,11 @@ def hyperparam_search_xgb_iou(
                 verbose_eval=verbose_eval,
             )
         except xgb.core.XGBoostError as e:
-            if use_gpu and "gpu_hist" in str(e):
-                logger.warning("xgboost build lacks GPU; retrying with CPU hist.")
+            if gpu_enabled and _is_gpu_unavailable_error(e):
+                logger.warning("xgboost GPU unavailable; retrying with CPU hist.")
+                gpu_enabled = False
                 params["tree_method"] = "hist"
+                params.pop("device", None)
                 model = xgb.train(
                     params,
                     dtrain,
@@ -452,6 +503,7 @@ def hyperparam_search_xgb_iou(
             image_id_b,
             prefetched_tiles=prefetched_tiles,
             context_radius=context_radius,
+            xgb_feature_stats=xgb_feature_stats,
         )
         if device is not None:
             try:
@@ -506,6 +558,7 @@ def xgb_score_image_b(
     image_id_b,
     prefetched_tiles=None,
     context_radius: int = 0,
+    xgb_feature_stats: dict | None = None,
 ):
     """Apply a trained XGBoost model to Image B and return a score map.
 
@@ -550,27 +603,53 @@ def xgb_score_image_b(
             w_eff = feat_info["w_eff"]
             hp = feat_info["hp"]
             wp = feat_info["wp"]
+            img_c = img_b[y : y + h_eff, x : x + w_eff]
         else:
             y, x, img_tile = tile_entry
             img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
             if h_eff < ps or w_eff < ps:
                 continue
-            fpath = tile_feature_path(feature_dir, image_id_b, y, x)
-            if not os.path.exists(fpath):
+            hp = h_eff // ps
+            wp = w_eff // ps
+            feats_tile = load_tile_features_if_valid(
+                feature_dir,
+                image_id_b,
+                y,
+                x,
+                expected_hp=hp,
+                expected_wp=wp,
+                ps=ps,
+                resample_factor=int(cfg.model.backbone.resample_factor or 1),
+            )
+            if feats_tile is None:
                 continue
-            feats_tile = np.load(fpath)
-            hp, wp = feats_tile.shape[:2]
+            img_c = img_c[:h_eff, :w_eff]
 
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, int(context_radius))
+        feats_tile, _ = fuse_patch_features(
+            feats_tile,
+            img_c,
+            ps,
+            mode="xgb",
+            xgb_feature_stats=xgb_feature_stats,
+            return_layout=False,
+        )
 
         if hp is None or wp is None:
             logger.warning(
                 "missing patch dimensions for tile y=%s x=%s; skipping", y, x
             )
             continue
-        dtest = xgb.DMatrix(feats_tile.reshape(-1, feats_tile.shape[-1]))
-        scores_patch = bst.predict(dtest).reshape(hp, wp)
+        flat_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(
+            np.float32, copy=False
+        )
+        try:
+            scores_flat = bst.inplace_predict(flat_feats)
+        except Exception:
+            dtest = xgb.DMatrix(flat_feats)
+            scores_flat = bst.predict(dtest)
+        scores_patch = np.asarray(scores_flat, dtype=np.float32).reshape(hp, wp)
         scores_tile = resize(
             scores_patch,
             (h_eff, w_eff),

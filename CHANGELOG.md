@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Reduce LOO tuning runtime with stronger caching defaults and XGB scoring/training efficiency improvements.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/features.py`, `segedge/core/banks.py`, `segedge/core/xdboost.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`
+- reason: Address repeated DINO extraction, CPU fallback overhead, expensive roads rasterization, and oversized training samples.
+- problems fixed: Defaulted to disk feature cache + auto-force disk in LOO+augmentation mode, added roads-mask disk caching, switched XGB tile inference to `inplace_predict`, capped positive samples (`max_pos_bank`) for banks/XGB dataset, hardened feature-cache validity via `feature_spec_hash`, and reduced repeated GPU retry behavior.
+
+- Description: Add hybrid DINO+image feature fusion for kNN/XGB, shape-filtered novel proposals, and richer inference diagnostics plots.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/features.py`, `segedge/core/banks.py`, `segedge/core/knn.py`, `segedge/core/xdboost.py`, `segedge/core/plotting.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Improve thin-structure segmentation boundaries and auditability by combining semantic embeddings with local patch cues and object-level heuristics.
+- problems fixed: Enables leakage-safe train-fold feature standardization for XGB, preserves kNN cosine geometry, exports feature-spec/model metadata, proposes accepted/rejected novel objects outside incomplete labels, and adds boundary/disagreement/uncertainty/importance visual diagnostics.
+
 - Description: Add interruption-safe rolling best-config checkpoints during LOO tuning and holdout inference.
 - file touched: `segedge/pipeline/run.py`, `segedge/pipeline/common.py`, `CHANGELOG.md`
 - reason: Persist the current best configuration while long runs are still in progress.

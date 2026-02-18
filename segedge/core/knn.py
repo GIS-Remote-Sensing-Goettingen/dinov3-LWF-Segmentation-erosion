@@ -15,6 +15,8 @@ from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
     extract_patch_features_single_scale,
+    fuse_patch_features,
+    hybrid_feature_spec_hash,
     load_tile_features_if_valid,
     save_tile_features,
     tile_iterator,
@@ -132,6 +134,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
             w_eff = feat_info["w_eff"]
             hp = feat_info["hp"]
             wp = feat_info["wp"]
+            img_c = img_b[y : y + h_eff, x : x + w_eff]
             cached_tiles += 1
         else:
             y, x, img_tile = tile_entry
@@ -172,6 +175,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
                         "resample_factor": resample_factor,
                         "h_eff": h_eff,
                         "w_eff": w_eff,
+                        "feature_spec_hash": hybrid_feature_spec_hash(),
                     }
                     save_tile_features(
                         feats_tile, feature_dir, image_id, y, x, meta=meta
@@ -179,6 +183,13 @@ def zero_shot_knn_single_scale_B_with_saliency(
 
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
+        feats_tile, _ = fuse_patch_features(
+            feats_tile,
+            img_c,
+            ps,
+            mode="knn",
+            return_layout=False,
+        )
 
         if hp is None or wp is None:
             logger.warning(

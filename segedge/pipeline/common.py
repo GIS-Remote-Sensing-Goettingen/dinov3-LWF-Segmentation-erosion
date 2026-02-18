@@ -22,7 +22,11 @@ from transformers import AutoImageProcessor, AutoModel
 
 from ..core.banks import build_banks_single_scale
 from ..core.config_loader import cfg
-from ..core.features import prefetch_features_single_scale_image
+from ..core.features import (
+    apply_xgb_feature_stats,
+    fit_xgb_feature_stats,
+    prefetch_features_single_scale_image,
+)
 from ..core.io_utils import (
     build_sh_buffer_mask,
     load_dop20_image,
@@ -503,7 +507,16 @@ def build_training_artifacts_for_tiles(
     feature_cache_mode: str,
     feature_dir: str | None,
     context_radius: int,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[str], list[str]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray,
+    np.ndarray,
+    list[str],
+    list[str],
+    dict | None,
+    dict | None,
+]:
     """Build banks and XGB training data from a set of source tiles.
 
     Args:
@@ -520,9 +533,19 @@ def build_training_artifacts_for_tiles(
         context_radius (int): Feature context radius.
 
     Returns:
-        tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[str], list[str]]:
+        tuple[
+            np.ndarray,
+            np.ndarray | None,
+            np.ndarray,
+            np.ndarray,
+            list[str],
+            list[str],
+            dict | None,
+            dict | None,
+        ]:
             Positive bank, negative bank, XGB feature matrix, XGB labels,
-            base image ids, augmentation modes.
+            base image ids, augmentation modes, XGB feature z-score stats,
+            and feature layout metadata.
 
     Examples:
         >>> callable(build_training_artifacts_for_tiles)
@@ -539,6 +562,7 @@ def build_training_artifacts_for_tiles(
     neg_banks = []
     x_list = []
     y_list = []
+    feature_layout: dict | None = None
     base_image_ids = [os.path.splitext(os.path.basename(p))[0] for p in source_tiles]
     ds = int(cfg.model.backbone.resample_factor or 1)
 
@@ -599,7 +623,7 @@ def build_training_artifacts_for_tiles(
             if neg_bank_i is not None and len(neg_bank_i) > 0:
                 neg_banks.append(neg_bank_i)
 
-            x_i, y_i = build_xgb_dataset(
+            x_i, y_i, layout_i = build_xgb_dataset(
                 img_a,
                 labels_a,
                 ps,
@@ -608,13 +632,17 @@ def build_training_artifacts_for_tiles(
                 feature_dir,
                 image_id_aug,
                 pos_frac=cfg.model.banks.pos_frac_thresh,
+                max_pos=cfg.model.banks.max_pos_bank,
                 max_neg=cfg.model.banks.max_neg_bank,
                 context_radius=context_radius,
                 prefetched_tiles=prefetched_a,
+                return_layout=feature_layout is None,
             )
             if x_i.size > 0 and y_i.size > 0:
                 x_list.append(x_i)
                 y_list.append(y_i)
+            if feature_layout is None and layout_i is not None:
+                feature_layout = layout_i
 
     if not pos_banks:
         raise ValueError("no positive banks were built; check source tiles and labels")
@@ -630,7 +658,22 @@ def build_training_artifacts_for_tiles(
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
     if x.size == 0 or y.size == 0:
         raise ValueError("XGBoost dataset is empty; check source tiles and labels")
-    return pos_bank, neg_bank, x, y, base_image_ids, aug_modes
+    xgb_feature_stats = None
+    if cfg.model.hybrid_features.enabled and cfg.model.hybrid_features.xgb_zscore:
+        xgb_feature_stats = fit_xgb_feature_stats(
+            x, eps=float(cfg.model.hybrid_features.zscore_eps)
+        )
+        x = apply_xgb_feature_stats(x, xgb_feature_stats)
+    return (
+        pos_bank,
+        neg_bank,
+        x,
+        y,
+        base_image_ids,
+        aug_modes,
+        xgb_feature_stats,
+        feature_layout,
+    )
 
 
 def build_banks_for_sources(
@@ -730,7 +773,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
         labels_a = reproject_labels_to_image(
             img_a_path, lab_a_path, downsample_factor=ds
         )
-        X_i, y_i = build_xgb_dataset(
+        X_i, y_i, _ = build_xgb_dataset(
             img_a,
             labels_a,
             ps,
@@ -739,6 +782,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
             feature_dir,
             image_id_a,
             pos_frac=cfg.model.banks.pos_frac_thresh,
+            max_pos=cfg.model.banks.max_pos_bank,
             max_neg=cfg.model.banks.max_neg_bank,
             context_radius=context_radius,
         )

@@ -8,32 +8,24 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
-import fiona
 import numpy as np
-import rasterio
-import rasterio.features as rfeatures
 import torch
-import yaml
-from pyproj import CRS, Transformer
 from scipy.ndimage import median_filter
-from shapely.geometry import box, mapping, shape
-from shapely.ops import transform as shp_transform
-from shapely.strtree import STRtree
-from skimage.transform import resize
 
 from ..core.config_loader import cfg
 from ..core.crf_utils import refine_with_densecrf
-from ..core.features import prefetch_features_single_scale_image
+from ..core.features import (
+    hybrid_feature_spec_hash,
+    prefetch_features_single_scale_image,
+    serialize_xgb_feature_stats,
+)
 from ..core.io_utils import (
     append_mask_to_union_shapefile,
     backup_union_shapefile,
-    build_sh_buffer_mask,
     consolidate_features_for_image,
     count_shapefile_features,
     export_best_settings,
-    load_dop20_image,
-    rasterize_vector_labels,
-    reproject_labels_to_image,
+    export_mask_to_shapefile,
 )
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.logging_utils import setup_logging
@@ -43,7 +35,14 @@ from ..core.metrics_utils import (
     compute_metrics_batch_gpu,
     compute_oracle_upper_bound,
 )
-from ..core.plotting import save_unified_plot
+from ..core.plotting import (
+    save_core_qualitative_plot,
+    save_dino_channel_importance_plot,
+    save_disagreement_entropy_plot,
+    save_proposal_overlay_plot,
+    save_score_threshold_plot,
+    save_unified_plot,
+)
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import (
     hyperparam_search_xgb_iou,
@@ -55,517 +54,27 @@ from .common import (
     init_model,
     resolve_tiles_from_gt_presence,
 )
+from .runtime_utils import (
+    _apply_roads_penalty,
+    _apply_shadow_filter,
+    _eval_crf_config,
+    _get_roads_mask,
+    _init_crf_parallel,
+    _log_phase,
+    _summarize_phase_metrics,
+    _update_phase_metrics,
+    _weighted_mean,
+    filter_novel_proposals,
+    load_b_tile_context,
+    summarize_phase_metrics_mean_std,
+    write_rolling_best_config,
+)
 
 # Config-driven flags
 USE_FP16_KNN = cfg.search.knn.use_fp16_knn
 CRF_MAX_CONFIGS = cfg.search.crf.max_configs
 
 logger = logging.getLogger(__name__)
-
-_CRF_PARALLEL_CONTEXTS: list[dict] | None = None
-_ROADS_MASK_CACHE: dict[tuple[str, int], np.ndarray] = {}
-_ROADS_INDEX_CACHE: dict[tuple[str, str], tuple[STRtree | None, list]] = {}
-
-
-def _get_roads_index(tile_crs) -> tuple[STRtree | None, list]:
-    """Load and cache road geometries in a spatial index.
-
-    Args:
-        tile_crs: Target CRS for geometries.
-
-    Returns:
-        tuple[STRtree | None, list]: Index and geometry list.
-
-    Examples:
-        >>> callable(_get_roads_index)
-        True
-    """
-    roads_path = cfg.io.paths.roads_mask_path
-    if not roads_path or not os.path.exists(roads_path):
-        return None, []
-    crs_key = CRS.from_user_input(tile_crs).to_string() if tile_crs else "<none>"
-    cache_key = (roads_path, crs_key)
-    if cache_key in _ROADS_INDEX_CACHE:
-        return _ROADS_INDEX_CACHE[cache_key]
-
-    t0 = time_start()
-    geoms = []
-    with fiona.open(roads_path, "r") as shp:
-        vec_crs = shp.crs
-        transformer = None
-        if vec_crs and tile_crs is not None:
-            vec_crs_obj = CRS.from_user_input(vec_crs)
-            tile_crs_obj = CRS.from_user_input(tile_crs)
-            if vec_crs_obj != tile_crs_obj:
-                logger.info(
-                    "reprojecting road geometries from %s -> %s for %s",
-                    vec_crs_obj.to_string(),
-                    tile_crs_obj.to_string(),
-                    roads_path,
-                )
-                transformer = Transformer.from_crs(
-                    vec_crs_obj, tile_crs_obj, always_xy=True
-                )
-        for feat in shp:
-            geom = feat.get("geometry")
-            if not geom:
-                continue
-            geom_obj = shape(geom)
-            if geom_obj.is_empty:
-                continue
-            if transformer is not None:
-                geom_obj = shp_transform(transformer.transform, geom_obj)
-            geoms.append(geom_obj)
-
-    tree = STRtree(geoms) if geoms else None
-    _ROADS_INDEX_CACHE[cache_key] = (tree, geoms)
-    time_end("roads_index_build", t0)
-    logger.info("roads index built: %s geometries", len(geoms))
-    return tree, geoms
-
-
-def _get_roads_mask(
-    tile_path: str,
-    downsample_factor: int,
-    target_shape: tuple[int, int] | None = None,
-) -> np.ndarray | None:
-    """Load or cache a roads mask rasterized to the tile grid.
-
-    Args:
-        tile_path (str): Tile path.
-        downsample_factor (int): Downsample factor for rasterization.
-
-    Returns:
-        np.ndarray | None: Boolean mask if available.
-
-    Examples:
-        >>> callable(_get_roads_mask)
-        True
-    """
-    key = (tile_path, downsample_factor)
-    if key in _ROADS_MASK_CACHE:
-        return _ROADS_MASK_CACHE[key]
-
-    with rasterio.open(tile_path) as tile_src:
-        if downsample_factor > 1:
-            out_shape = (
-                tile_src.height // downsample_factor,
-                tile_src.width // downsample_factor,
-            )
-            transform = tile_src.transform * tile_src.transform.scale(
-                tile_src.width / out_shape[1],
-                tile_src.height / out_shape[0],
-            )
-        else:
-            out_shape = (tile_src.height, tile_src.width)
-            transform = tile_src.transform
-        tile_bounds = tile_src.bounds
-        tile_crs = tile_src.crs
-
-    tree, geoms = _get_roads_index(tile_crs)
-    if tree is None or not geoms:
-        mask_empty = np.zeros(out_shape, dtype=bool)
-        _ROADS_MASK_CACHE[key] = mask_empty
-        return mask_empty
-
-    tile_box = box(
-        tile_bounds.left,
-        tile_bounds.bottom,
-        tile_bounds.right,
-        tile_bounds.top,
-    )
-    hits = tree.query(tile_box)
-    if len(hits) == 0:
-        mask_empty = np.zeros(out_shape, dtype=bool)
-        _ROADS_MASK_CACHE[key] = mask_empty
-        return mask_empty
-
-    if isinstance(hits[0], (int, np.integer)):
-        candidates = [geoms[int(idx)] for idx in hits]
-    else:
-        candidates = list(hits)
-    shapes = [mapping(g) for g in candidates if g.intersects(tile_box)]
-    if not shapes:
-        mask_empty = np.zeros(out_shape, dtype=bool)
-        _ROADS_MASK_CACHE[key] = mask_empty
-        return mask_empty
-
-    t0 = time_start()
-    mask = rfeatures.rasterize(
-        shapes=[(geom, 1) for geom in shapes],
-        out_shape=out_shape,
-        transform=transform,
-        fill=0,
-        default_value=1,
-        dtype="uint8",
-        all_touched=False,
-    )
-    if target_shape is not None and mask.shape != target_shape:
-        mask = resize(
-            mask,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype("uint8")
-    mask_bool = mask.astype(bool)
-    time_end("roads_mask_rasterize", t0)
-    logger.info(
-        "roads mask rasterized: shapes=%s coverage=%.4f",
-        len(shapes),
-        float(mask_bool.mean()),
-    )
-    _ROADS_MASK_CACHE[key] = mask_bool
-    return mask_bool
-
-
-def _apply_roads_penalty(
-    score_map: np.ndarray,
-    roads_mask: np.ndarray | None,
-    penalty: float,
-) -> np.ndarray:
-    """Apply a multiplicative penalty on road pixels.
-
-    Args:
-        score_map (np.ndarray): Score map.
-        roads_mask (np.ndarray | None): Roads mask.
-        penalty (float): Multiplicative penalty in [0, 1].
-
-    Returns:
-        np.ndarray: Penalized score map.
-
-    Examples:
-        >>> import numpy as np
-        >>> score = np.array([[1.0, 2.0]], dtype=np.float32)
-        >>> mask = np.array([[True, False]])
-        >>> _apply_roads_penalty(score, mask, 0.5).tolist()
-        [[0.5, 2.0]]
-    """
-    if roads_mask is None or penalty >= 1.0:
-        return score_map
-    if roads_mask.shape != score_map.shape:
-        raise ValueError("roads_mask must match score_map shape")
-    penalty_map = np.where(roads_mask, penalty, 1.0).astype(score_map.dtype)
-    return score_map * penalty_map
-
-
-def _weighted_mean(values: list[float], weights: list[float]) -> float:
-    """Compute weighted mean with safe fallback.
-
-    Args:
-        values (list[float]): Values.
-        weights (list[float]): Weights.
-
-    Returns:
-        float: Weighted mean or simple mean if total weight is zero.
-
-    Examples:
-        >>> _weighted_mean([1.0, 3.0], [1.0, 1.0])
-        2.0
-    """
-    total_w = float(np.sum(weights))
-    if total_w <= 0:
-        return float(np.mean(values)) if values else 0.0
-    return float(np.sum(np.array(values) * np.array(weights)) / total_w)
-
-
-def _log_phase(kind: str, name: str) -> None:
-    """Log a phase marker with ANSI color.
-
-    Args:
-        kind (str): Phase kind.
-        name (str): Phase name.
-
-    Examples:
-        >>> callable(_log_phase)
-        True
-    """
-    msg = f"PHASE {kind}: {name}".upper()
-    logger.info("\033[31m%s\033[0m", msg)
-
-
-def _update_phase_metrics(acc: dict[str, list[dict]], metrics_map: dict) -> None:
-    for key, metrics in metrics_map.items():
-        acc.setdefault(key, []).append(metrics)
-
-
-def _summarize_phase_metrics(acc: dict[str, list[dict]], label: str) -> None:
-    if not acc:
-        logger.info("summary %s: no metrics", label)
-        return
-    metric_keys = ["iou", "f1", "precision", "recall"]
-    phase_order = [
-        "knn_raw",
-        "knn_crf",
-        "knn_shadow",
-        "xgb_raw",
-        "xgb_crf",
-        "xgb_shadow",
-        "champion_raw",
-        "champion_crf",
-    ]
-    phase_order.append("champion_shadow")
-
-    logger.info("summary %s: phase metrics", label)
-    for phase in phase_order:
-        if phase not in acc or not acc[phase]:
-            continue
-        weights = [float(m.get("_weight", 0.0)) for m in acc[phase]]
-        vals = {k: [m.get(k, 0.0) for m in acc[phase]] for k in metric_keys}
-        mean_vals = {k: _weighted_mean(v, weights) for k, v in vals.items()}
-        med_vals = {k: float(np.median(v)) for k, v in vals.items()}
-        logger.info(
-            "summary %s %s wmean IoU=%.3f F1=%.3f P=%.3f R=%.3f | median IoU=%.3f F1=%.3f",
-            label,
-            phase,
-            mean_vals["iou"],
-            mean_vals["f1"],
-            mean_vals["precision"],
-            mean_vals["recall"],
-            med_vals["iou"],
-            med_vals["f1"],
-        )
-
-    champ_chain = ["champion_raw", "champion_crf", "champion_shadow"]
-    for prev, curr in zip(champ_chain, champ_chain[1:], strict=True):
-        if prev not in acc or curr not in acc:
-            continue
-        prev_weights = [float(m.get("_weight", 0.0)) for m in acc[prev]]
-        curr_weights = [float(m.get("_weight", 0.0)) for m in acc[curr]]
-        prev_iou = _weighted_mean([m.get("iou", 0.0) for m in acc[prev]], prev_weights)
-        curr_iou = _weighted_mean([m.get("iou", 0.0) for m in acc[curr]], curr_weights)
-        prev_f1 = _weighted_mean([m.get("f1", 0.0) for m in acc[prev]], prev_weights)
-        curr_f1 = _weighted_mean([m.get("f1", 0.0) for m in acc[curr]], curr_weights)
-        logger.info(
-            "summary %s delta %s→%s IoU=%.3f F1=%.3f",
-            label,
-            prev,
-            curr,
-            float(curr_iou - prev_iou),
-            float(curr_f1 - prev_f1),
-        )
-
-
-def _init_crf_parallel(contexts: list[dict]) -> None:
-    global _CRF_PARALLEL_CONTEXTS
-    _CRF_PARALLEL_CONTEXTS = contexts
-
-
-def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
-    if _CRF_PARALLEL_CONTEXTS is None:
-        raise RuntimeError("CRF contexts not initialized")
-    prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
-    ious = []
-    weights = []
-    for ctx in _CRF_PARALLEL_CONTEXTS:
-        mask_crf_local = refine_with_densecrf(
-            ctx["img_b"],
-            ctx["score_full"],
-            ctx["thr_center"],
-            ctx["sh_buffer_mask"],
-            prob_softness=prob_soft,
-            n_iters=n_iters,
-            pos_w=pos_w,
-            pos_xy_std=pos_xy,
-            bilateral_w=bi_w,
-            bilateral_xy_std=bi_xy,
-            bilateral_rgb_std=bi_rgb,
-        )
-        ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
-        weights.append(float(ctx["gt_weight"]))
-    return _weighted_mean(ious, weights), cfg
-
-
-def _apply_shadow_filter(
-    img_b: np.ndarray,
-    base_mask: np.ndarray,
-    weights,
-    threshold: float,
-    score_full: np.ndarray,
-    protect_score: float | None,
-) -> np.ndarray:
-    img_float = img_b.astype(np.float32)
-    w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
-    wsum = (img_float * w).sum(axis=2)
-    shadow_pass = wsum >= threshold
-    if protect_score is None:
-        return np.logical_and(base_mask, shadow_pass)
-    return np.logical_and(base_mask, shadow_pass | (score_full >= protect_score))
-
-
-def summarize_phase_metrics_mean_std(
-    phase_metrics: dict[str, list[dict]],
-) -> dict[str, dict[str, float]]:
-    """Summarize phase metrics as mean/std pairs across runs.
-
-    Args:
-        phase_metrics (dict[str, list[dict]]): Phase metrics keyed by phase.
-
-    Returns:
-        dict[str, dict[str, float]]: Per-phase metric summary.
-
-    Examples:
-        >>> summarize_phase_metrics_mean_std({}) == {}
-        True
-    """
-    out: dict[str, dict[str, float]] = {}
-    metric_keys = ["iou", "f1", "precision", "recall"]
-    for phase, rows in phase_metrics.items():
-        if not rows:
-            continue
-        phase_summary: dict[str, float] = {}
-        for key in metric_keys:
-            vals = [float(r.get(key, 0.0)) for r in rows]
-            phase_summary[f"{key}_mean"] = float(np.mean(vals))
-            phase_summary[f"{key}_std"] = float(np.std(vals))
-        out[phase] = phase_summary
-    return out
-
-
-def write_rolling_best_config(
-    out_path: str,
-    stage: str,
-    tuned: dict,
-    fold_done: int,
-    fold_total: int,
-    holdout_done: int,
-    holdout_total: int,
-    best_fold: dict | None = None,
-) -> None:
-    """Write rolling best config checkpoint for interruption-safe resume context.
-
-    Args:
-        out_path (str): Destination YAML path.
-        stage (str): Current pipeline stage.
-        tuned (dict): Tuned settings bundle.
-        fold_done (int): Completed LOO folds.
-        fold_total (int): Total LOO folds.
-        holdout_done (int): Processed holdout tiles.
-        holdout_total (int): Total holdout tiles.
-        best_fold (dict | None): Optional best-fold metadata.
-
-    Examples:
-        >>> callable(write_rolling_best_config)
-        True
-    """
-    payload = {
-        "timestamp_utc": datetime.utcnow().isoformat(),
-        "stage": stage,
-        "progress": {
-            "loo_folds_done": int(fold_done),
-            "loo_folds_total": int(fold_total),
-            "holdout_done": int(holdout_done),
-            "holdout_total": int(holdout_total),
-        },
-        "best_raw_config": tuned.get("best_raw_config"),
-        "best_xgb_config": tuned.get("best_xgb_config"),
-        "best_crf_config": tuned.get("best_crf_config"),
-        "best_shadow_config": tuned.get("shadow_cfg"),
-        "champion_source": tuned.get("champion_source"),
-        "roads_penalty": tuned.get("roads_penalty"),
-    }
-    if best_fold is not None:
-        payload["selected_fold"] = {
-            "fold_index": int(best_fold["fold_index"]),
-            "val_tile": best_fold["val_tile"],
-            "val_champion_shadow_iou": float(best_fold["val_champion_shadow_iou"]),
-        }
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(payload, fh, sort_keys=False, default_flow_style=False)
-
-
-def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
-    """Load B tile, SH raster, GT (optional), and buffer mask.
-
-    Args:
-        img_path (str): Image B path.
-        gt_vector_paths (list[str] | None): Vector GT paths.
-
-    Returns:
-        tuple: (img_b, labels_sh, gt_mask, gt_mask_eval, sh_buffer_mask, buffer_m, pixel_size_m)
-
-    Examples:
-        >>> callable(load_b_tile_context)
-        True
-    """
-    logger.info("loading tile: %s", img_path)
-    t0_data = time_start()
-    ds = int(cfg.model.backbone.resample_factor or 1)
-    img_b = load_dop20_image(img_path, downsample_factor=ds)
-    labels_sh = reproject_labels_to_image(
-        img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
-    )
-    gt_mask = (
-        rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds)
-        if gt_vector_paths
-        else None
-    )
-    time_end("data_loading_and_reprojection", t0_data)
-    target_shape = img_b.shape[:2]
-    if labels_sh.shape != target_shape:
-        logger.warning(
-            "labels_sh shape %s != image shape %s; resizing to match",
-            labels_sh.shape,
-            target_shape,
-        )
-        labels_sh = resize(
-            labels_sh,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(labels_sh.dtype)
-    if gt_mask is not None and gt_mask.shape != target_shape:
-        logger.warning(
-            "gt_mask shape %s != image shape %s; resizing to match",
-            gt_mask.shape,
-            target_shape,
-        )
-        gt_mask = resize(
-            gt_mask,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(gt_mask.dtype)
-
-    if gt_mask is not None:
-        logger.debug("GT positives on B: %s", gt_mask.sum())
-    logger.debug("SH_2022 positives on B: %s", (labels_sh > 0).sum())
-
-    with __import__("rasterio").open(img_path) as src:
-        pixel_size_m = abs(src.transform.a)
-    pixel_size_m = pixel_size_m * ds
-    buffer_m = cfg.model.priors.buffer_m
-    buffer_pixels = int(round(buffer_m / pixel_size_m))
-    logger.info(
-        "tile=%s pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s",
-        img_path,
-        pixel_size_m,
-        buffer_m,
-        buffer_pixels,
-    )
-
-    sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
-    if gt_mask is not None and cfg.model.priors.clip_gt_to_buffer:
-        gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
-        logger.info(
-            "CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)",
-            gt_mask_eval.sum(),
-            gt_mask.sum(),
-        )
-    else:
-        gt_mask_eval = gt_mask
-    return (
-        img_b,
-        labels_sh,
-        gt_mask,
-        gt_mask_eval,
-        sh_buffer_mask,
-        buffer_m,
-        pixel_size_m,
-    )
 
 
 def tune_on_validation_multi(
@@ -578,6 +87,8 @@ def tune_on_validation_multi(
     neg_bank: np.ndarray | None,
     X: np.ndarray,
     y: np.ndarray,
+    xgb_feature_stats: dict | None,
+    feature_layout: dict | None,
     ps: int,
     tile_size: int,
     stride: int,
@@ -596,6 +107,8 @@ def tune_on_validation_multi(
         neg_bank (np.ndarray | None): Negative bank.
         X (np.ndarray): XGB feature matrix.
         y (np.ndarray): XGB labels.
+        xgb_feature_stats (dict | None): Fold-fitted XGB feature standardization stats.
+        feature_layout (dict | None): Feature layout metadata.
         ps (int): Patch size.
         tile_size (int): Tile size in pixels.
         stride (int): Tile stride.
@@ -669,6 +182,18 @@ def tune_on_validation_multi(
     val_fraction = cfg.search.xgb.val_fraction
     if param_grid is None:
         param_grid = [None]
+    feature_names = (
+        list(feature_layout.get("feature_names", []))
+        if feature_layout is not None
+        else None
+    )
+    if feature_names is not None and len(feature_names) != X.shape[1]:
+        logger.warning(
+            "feature layout dim mismatch: names=%s, X=%s; disabling XGB feature names",
+            len(feature_names),
+            X.shape[1],
+        )
+        feature_names = None
 
     xgb_candidates = []
     for overrides in param_grid:
@@ -679,6 +204,7 @@ def tune_on_validation_multi(
                 use_gpu=use_gpu_xgb,
                 num_boost_round=num_boost_round,
                 verbose_eval=verbose_eval,
+                feature_names=feature_names,
             )
             params_used = None
         else:
@@ -704,6 +230,8 @@ def tune_on_validation_multi(
                 verbose_eval=verbose_eval,
                 seed=42,
                 context_radius=context_radius,
+                xgb_feature_stats=xgb_feature_stats,
+                feature_names=feature_names,
             )
         xgb_candidates.append({"bst": bst, "params": params_used})
 
@@ -831,6 +359,7 @@ def tune_on_validation_multi(
                     ctx["image_id"],
                     prefetched_tiles=ctx["prefetched_b"],
                     context_radius=context_radius,
+                    xgb_feature_stats=xgb_feature_stats,
                 )
                 score_full = _apply_roads_penalty(
                     score_full, ctx["roads_mask"], penalty
@@ -952,6 +481,7 @@ def tune_on_validation_multi(
                 ctx["image_id"],
                 prefetched_tiles=ctx["prefetched_b"],
                 context_radius=context_radius,
+                xgb_feature_stats=xgb_feature_stats,
             )
         score_full = _apply_roads_penalty(
             score_full, ctx["roads_mask"], float(roads_penalty)
@@ -1100,6 +630,8 @@ def tune_on_validation_multi(
         "best_crf_config": {**best_crf_cfg, "k": best_raw_config["k"]},
         "shadow_cfg": best_shadow_cfg,
         "roads_penalty": float(roads_penalty),
+        "xgb_feature_stats": xgb_feature_stats,
+        "feature_layout": feature_layout,
     }
 
 
@@ -1164,6 +696,7 @@ def infer_on_holdout(
     ds = int(cfg.model.backbone.resample_factor or 1)
     roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
     roads_penalty = float(tuned.get("roads_penalty", 1.0))
+    xgb_feature_stats = tuned.get("xgb_feature_stats")
 
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
     prefetched_b = prefetch_features_single_scale_image(
@@ -1218,6 +751,7 @@ def infer_on_holdout(
         image_id_b,
         prefetched_tiles=prefetched_b,
         context_radius=context_radius,
+        xgb_feature_stats=xgb_feature_stats,
     )
     score_xgb = _apply_roads_penalty(score_xgb, roads_mask, roads_penalty)
     mask_xgb = (score_xgb >= xgb_thr) & sh_buffer_mask
@@ -1227,8 +761,10 @@ def infer_on_holdout(
     champion_source = tuned["champion_source"]
     if champion_source == "raw":
         champion_score = score_knn
+        champion_thr = float(knn_thr)
     else:
         champion_score = score_xgb
+        champion_thr = float(xgb_thr)
 
     crf_cfg = tuned["best_crf_config"]
     mask_crf_knn = refine_with_densecrf(
@@ -1296,6 +832,47 @@ def infer_on_holdout(
     metrics_champion_raw = compute_metrics(champ_raw_mask, gt_mask_eval)
     metrics_champion_crf = compute_metrics(best_crf_mask, gt_mask_eval)
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
+    proposal_bundle = filter_novel_proposals(
+        shadow_mask,
+        labels_sh,
+        champion_score,
+        roads_mask,
+        pixel_size_m,
+    )
+    proposal_candidate_mask = proposal_bundle["candidate_mask"]
+    proposal_accepted_mask = proposal_bundle["accepted_mask"]
+    proposal_rejected_mask = proposal_bundle["rejected_mask"]
+
+    if cfg.postprocess.novel_proposals.enabled:
+        proposal_dir = os.path.join(shape_dir, "proposals")
+        os.makedirs(proposal_dir, exist_ok=True)
+        if proposal_accepted_mask.any():
+            export_mask_to_shapefile(
+                proposal_accepted_mask,
+                holdout_path,
+                os.path.join(proposal_dir, f"{image_id_b}_accepted.shp"),
+            )
+        if proposal_rejected_mask.any():
+            export_mask_to_shapefile(
+                proposal_rejected_mask,
+                holdout_path,
+                os.path.join(proposal_dir, f"{image_id_b}_rejected.shp"),
+            )
+
+    if champion_source == "xgb":
+        champion_prob = np.clip(champion_score.astype(np.float32), 1e-6, 1.0 - 1e-6)
+    else:
+        s = champion_score.astype(np.float32)
+        smin = float(np.min(s))
+        smax = float(np.max(s))
+        champion_prob = (s - smin) / (smax - smin + 1e-8)
+        champion_prob = np.clip(champion_prob, 1e-6, 1.0 - 1e-6)
+    disagreement_map = np.abs(score_xgb - score_knn).astype(np.float32)
+    entropy_map = (
+        -champion_prob * np.log(champion_prob)
+        - (1.0 - champion_prob) * np.log(1.0 - champion_prob)
+    ).astype(np.float32)
+
     metrics_map = {
         "knn_raw": metrics_knn,
         "knn_crf": metrics_knn_crf,
@@ -1333,6 +910,46 @@ def infer_on_holdout(
         gt_available=gt_available,
         similarity_map=score_knn_raw,
         score_maps={"knn": score_knn, "xgb": score_xgb},
+        proposal_masks={
+            "candidate": proposal_candidate_mask,
+            "accepted": proposal_accepted_mask,
+            "rejected": proposal_rejected_mask,
+        },
+    )
+    save_core_qualitative_plot(
+        img_b=img_b,
+        gt_mask=gt_mask_eval,
+        pred_mask=shadow_mask,
+        plot_dir=cfg.io.paths.plot_dir,
+        image_id_b=image_id_b,
+        gt_available=gt_available,
+        boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
+    )
+    save_score_threshold_plot(
+        score_map=champion_score,
+        threshold=champion_thr,
+        sh_buffer_mask=sh_buffer_mask,
+        plot_dir=cfg.io.paths.plot_dir,
+        image_id_b=image_id_b,
+    )
+    save_disagreement_entropy_plot(
+        disagreement_map=disagreement_map,
+        entropy_map=entropy_map,
+        candidate_mask=proposal_candidate_mask,
+        plot_dir=cfg.io.paths.plot_dir,
+        image_id_b=image_id_b,
+    )
+    save_proposal_overlay_plot(
+        img_b=img_b,
+        prediction_mask=shadow_mask,
+        candidate_mask=proposal_candidate_mask,
+        accepted_mask=proposal_accepted_mask,
+        rejected_mask=proposal_rejected_mask,
+        plot_dir=cfg.io.paths.plot_dir,
+        image_id_b=image_id_b,
+        accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
+        reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
+        candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
     )
 
     champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
@@ -1354,6 +971,7 @@ def infer_on_holdout(
             "champion_crf": best_crf_mask,
             "champion_shadow": shadow_mask,
         },
+        "proposals": proposal_bundle,
     }
 
 
@@ -1526,6 +1144,16 @@ def main():
     feature_cache_mode = cfg.runtime.feature_cache_mode
     if feature_cache_mode not in {"disk", "memory"}:
         raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
+    if (
+        feature_cache_mode == "memory"
+        and cfg.training.loo.enabled
+        and cfg.model.augmentation.enabled
+    ):
+        logger.warning(
+            "feature_cache_mode=memory with LOO+augmentation causes "
+            "repeated DINO extraction; forcing disk cache"
+        )
+        feature_cache_mode = "disk"
     if feature_cache_mode == "disk":
         feature_dir = cfg.io.paths.feature_dir
         os.makedirs(feature_dir, exist_ok=True)
@@ -1567,20 +1195,27 @@ def main():
             len(train_tiles),
             val_path,
         )
-        pos_bank_fold, neg_bank_fold, x_fold, y_fold, _, _ = (
-            build_training_artifacts_for_tiles(
-                train_tiles,
-                source_label_raster,
-                model,
-                processor,
-                device,
-                ps,
-                tile_size,
-                stride,
-                feature_cache_mode,
-                feature_dir,
-                context_radius,
-            )
+        (
+            pos_bank_fold,
+            neg_bank_fold,
+            x_fold,
+            y_fold,
+            _,
+            _,
+            xgb_feature_stats_fold,
+            feature_layout_fold,
+        ) = build_training_artifacts_for_tiles(
+            train_tiles,
+            source_label_raster,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_cache_mode,
+            feature_dir,
+            context_radius,
         )
         tuned_fold = tune_on_validation_multi(
             [val_path],
@@ -1592,6 +1227,8 @@ def main():
             neg_bank_fold,
             x_fold,
             y_fold,
+            xgb_feature_stats_fold,
+            feature_layout_fold,
             ps,
             tile_size,
             stride,
@@ -1672,22 +1309,41 @@ def main():
     # Final training on all GT tiles with selected LOO hyperparameters
     # ------------------------------------------------------------
     _log_phase("START", "final_all_gt_training")
-    pos_bank, neg_bank, X, y, image_id_a_list, aug_modes = (
-        build_training_artifacts_for_tiles(
-            gt_tiles,
-            source_label_raster,
-            model,
-            processor,
-            device,
-            ps,
-            tile_size,
-            stride,
-            feature_cache_mode,
-            feature_dir,
-            context_radius,
-        )
+    (
+        pos_bank,
+        neg_bank,
+        X,
+        y,
+        image_id_a_list,
+        aug_modes,
+        xgb_feature_stats,
+        feature_layout,
+    ) = build_training_artifacts_for_tiles(
+        gt_tiles,
+        source_label_raster,
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        feature_cache_mode,
+        feature_dir,
+        context_radius,
     )
     best_xgb_params = selected_tuned["best_xgb_config"].get("params")
+    feature_names = (
+        list(feature_layout.get("feature_names", []))
+        if feature_layout is not None
+        else None
+    )
+    if feature_names is not None and len(feature_names) != X.shape[1]:
+        logger.warning(
+            "final training feature layout mismatch: names=%s X=%s; disabling names",
+            len(feature_names),
+            X.shape[1],
+        )
+        feature_names = None
     final_bst = train_xgb_classifier(
         X,
         y,
@@ -1695,8 +1351,14 @@ def main():
         num_boost_round=cfg.search.xgb.num_boost_round,
         verbose_eval=cfg.search.xgb.verbose_eval,
         param_overrides=best_xgb_params,
+        feature_names=feature_names,
     )
-    tuned = {**selected_tuned, "bst": final_bst}
+    tuned = {
+        **selected_tuned,
+        "bst": final_bst,
+        "xgb_feature_stats": xgb_feature_stats,
+        "feature_layout": feature_layout,
+    }
     _log_phase("END", "final_all_gt_training")
     write_rolling_best_config(
         rolling_best_settings_path,
@@ -1739,6 +1401,12 @@ def main():
     inference_best_settings_path = os.path.join(run_dir, "inference_best_setting.yml")
     bst = tuned["bst"]
     xgb_model_info: dict[str, object] = {}
+    dino_importance_plot = save_dino_channel_importance_plot(
+        bst,
+        tuned.get("feature_layout"),
+        cfg.io.paths.plot_dir,
+        top_k=20,
+    )
     if bst is not None:
         best_iter = getattr(bst, "best_iteration", None)
         best_score = getattr(bst, "best_score", None)
@@ -1747,7 +1415,12 @@ def main():
             "best_score": float(best_score) if best_score is not None else None,
             "num_features": int(bst.num_features()),
             "attributes": bst.attributes(),
+            "dino_importance_plot": dino_importance_plot,
         }
+    xgb_feature_stats_payload = serialize_xgb_feature_stats(
+        tuned.get("xgb_feature_stats")
+    )
+    feature_layout_payload = tuned.get("feature_layout")
     model_info = {
         "backbone": {
             "name": cfg.model.backbone.name,
@@ -1773,6 +1446,12 @@ def main():
                 "count": cfg.search.knn.thresholds.count,
             },
         },
+        "hybrid_features": {
+            "enabled": cfg.model.hybrid_features.enabled,
+            "feature_spec_hash": hybrid_feature_spec_hash(),
+            "feature_layout": feature_layout_payload,
+            "xgb_feature_stats": xgb_feature_stats_payload,
+        },
     }
     export_best_settings(
         tuned["best_raw_config"],
@@ -1794,8 +1473,25 @@ def main():
             "feat_context_radius": context_radius,
             "neg_alpha": cfg.model.banks.neg_alpha,
             "pos_frac_thresh": cfg.model.banks.pos_frac_thresh,
+            "max_pos_bank": cfg.model.banks.max_pos_bank,
+            "max_neg_bank": cfg.model.banks.max_neg_bank,
             "roads_penalty": tuned.get("roads_penalty", 1.0),
             "roads_mask_path": cfg.io.paths.roads_mask_path,
+            "novel_proposals": {
+                "enabled": cfg.postprocess.novel_proposals.enabled,
+                "min_area_px": cfg.postprocess.novel_proposals.min_area_px,
+                "min_length_m": cfg.postprocess.novel_proposals.min_length_m,
+                "max_width_m": cfg.postprocess.novel_proposals.max_width_m,
+                "min_skeleton_ratio": cfg.postprocess.novel_proposals.min_skeleton_ratio,
+                "min_pca_ratio": cfg.postprocess.novel_proposals.min_pca_ratio,
+                "max_circularity": cfg.postprocess.novel_proposals.max_circularity,
+                "min_mean_score": cfg.postprocess.novel_proposals.min_mean_score,
+                "max_road_overlap": cfg.postprocess.novel_proposals.max_road_overlap,
+                "connectivity": cfg.postprocess.novel_proposals.connectivity,
+            },
+            "feature_spec_hash": hybrid_feature_spec_hash(),
+            "xgb_feature_stats": xgb_feature_stats_payload,
+            "feature_layout": feature_layout_payload,
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,

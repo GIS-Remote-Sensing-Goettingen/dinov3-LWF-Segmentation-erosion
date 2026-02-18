@@ -64,6 +64,8 @@ model:
     neg_alpha: 1.0
     feat_context_radius: 0
     bank_erosion_radius: 0
+    # Cap positives to keep XGB search tractable on CPU.
+    max_pos_bank: 120000
     max_neg_bank: 8000
 
   augmentation:
@@ -73,6 +75,43 @@ model:
     vertical_flip: true
     # Use right-angle rotations to avoid interpolation artifacts.
     rotations_deg: [90, 180, 270]
+
+  # Hybrid feature fusion: DINO embeddings + low-cost image patch descriptors.
+  # kNN and XGB intentionally use different normalization geometry.
+  hybrid_features:
+    enabled: true
+    # kNN branch: block-weighted concat + final L2 normalization.
+    knn_l2_normalize: true
+    # XGB branch: optional z-score standardization (fit on train folds only).
+    xgb_zscore: true
+    zscore_eps: 1.0e-6
+    blocks:
+      dino:
+        enabled: true
+        weight_knn: 1.0
+        weight_xgb: 1.0
+      rgb_stats:
+        enabled: true
+        weight_knn: 0.5
+        weight_xgb: 1.0
+      hsv_mean:
+        enabled: true
+        weight_knn: 0.4
+        weight_xgb: 0.8
+      grad_stats:
+        enabled: true
+        weight_knn: 0.6
+        weight_xgb: 1.0
+      grad_orient_hist:
+        enabled: true
+        bins: 8
+        weight_knn: 0.6
+        weight_xgb: 1.0
+      lbp_hist:
+        enabled: true
+        bins: 16
+        weight_knn: 0.4
+        weight_xgb: 0.8
 
 training:
   loo:
@@ -104,7 +143,8 @@ search:
     max_configs: 1
 
   xgb:
-    use_gpu: true
+    # Set true only when CUDA-enabled XGBoost is installed.
+    use_gpu: false
     val_fraction: 0.3
     num_boost_round: 1200
     early_stop: 80
@@ -188,8 +228,22 @@ postprocess:
   roads:
     penalty_values: [0.8,0.7, 0.6, 0.5]
 
+  # Propose new elongated LWF objects outside the incomplete label raster.
+  novel_proposals:
+    enabled: true
+    min_area_px: 150
+    min_length_m: 30.0
+    max_width_m: 12.0
+    min_skeleton_ratio: 10.0
+    min_pca_ratio: 3.0
+    max_circularity: 0.5
+    min_mean_score: 0.55
+    max_road_overlap: 0.5
+    connectivity: 2
+
 runtime:
-  feature_cache_mode: memory
+  # Disk cache strongly recommended for LOO + augmentation workloads.
+  feature_cache_mode: disk
   feature_batch_size: 4
   resume_run: false
   resume_run_dir: null
@@ -198,3 +252,10 @@ runtime:
   debug_timing: true
   debug_timing_verbose: false
   compact_timing_logs: true
+  plotting:
+    # Boundary band width for FP/FN diagnostics.
+    boundary_band_px: 12
+    # Overlay colors as RGB [0-255].
+    proposal_accept_rgb: [0, 255, 255]
+    proposal_reject_rgb: [255, 165, 0]
+    proposal_candidate_rgb: [255, 255, 0]

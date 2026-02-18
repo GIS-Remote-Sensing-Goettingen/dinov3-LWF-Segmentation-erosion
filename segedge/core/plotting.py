@@ -8,8 +8,301 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from scipy.ndimage import binary_dilation, binary_erosion
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_heatmap(values: np.ndarray) -> np.ndarray:
+    """Min-max normalize a heatmap to [0, 1].
+
+    Examples:
+        >>> import numpy as np
+        >>> _normalize_heatmap(np.array([[1.0, 3.0]])).shape
+        (1, 2)
+    """
+    vals = values.astype(np.float32)
+    vmin = float(np.min(vals))
+    vmax = float(np.max(vals))
+    if vmax - vmin <= 1e-8:
+        return np.zeros_like(vals)
+    return (vals - vmin) / (vmax - vmin)
+
+
+def _overlay_mask(
+    img_rgb: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int],
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """Blend a binary mask onto an RGB image.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.zeros((2, 2, 3), dtype=np.uint8)
+        >>> out = _overlay_mask(img, np.array([[1, 0], [0, 0]]), (255, 0, 0))
+        >>> out.shape
+        (2, 2, 3)
+    """
+    out = img_rgb.copy()
+    mask_bool = mask.astype(bool)
+    if not mask_bool.any():
+        return out
+    c = np.array(color, dtype=np.float32).reshape(1, 1, 3)
+    out_f = out.astype(np.float32)
+    out_f[mask_bool] = (1.0 - alpha) * out_f[mask_bool] + alpha * c
+    return np.clip(out_f, 0, 255).astype(img_rgb.dtype)
+
+
+def save_core_qualitative_plot(
+    img_b: np.ndarray,
+    gt_mask: np.ndarray,
+    pred_mask: np.ndarray,
+    plot_dir: str,
+    image_id_b: str,
+    gt_available: bool,
+    boundary_band_px: int = 10,
+) -> None:
+    """Save core 4-panel qualitative diagnostics for one tile.
+
+    Examples:
+        >>> callable(save_core_qualitative_plot)
+        True
+    """
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+    axs[0, 0].imshow(img_b)
+    axs[0, 0].set_title("RGB")
+    axs[0, 0].axis("off")
+
+    if gt_available:
+        gt_overlay = _overlay_mask(img_b, gt_mask, (0, 0, 255), alpha=0.45)
+        axs[0, 1].imshow(gt_overlay)
+        axs[0, 1].set_title("GT overlay")
+    else:
+        axs[0, 1].imshow(np.zeros(img_b.shape[:2], dtype=np.uint8), cmap="gray")
+        axs[0, 1].set_title("GT unavailable")
+    axs[0, 1].axis("off")
+
+    pred_overlay = _overlay_mask(img_b, pred_mask, (255, 0, 0), alpha=0.45)
+    axs[1, 0].imshow(pred_overlay)
+    axs[1, 0].set_title("Prediction overlay")
+    axs[1, 0].axis("off")
+
+    if gt_available:
+        gt_bool = gt_mask.astype(bool)
+        pred_bool = pred_mask.astype(bool)
+        boundary = np.logical_xor(gt_bool, binary_erosion(gt_bool))
+        if boundary_band_px > 0:
+            band = binary_dilation(boundary, iterations=int(boundary_band_px))
+        else:
+            band = boundary
+        fp = np.logical_and(np.logical_and(pred_bool, ~gt_bool), band)
+        fn = np.logical_and(np.logical_and(~pred_bool, gt_bool), band)
+        err_overlay = img_b.copy()
+        err_overlay = _overlay_mask(err_overlay, fp, (255, 0, 0), alpha=0.65)
+        err_overlay = _overlay_mask(err_overlay, fn, (0, 0, 255), alpha=0.65)
+        axs[1, 1].imshow(err_overlay)
+        axs[1, 1].set_title("Boundary-band errors (FP red / FN blue)")
+    else:
+        axs[1, 1].imshow(img_b)
+        axs[1, 1].set_title("Boundary-band errors unavailable")
+    axs[1, 1].axis("off")
+
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    out_path = os.path.join(plot_dir, f"{image_id_b}_qualitative_core.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot saved core qualitative to %s", out_path)
+
+
+def save_score_threshold_plot(
+    score_map: np.ndarray,
+    threshold: float,
+    sh_buffer_mask: np.ndarray,
+    plot_dir: str,
+    image_id_b: str,
+) -> None:
+    """Save score heatmap with threshold and in/out buffer histogram inset.
+
+    Examples:
+        >>> callable(save_score_threshold_plot)
+        True
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+    norm = _normalize_heatmap(score_map)
+    im = ax.imshow(norm, cmap="magma")
+    ax.set_title(f"Champion score map (thr={threshold:.3f})")
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.set_ylabel("normalized score", rotation=270, labelpad=12)
+
+    in_vals = score_map[sh_buffer_mask.astype(bool)].ravel()
+    out_vals = score_map[~sh_buffer_mask.astype(bool)].ravel()
+    ins = inset_axes(ax, width="38%", height="38%", loc="lower left", borderpad=1.2)
+    if in_vals.size > 0:
+        ins.hist(in_vals, bins=40, alpha=0.6, color="tab:blue", label="in-buffer")
+    if out_vals.size > 0:
+        ins.hist(out_vals, bins=40, alpha=0.6, color="tab:orange", label="out-buffer")
+    ins.axvline(float(threshold), color="white", linestyle="--", linewidth=1.2)
+    ins.set_facecolor((0.1, 0.1, 0.1, 0.8))
+    ins.tick_params(axis="both", labelsize=7, colors="white")
+    for spine in ins.spines.values():
+        spine.set_color("white")
+    if in_vals.size > 0 or out_vals.size > 0:
+        ins.legend(fontsize=6, loc="upper right")
+
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    out_path = os.path.join(plot_dir, f"{image_id_b}_score_threshold.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot saved score threshold to %s", out_path)
+
+
+def save_disagreement_entropy_plot(
+    disagreement_map: np.ndarray,
+    entropy_map: np.ndarray,
+    candidate_mask: np.ndarray,
+    plot_dir: str,
+    image_id_b: str,
+) -> None:
+    """Save disagreement and entropy diagnostics with proposal contour.
+
+    Examples:
+        >>> callable(save_disagreement_entropy_plot)
+        True
+    """
+    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+    panels = [
+        ("|score_xgb - score_knn|", disagreement_map, "inferno"),
+        ("Entropy uncertainty", entropy_map, "viridis"),
+    ]
+    for ax, (title, data, cmap) in zip(axs, panels, strict=True):
+        norm = _normalize_heatmap(data)
+        im = ax.imshow(norm, cmap=cmap)
+        if candidate_mask is not None and candidate_mask.any():
+            ax.contour(
+                candidate_mask.astype(np.uint8),
+                levels=[0.5],
+                colors="yellow",
+                linewidths=0.6,
+            )
+        ax.set_title(title)
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    out_path = os.path.join(plot_dir, f"{image_id_b}_disagreement_entropy.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot saved disagreement/entropy to %s", out_path)
+
+
+def save_proposal_overlay_plot(
+    img_b: np.ndarray,
+    prediction_mask: np.ndarray,
+    candidate_mask: np.ndarray,
+    accepted_mask: np.ndarray,
+    rejected_mask: np.ndarray,
+    plot_dir: str,
+    image_id_b: str,
+    accept_rgb: tuple[int, int, int],
+    reject_rgb: tuple[int, int, int],
+    candidate_rgb: tuple[int, int, int],
+) -> None:
+    """Save proposal overlay plot with accepted/rejected colors.
+
+    Examples:
+        >>> callable(save_proposal_overlay_plot)
+        True
+    """
+    overlay = _overlay_mask(img_b, prediction_mask, (255, 0, 0), alpha=0.3)
+    overlay = _overlay_mask(overlay, candidate_mask, candidate_rgb, alpha=0.25)
+    overlay = _overlay_mask(overlay, rejected_mask, reject_rgb, alpha=0.65)
+    overlay = _overlay_mask(overlay, accepted_mask, accept_rgb, alpha=0.65)
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.imshow(overlay)
+    ax.set_title("Proposals: accepted vs rejected")
+    ax.axis("off")
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    out_path = os.path.join(plot_dir, f"{image_id_b}_proposal_overlay.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot saved proposal overlay to %s", out_path)
+
+
+def save_dino_channel_importance_plot(
+    bst,
+    feature_layout: dict | None,
+    plot_dir: str,
+    top_k: int = 20,
+) -> str | None:
+    """Save top DINO channel importances from trained XGB model.
+
+    Examples:
+        >>> callable(save_dino_channel_importance_plot)
+        True
+    """
+    if bst is None:
+        return None
+    feature_names = (
+        list(feature_layout.get("feature_names", []))
+        if feature_layout is not None
+        else []
+    )
+    if not feature_names:
+        logger.warning("skip dino importance plot: missing feature names")
+        return None
+
+    gain = bst.get_score(importance_type="gain")
+    if not gain:
+        logger.warning("skip dino importance plot: empty gain map")
+        return None
+
+    dino_rows: list[tuple[str, float]] = []
+    for name, val in gain.items():
+        if not name.startswith("dino_"):
+            continue
+        try:
+            idx = int(name.split("_", 1)[1])
+        except (ValueError, IndexError):
+            idx = -1
+        dino_rows.append((f"dino_{idx}", float(val)))
+    if not dino_rows:
+        logger.warning("skip dino importance plot: no dino_* features in gain map")
+        return None
+
+    dino_rows.sort(key=lambda t: t[1], reverse=True)
+    top = dino_rows[: max(1, int(top_k))]
+    labels = [r[0] for r in top][::-1]
+    values = np.array([r[1] for r in top][::-1], dtype=np.float32)
+    cum = np.cumsum(values) / max(float(values.sum()), 1e-8)
+
+    fig, ax1 = plt.subplots(1, 1, figsize=(10, 7))
+    y = np.arange(len(labels))
+    ax1.barh(y, values, color="#2f7fb8", alpha=0.9)
+    ax1.set_yticks(y)
+    ax1.set_yticklabels(labels, fontsize=8)
+    ax1.set_xlabel("XGB gain")
+    ax1.set_title("Top DINO channels by XGB gain")
+
+    ax2 = ax1.twiny()
+    ax2.plot(cum, y, color="#f06a3a", linewidth=1.8)
+    ax2.set_xlim(0, 1.0)
+    ax2.set_xlabel("cumulative gain share")
+
+    plt.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    out_path = os.path.join(plot_dir, "xgb_dino_channel_importance.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot saved dino channel importance to %s", out_path)
+    return out_path
 
 
 def save_plot(
@@ -235,6 +528,7 @@ def save_unified_plot(
     score_maps: dict | None = None,
     skeleton=None,
     endpoints=None,
+    proposal_masks: dict | None = None,
 ):
     """Save a unified multi-panel plot for all phases.
 
@@ -263,14 +557,6 @@ def save_unified_plot(
             return base
         m = metrics[key]
         return f"{base} IoU={m['iou']:.3f}, F1={m['f1']:.3f}"
-
-    def _normalize_heatmap(values):
-        vals = values.astype(np.float32)
-        vmin = float(np.min(vals))
-        vmax = float(np.max(vals))
-        if vmax - vmin <= 1e-8:
-            return np.zeros_like(vals)
-        return (vals - vmin) / (vmax - vmin)
 
     panels = []
     panels.append(("RGB", img_b, None))
@@ -319,6 +605,38 @@ def save_unified_plot(
             0.5 * overlay_skel[skeleton.astype(bool)] + 0.5 * np.array([0, 255, 255])
         ).astype(overlay_skel.dtype)
         panels.append(("Skeleton + endpoints", overlay_skel, None))
+
+    if proposal_masks:
+        if "candidate" in proposal_masks:
+            panels.append(
+                (
+                    "Proposal candidates",
+                    _overlay_mask(
+                        img_b, proposal_masks["candidate"], (255, 255, 0), 0.5
+                    ),
+                    None,
+                )
+            )
+        if "accepted" in proposal_masks:
+            panels.append(
+                (
+                    "Proposals accepted",
+                    _overlay_mask(
+                        img_b, proposal_masks["accepted"], (0, 255, 255), 0.6
+                    ),
+                    None,
+                )
+            )
+        if "rejected" in proposal_masks:
+            panels.append(
+                (
+                    "Proposals rejected",
+                    _overlay_mask(
+                        img_b, proposal_masks["rejected"], (255, 165, 0), 0.6
+                    ),
+                    None,
+                )
+            )
 
     cols = 3
     rows = int(math.ceil(len(panels) / cols))
