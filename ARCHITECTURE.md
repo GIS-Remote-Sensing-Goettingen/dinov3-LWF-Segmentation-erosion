@@ -27,9 +27,12 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    (`model.hybrid_features`), with train-fold-only z-score stats for XGB.
 4. Run `python main.py` for the full pipeline.
 5. During execution, `rolling_best_setting.yml` is updated incrementally so best-known settings survive interruptions.
-6. In inference, champion masks can spawn `postprocess.novel_proposals` outside the
+6. Optional runtime time-budget cutover (`runtime.time_budget`) can stop training
+   phases after the configured wall-clock budget and switch directly to holdout
+   inference using best-so-far fold settings.
+7. In inference, champion masks can spawn `postprocess.novel_proposals` outside the
    incomplete source label raster; connected components are filtered by shape
    heuristics and exported as accepted/rejected proposal layers.
-7. Plot outputs include unified phase panels plus diagnostics (core qualitative
+8. Plot outputs include unified phase panels plus diagnostics (core qualitative
    boundary errors, score+threshold histogram inset, disagreement/entropy maps,
    proposal overlays, and XGB DINO-channel importance).

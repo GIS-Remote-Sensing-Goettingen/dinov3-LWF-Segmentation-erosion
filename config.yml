@@ -259,3 +259,11 @@ runtime:
     proposal_accept_rgb: [0, 255, 255]
     proposal_reject_rgb: [255, 165, 0]
     proposal_candidate_rgb: [255, 255, 0]
+  time_budget:
+    enabled: true
+    # Wall-clock budget in hours.
+    hours: 10.0
+    # immediate_inference | final_retrain_then_infer | stop
+    cutover_mode: immediate_inference
+    # total_wall_clock | training_only
+    scope: total_wall_clock

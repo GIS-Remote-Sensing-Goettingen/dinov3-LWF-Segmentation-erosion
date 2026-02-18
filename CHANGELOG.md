@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add time-budget cutover that uses best-so-far settings and transitions to inference after budget expiry.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`, `ARCHITECTURE.md`
+- reason: Long LOO runs need a deterministic wall-clock stop point with interruption-safe continuation to inference.
+- problems fixed: Adds configurable runtime budget (`runtime.time_budget`), resume-aware deadline handling, rolling checkpoint time-budget metadata, and immediate inference cutover using best completed fold artifacts when the budget is hit.
+
 - Description: Reduce LOO tuning runtime with stronger caching defaults and XGB scoring/training efficiency improvements.
 - file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/features.py`, `segedge/core/banks.py`, `segedge/core/xdboost.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`
 - reason: Address repeated DINO extraction, CPU fallback overhead, expensive roads rasterization, and oversized training samples.

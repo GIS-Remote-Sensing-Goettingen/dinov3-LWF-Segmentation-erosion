@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
 import fiona
 import numpy as np
@@ -38,6 +39,122 @@ logger = logging.getLogger(__name__)
 _CRF_PARALLEL_CONTEXTS: list[dict] | None = None
 _ROADS_MASK_CACHE: dict[tuple[str, int, tuple[int, int] | None], np.ndarray] = {}
 _ROADS_INDEX_CACHE: dict[tuple[str, str], tuple[STRtree | None, list]] = {}
+
+
+def compute_budget_deadline(start_ts: float, hours: float) -> float:
+    """Return the deadline timestamp for a wall-clock budget.
+
+    Examples:
+        >>> round(compute_budget_deadline(100.0, 1.0), 1)
+        3700.0
+    """
+    return float(start_ts) + float(hours) * 3600.0
+
+
+def is_budget_exceeded(deadline_ts: float | None, now_ts: float | None = None) -> bool:
+    """Return True when the current time has reached/exceeded the deadline.
+
+    Examples:
+        >>> is_budget_exceeded(10.0, now_ts=11.0)
+        True
+    """
+    if deadline_ts is None:
+        return False
+    now = time.time() if now_ts is None else float(now_ts)
+    return now >= float(deadline_ts)
+
+
+def remaining_budget_s(
+    deadline_ts: float | None,
+    now_ts: float | None = None,
+) -> float | None:
+    """Return remaining seconds before deadline (clamped at >=0).
+
+    Examples:
+        >>> remaining_budget_s(10.0, now_ts=7.0)
+        3.0
+    """
+    if deadline_ts is None:
+        return None
+    now = time.time() if now_ts is None else float(now_ts)
+    return max(0.0, float(deadline_ts) - now)
+
+
+def deadline_ts_to_utc_iso(deadline_ts: float | None) -> str | None:
+    """Convert epoch seconds to UTC ISO timestamp string.
+
+    Examples:
+        >>> deadline_ts_to_utc_iso(0.0).startswith("1970-01-01T00:00:00")
+        True
+    """
+    if deadline_ts is None:
+        return None
+    return datetime.fromtimestamp(float(deadline_ts), tz=timezone.utc).isoformat()
+
+
+def parse_utc_iso_to_epoch(value: str | None) -> float | None:
+    """Parse ISO UTC timestamp to epoch seconds.
+
+    Examples:
+        >>> parse_utc_iso_to_epoch(None) is None
+        True
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return float(dt.timestamp())
+
+
+def build_time_budget_status(
+    *,
+    enabled: bool,
+    hours: float,
+    scope: str,
+    cutover_mode: str,
+    deadline_ts: float | None,
+    clock_start_ts: float | None,
+    cutover_triggered: bool,
+    cutover_stage: str,
+) -> dict | None:
+    """Build a serializable snapshot of time-budget status.
+
+    Examples:
+        >>> s = build_time_budget_status(
+        ...     enabled=True,
+        ...     hours=1.0,
+        ...     scope="total_wall_clock",
+        ...     cutover_mode="immediate_inference",
+        ...     deadline_ts=100.0,
+        ...     clock_start_ts=0.0,
+        ...     cutover_triggered=False,
+        ...     cutover_stage="none",
+        ... )
+        >>> isinstance(s, dict)
+        True
+    """
+    if not enabled:
+        return None
+    now = time.time()
+    rem = remaining_budget_s(deadline_ts, now_ts=now)
+    elapsed = None
+    if clock_start_ts is not None:
+        elapsed = max(0.0, now - float(clock_start_ts))
+    return {
+        "enabled": bool(enabled),
+        "hours": float(hours),
+        "scope": str(scope),
+        "cutover_mode": str(cutover_mode),
+        "deadline_utc": deadline_ts_to_utc_iso(deadline_ts),
+        "remaining_s": float(rem) if rem is not None else None,
+        "elapsed_s": float(elapsed) if elapsed is not None else None,
+        "cutover_triggered": bool(cutover_triggered),
+        "cutover_stage": str(cutover_stage),
+    }
 
 
 def _roads_mask_disk_cache_path(
@@ -652,6 +769,7 @@ def write_rolling_best_config(
     holdout_done: int,
     holdout_total: int,
     best_fold: dict | None = None,
+    time_budget: dict | None = None,
 ) -> None:
     """Write rolling best config checkpoint for interruption-safe resume context.
 
@@ -664,6 +782,7 @@ def write_rolling_best_config(
         holdout_done (int): Processed holdout tiles.
         holdout_total (int): Total holdout tiles.
         best_fold (dict | None): Optional best-fold metadata.
+        time_budget (dict | None): Optional time-budget status payload.
 
     Examples:
         >>> callable(write_rolling_best_config)
@@ -693,6 +812,8 @@ def write_rolling_best_config(
             "val_tile": best_fold["val_tile"],
             "val_champion_shadow_iou": float(best_fold["val_champion_shadow_iou"]),
         }
+    if time_budget is not None:
+        payload["time_budget"] = time_budget
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         yaml.safe_dump(payload, fh, sort_keys=False, default_flow_style=False)

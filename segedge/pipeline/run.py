@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
 import numpy as np
 import torch
+import yaml
 from scipy.ndimage import median_filter
 
 from ..core.config_loader import cfg
@@ -64,8 +66,13 @@ from .runtime_utils import (
     _summarize_phase_metrics,
     _update_phase_metrics,
     _weighted_mean,
+    build_time_budget_status,
+    compute_budget_deadline,
     filter_novel_proposals,
+    is_budget_exceeded,
     load_b_tile_context,
+    parse_utc_iso_to_epoch,
+    remaining_budget_s,
     summarize_phase_metrics_mean_std,
     write_rolling_best_config,
 )
@@ -1027,6 +1034,7 @@ def main():
     processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
     processed_tiles: set[str] = set()
     rolling_best_settings_path = os.path.join(run_dir, "rolling_best_setting.yml")
+    wall_clock_start_ts = time.time()
     if resume_run and os.path.exists(processed_log_path):
         with open(processed_log_path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -1040,6 +1048,62 @@ def main():
                 if record.get("status") == "done" and record.get("tile_path"):
                     processed_tiles.add(record["tile_path"])
         logger.info("resume: loaded %s processed tiles", len(processed_tiles))
+
+    time_budget_cfg = cfg.runtime.time_budget
+    budget_enabled = bool(time_budget_cfg.enabled)
+    budget_hours = float(time_budget_cfg.hours)
+    budget_scope = str(time_budget_cfg.scope)
+    budget_cutover_mode = str(time_budget_cfg.cutover_mode)
+    budget_deadline_ts: float | None = None
+    budget_clock_start_ts: float | None = None
+    cutover_triggered = False
+    cutover_stage = "none"
+
+    if budget_enabled and resume_run and os.path.exists(rolling_best_settings_path):
+        try:
+            with open(rolling_best_settings_path, "r", encoding="utf-8") as fh:
+                rolling_payload = yaml.safe_load(fh) or {}
+            budget_payload = rolling_payload.get("time_budget", {})
+            parsed_deadline = parse_utc_iso_to_epoch(budget_payload.get("deadline_utc"))
+            if parsed_deadline is not None:
+                budget_deadline_ts = parsed_deadline
+                budget_clock_start_ts = budget_deadline_ts - budget_hours * 3600.0
+                logger.info(
+                    "time budget resume: deadline_utc=%s remaining=%.1f s",
+                    budget_payload.get("deadline_utc"),
+                    float(remaining_budget_s(budget_deadline_ts) or 0.0),
+                )
+        except Exception:
+            logger.warning("failed to read time budget from rolling_best_setting.yml")
+
+    if (
+        budget_enabled
+        and budget_scope == "total_wall_clock"
+        and budget_deadline_ts is None
+    ):
+        budget_clock_start_ts = wall_clock_start_ts
+        budget_deadline_ts = compute_budget_deadline(wall_clock_start_ts, budget_hours)
+    if budget_enabled:
+        logger.info(
+            "time budget: enabled=%s hours=%.2f scope=%s cutover_mode=%s deadline_utc=%s",
+            budget_enabled,
+            budget_hours,
+            budget_scope,
+            budget_cutover_mode,
+            (
+                build_time_budget_status(
+                    enabled=budget_enabled,
+                    hours=budget_hours,
+                    scope=budget_scope,
+                    cutover_mode=budget_cutover_mode,
+                    deadline_ts=budget_deadline_ts,
+                    clock_start_ts=budget_clock_start_ts,
+                    cutover_triggered=cutover_triggered,
+                    cutover_stage=cutover_stage,
+                )
+                or {}
+            ).get("deadline_utc"),
+        )
 
     union_backup_every = int(cfg.runtime.union_backup_every or 0)
     union_root = os.path.join(shape_dir, "unions")
@@ -1085,6 +1149,18 @@ def main():
         )
         if union_backup_every > 0 and step % union_backup_every == 0:
             backup_union_shapefile(union_path, backup_dir, step)
+
+    def _current_time_budget_status() -> dict | None:
+        return build_time_budget_status(
+            enabled=budget_enabled,
+            hours=budget_hours,
+            scope=budget_scope,
+            cutover_mode=budget_cutover_mode,
+            deadline_ts=budget_deadline_ts,
+            clock_start_ts=budget_clock_start_ts,
+            cutover_triggered=cutover_triggered,
+            cutover_stage=cutover_stage,
+        )
 
     # ------------------------------------------------------------
     # Init DINOv3 model & processor
@@ -1166,14 +1242,35 @@ def main():
     val_buffer_m = None
     val_pixel_size_m = None
     loo_fold_records = []
+    best_fold_runtime_artifacts: dict | None = None
+    best_fold_runtime_iou = -1.0
 
     # ------------------------------------------------------------
     # LOO tuning/search: train on N-1 GT tiles, validate on the left-out tile
     # ------------------------------------------------------------
     if not cfg.training.loo.enabled:
         raise ValueError("training.loo.enabled must be true for this pipeline")
+    if (
+        budget_enabled
+        and budget_scope == "training_only"
+        and budget_deadline_ts is None
+    ):
+        budget_clock_start_ts = time.time()
+        budget_deadline_ts = compute_budget_deadline(
+            budget_clock_start_ts, budget_hours
+        )
     _log_phase("START", "loo_validation_tuning")
     for fold_idx, val_path in enumerate(val_tiles, start=1):
+        if budget_enabled and is_budget_exceeded(budget_deadline_ts):
+            cutover_triggered = True
+            cutover_stage = "loo_validation_tuning"
+            logger.warning(
+                "time budget exceeded before LOO fold %s/%s; cutover_mode=%s",
+                fold_idx,
+                len(val_tiles),
+                budget_cutover_mode,
+            )
+            break
         train_tiles = [p for p in gt_tiles if p != val_path]
         if not train_tiles:
             logger.warning(
@@ -1200,8 +1297,8 @@ def main():
             neg_bank_fold,
             x_fold,
             y_fold,
-            _,
-            _,
+            image_id_a_fold,
+            aug_modes_fold,
             xgb_feature_stats_fold,
             feature_layout_fold,
         ) = build_training_artifacts_for_tiles(
@@ -1275,6 +1372,17 @@ def main():
                 "tuned": tuned_fold,
             }
         )
+        fold_iou = float(fold_result["metrics"]["champion_shadow"]["iou"])
+        if fold_iou > best_fold_runtime_iou:
+            best_fold_runtime_iou = fold_iou
+            best_fold_runtime_artifacts = {
+                "pos_bank": pos_bank_fold,
+                "neg_bank": neg_bank_fold,
+                "image_id_a_list": image_id_a_fold,
+                "aug_modes": aug_modes_fold,
+                "xgb_feature_stats": xgb_feature_stats_fold,
+                "feature_layout": feature_layout_fold,
+            }
         current_best_fold = max(
             loo_fold_records,
             key=lambda r: float(r["val_champion_shadow_iou"]),
@@ -1288,9 +1396,14 @@ def main():
             holdout_done=len(processed_tiles),
             holdout_total=len(holdout_tiles),
             best_fold=current_best_fold,
+            time_budget=_current_time_budget_status(),
         )
     _log_phase("END", "loo_validation_tuning")
     if not loo_fold_records:
+        if cutover_triggered:
+            raise ValueError(
+                "time budget exhausted before any LOO fold completed; cannot continue to inference"
+            )
         raise ValueError("LOO tuning produced no fold records")
 
     best_fold = max(
@@ -1308,67 +1421,112 @@ def main():
     # ------------------------------------------------------------
     # Final training on all GT tiles with selected LOO hyperparameters
     # ------------------------------------------------------------
-    _log_phase("START", "final_all_gt_training")
-    (
-        pos_bank,
-        neg_bank,
-        X,
-        y,
-        image_id_a_list,
-        aug_modes,
-        xgb_feature_stats,
-        feature_layout,
-    ) = build_training_artifacts_for_tiles(
-        gt_tiles,
-        source_label_raster,
-        model,
-        processor,
-        device,
-        ps,
-        tile_size,
-        stride,
-        feature_cache_mode,
-        feature_dir,
-        context_radius,
-    )
-    best_xgb_params = selected_tuned["best_xgb_config"].get("params")
-    feature_names = (
-        list(feature_layout.get("feature_names", []))
-        if feature_layout is not None
-        else None
-    )
-    if feature_names is not None and len(feature_names) != X.shape[1]:
+    pos_bank: np.ndarray | None = None
+    neg_bank: np.ndarray | None = None
+    image_id_a_list: list[str] = []
+    aug_modes: list[str] = []
+    tuned = dict(selected_tuned)
+    halt_before_inference = False
+    final_stage_name = "final_model_ready"
+
+    if budget_enabled and is_budget_exceeded(budget_deadline_ts):
         logger.warning(
-            "final training feature layout mismatch: names=%s X=%s; disabling names",
-            len(feature_names),
-            X.shape[1],
+            "time budget exceeded before final_all_gt_training; cutover_mode=%s",
+            budget_cutover_mode,
         )
-        feature_names = None
-    final_bst = train_xgb_classifier(
-        X,
-        y,
-        use_gpu=cfg.search.xgb.use_gpu,
-        num_boost_round=cfg.search.xgb.num_boost_round,
-        verbose_eval=cfg.search.xgb.verbose_eval,
-        param_overrides=best_xgb_params,
-        feature_names=feature_names,
-    )
-    tuned = {
-        **selected_tuned,
-        "bst": final_bst,
-        "xgb_feature_stats": xgb_feature_stats,
-        "feature_layout": feature_layout,
-    }
-    _log_phase("END", "final_all_gt_training")
+        if budget_cutover_mode in {"immediate_inference", "stop"}:
+            cutover_triggered = True
+            cutover_stage = "final_all_gt_training"
+            if best_fold_runtime_artifacts is None:
+                raise ValueError(
+                    "time-budget cutover requested, but no fold artifacts are available"
+                )
+            pos_bank = best_fold_runtime_artifacts["pos_bank"]
+            neg_bank = best_fold_runtime_artifacts["neg_bank"]
+            image_id_a_list = list(best_fold_runtime_artifacts["image_id_a_list"])
+            aug_modes = list(best_fold_runtime_artifacts["aug_modes"])
+            if tuned.get("xgb_feature_stats") is None:
+                tuned["xgb_feature_stats"] = best_fold_runtime_artifacts[
+                    "xgb_feature_stats"
+                ]
+            if tuned.get("feature_layout") is None:
+                tuned["feature_layout"] = best_fold_runtime_artifacts["feature_layout"]
+            if budget_cutover_mode == "immediate_inference":
+                final_stage_name = "final_model_ready_cutover"
+                logger.warning(
+                    "time-budget cutover: skipping final all-GT retraining and "
+                    "starting inference from best completed fold"
+                )
+            else:
+                final_stage_name = "time_budget_stop"
+                halt_before_inference = True
+                logger.warning(
+                    "time-budget cutover: mode=stop, will write outputs and exit"
+                )
+
+    if pos_bank is None:
+        _log_phase("START", "final_all_gt_training")
+        (
+            pos_bank,
+            neg_bank,
+            X,
+            y,
+            image_id_a_list,
+            aug_modes,
+            xgb_feature_stats,
+            feature_layout,
+        ) = build_training_artifacts_for_tiles(
+            gt_tiles,
+            source_label_raster,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_cache_mode,
+            feature_dir,
+            context_radius,
+        )
+        best_xgb_params = selected_tuned["best_xgb_config"].get("params")
+        feature_names = (
+            list(feature_layout.get("feature_names", []))
+            if feature_layout is not None
+            else None
+        )
+        if feature_names is not None and len(feature_names) != X.shape[1]:
+            logger.warning(
+                "final training feature layout mismatch: names=%s X=%s; disabling names",
+                len(feature_names),
+                X.shape[1],
+            )
+            feature_names = None
+        final_bst = train_xgb_classifier(
+            X,
+            y,
+            use_gpu=cfg.search.xgb.use_gpu,
+            num_boost_round=cfg.search.xgb.num_boost_round,
+            verbose_eval=cfg.search.xgb.verbose_eval,
+            param_overrides=best_xgb_params,
+            feature_names=feature_names,
+        )
+        tuned = {
+            **selected_tuned,
+            "bst": final_bst,
+            "xgb_feature_stats": xgb_feature_stats,
+            "feature_layout": feature_layout,
+        }
+        _log_phase("END", "final_all_gt_training")
     write_rolling_best_config(
         rolling_best_settings_path,
-        stage="final_model_ready",
+        stage=final_stage_name,
         tuned=tuned,
         fold_done=len(loo_fold_records),
         fold_total=len(val_tiles),
         holdout_done=len(processed_tiles),
         holdout_total=len(holdout_tiles),
         best_fold=best_fold,
+        time_budget=_current_time_budget_status(),
     )
 
     loo_fold_export = []
@@ -1452,6 +1610,14 @@ def main():
             "feature_layout": feature_layout_payload,
             "xgb_feature_stats": xgb_feature_stats_payload,
         },
+        "time_budget": {
+            "enabled": budget_enabled,
+            "hours": budget_hours,
+            "scope": budget_scope,
+            "cutover_mode": budget_cutover_mode,
+            "cutover_triggered": cutover_triggered,
+            "cutover_stage": cutover_stage,
+        },
     }
     export_best_settings(
         tuned["best_raw_config"],
@@ -1492,6 +1658,9 @@ def main():
             "feature_spec_hash": hybrid_feature_spec_hash(),
             "xgb_feature_stats": xgb_feature_stats_payload,
             "feature_layout": feature_layout_payload,
+            "time_budget": _current_time_budget_status(),
+            "cutover_triggered": cutover_triggered,
+            "cutover_stage": cutover_stage,
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,
@@ -1508,6 +1677,12 @@ def main():
         best_settings_path=inference_best_settings_path,
     )
     logger.info("wrote inference best settings: %s", inference_best_settings_path)
+
+    if halt_before_inference:
+        _summarize_phase_metrics(val_phase_metrics, "loo_validation")
+        _summarize_phase_metrics(holdout_phase_metrics, "holdout")
+        time_end("main (total)", t0_main)
+        return
 
     _log_phase("START", "holdout_inference")
     holdout_tiles_processed = len(processed_tiles)
@@ -1564,6 +1739,7 @@ def main():
             holdout_done=holdout_tiles_processed,
             holdout_total=len(holdout_tiles),
             best_fold=best_fold,
+            time_budget=_current_time_budget_status(),
         )
     _log_phase("END", "holdout_inference")
 

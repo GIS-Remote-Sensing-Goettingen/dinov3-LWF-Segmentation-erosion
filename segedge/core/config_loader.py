@@ -277,6 +277,16 @@ class PlottingConfig:
 
 
 @dataclass
+class TimeBudgetConfig:
+    """Time-budget cutover settings."""
+
+    enabled: bool
+    hours: float
+    cutover_mode: str
+    scope: str
+
+
+@dataclass
 class RuntimeConfig:
     """Runtime and diagnostics settings."""
 
@@ -290,6 +300,7 @@ class RuntimeConfig:
     debug_timing_verbose: bool
     compact_timing_logs: bool
     plotting: PlottingConfig
+    time_budget: TimeBudgetConfig
 
 
 @dataclass
@@ -327,6 +338,15 @@ def _as_list_int(value: Any, field_name: str) -> list[int]:
     if not isinstance(value, list):
         raise ValueError(f"'{field_name}' must be a list")
     return [int(v) for v in value]
+
+
+def _as_enum(value: Any, field_name: str, allowed: set[str], default: str) -> str:
+    val = str(value) if value is not None else str(default)
+    if val not in allowed:
+        raise ValueError(
+            f"'{field_name}' must be one of {sorted(allowed)}, got '{val}'"
+        )
+    return val
 
 
 def _load_thresholds(data: dict[str, Any]) -> ThresholdRangeConfig:
@@ -411,6 +431,9 @@ def load_config(path: str | Path | None = None) -> Config:
 
     runtime = _require_mapping(root["runtime"], "runtime")
     runtime_plotting = _require_mapping(runtime.get("plotting", {}), "runtime.plotting")
+    runtime_time_budget = _require_mapping(
+        runtime.get("time_budget", {}), "runtime.time_budget"
+    )
 
     io_paths_cfg = IOPathsConfig(
         source_tile=str(io_paths["source_tile"]),
@@ -661,7 +684,32 @@ def load_config(path: str | Path | None = None) -> Config:
                 "runtime.plotting.proposal_candidate_rgb",
             ),
         ),
+        time_budget=TimeBudgetConfig(
+            enabled=bool(runtime_time_budget.get("enabled", False)),
+            hours=float(runtime_time_budget.get("hours", 10.0)),
+            cutover_mode=_as_enum(
+                runtime_time_budget.get("cutover_mode", "immediate_inference"),
+                "runtime.time_budget.cutover_mode",
+                {
+                    "immediate_inference",
+                    "final_retrain_then_infer",
+                    "stop",
+                },
+                "immediate_inference",
+            ),
+            scope=_as_enum(
+                runtime_time_budget.get("scope", "total_wall_clock"),
+                "runtime.time_budget.scope",
+                {
+                    "total_wall_clock",
+                    "training_only",
+                },
+                "total_wall_clock",
+            ),
+        ),
     )
+    if runtime_cfg.time_budget.hours <= 0:
+        raise ValueError("'runtime.time_budget.hours' must be > 0")
 
     return Config(
         io=IOConfig(paths=io_paths_cfg, auto_split=io_auto_split_cfg),
