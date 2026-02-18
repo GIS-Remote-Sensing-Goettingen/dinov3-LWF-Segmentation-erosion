@@ -20,10 +20,8 @@ from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
 from skimage.transform import resize
 
-import config as cfg
-
 from ..core.banks import build_banks_single_scale
-from ..core.continuity import bridge_skeleton_gaps, skeletonize_with_endpoints
+from ..core.config_loader import cfg
 from ..core.crf_utils import refine_with_densecrf
 from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
@@ -56,8 +54,8 @@ from ..core.xdboost import (
 from .common import init_model, resolve_tile_splits_from_gt
 
 # Config-driven flags
-USE_FP16_KNN = getattr(cfg, "USE_FP16_KNN", True)
-CRF_MAX_CONFIGS = getattr(cfg, "CRF_MAX_CONFIGS", 64)
+USE_FP16_KNN = cfg.search.knn.use_fp16_knn
+CRF_MAX_CONFIGS = cfg.search.crf.max_configs
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +77,7 @@ def _get_roads_index(tile_crs) -> tuple[STRtree | None, list]:
         >>> callable(_get_roads_index)
         True
     """
-    roads_path = getattr(cfg, "ROADS_MASK_PATH", None)
+    roads_path = cfg.io.paths.roads_mask_path
     if not roads_path or not os.path.exists(roads_path):
         return None, []
     crs_key = CRS.from_user_input(tile_crs).to_string() if tile_crs else "<none>"
@@ -288,9 +286,7 @@ def _update_phase_metrics(acc: dict[str, list[dict]], metrics_map: dict) -> None
         acc.setdefault(key, []).append(metrics)
 
 
-def _summarize_phase_metrics(
-    acc: dict[str, list[dict]], label: str, bridge_enabled: bool
-) -> None:
+def _summarize_phase_metrics(acc: dict[str, list[dict]], label: str) -> None:
     if not acc:
         logger.info("summary %s: no metrics", label)
         return
@@ -305,8 +301,6 @@ def _summarize_phase_metrics(
         "champion_raw",
         "champion_crf",
     ]
-    if bridge_enabled:
-        phase_order.append("champion_bridge")
     phase_order.append("champion_shadow")
 
     logger.info("summary %s: phase metrics", label)
@@ -329,10 +323,7 @@ def _summarize_phase_metrics(
             med_vals["f1"],
         )
 
-    champ_chain = ["champion_raw", "champion_crf"]
-    if bridge_enabled:
-        champ_chain.append("champion_bridge")
-    champ_chain.append("champion_shadow")
+    champ_chain = ["champion_raw", "champion_crf", "champion_shadow"]
     for prev, curr in zip(champ_chain, champ_chain[1:], strict=True):
         if prev not in acc or curr not in acc:
             continue
@@ -399,6 +390,61 @@ def _apply_shadow_filter(
     return np.logical_and(base_mask, shadow_pass | (score_full >= protect_score))
 
 
+def _source_augmentation_modes() -> list[str]:
+    """Return enabled source augmentation modes from config."""
+    aug = cfg.model.augmentation
+    if not aug.enabled:
+        return ["orig"]
+    modes: list[str] = []
+    if aug.include_identity:
+        modes.append("orig")
+    if aug.horizontal_flip:
+        modes.append("flip_lr")
+    if aug.vertical_flip:
+        modes.append("flip_ud")
+    for deg in aug.rotations_deg:
+        d = int(deg) % 360
+        if d == 0:
+            if not aug.include_identity:
+                modes.append("orig")
+            continue
+        if d not in {90, 180, 270}:
+            logger.warning("skipping unsupported augmentation rotation: %s", deg)
+            continue
+        modes.append(f"rot{d}")
+    if not modes:
+        modes = ["orig"]
+    deduped = []
+    seen: set[str] = set()
+    for mode in modes:
+        if mode in seen:
+            continue
+        deduped.append(mode)
+        seen.add(mode)
+    return deduped
+
+
+def _apply_source_augmentation(
+    img: np.ndarray,
+    labels: np.ndarray,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a geometric augmentation to source image and labels."""
+    if mode == "orig":
+        return img, labels
+    if mode == "flip_lr":
+        return np.flip(img, axis=1).copy(), np.flip(labels, axis=1).copy()
+    if mode == "flip_ud":
+        return np.flip(img, axis=0).copy(), np.flip(labels, axis=0).copy()
+    if mode.startswith("rot"):
+        deg = int(mode.replace("rot", ""))
+        if deg % 90 != 0:
+            raise ValueError(f"rotation must be multiple of 90, got {deg}")
+        k = (deg // 90) % 4
+        return np.rot90(img, k).copy(), np.rot90(labels, k).copy()
+    raise ValueError(f"unknown augmentation mode: {mode}")
+
+
 def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     """Load B tile, SH raster, GT (optional), and buffer mask.
 
@@ -415,10 +461,10 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     """
     logger.info("loading tile: %s", img_path)
     t0_data = time_start()
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    ds = int(cfg.model.backbone.resample_factor or 1)
     img_b = load_dop20_image(img_path, downsample_factor=ds)
     labels_sh = reproject_labels_to_image(
-        img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds
+        img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
     )
     gt_mask = (
         rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds)
@@ -461,7 +507,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     with __import__("rasterio").open(img_path) as src:
         pixel_size_m = abs(src.transform.a)
     pixel_size_m = pixel_size_m * ds
-    buffer_m = cfg.BUFFER_M
+    buffer_m = cfg.model.priors.buffer_m
     buffer_pixels = int(round(buffer_m / pixel_size_m))
     logger.info(
         "tile=%s pixel_size=%.3f m, buffer_m=%s, buffer_pixels=%s",
@@ -472,7 +518,7 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     )
 
     sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
-    if gt_mask is not None and getattr(cfg, "CLIP_GT_TO_BUFFER", False):
+    if gt_mask is not None and cfg.model.priors.clip_gt_to_buffer:
         gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
         logger.info(
             "CLIP_GT_TO_BUFFER enabled: GT positives -> %s (was %s)",
@@ -537,7 +583,7 @@ def tune_on_validation_multi(
         raise ValueError("VAL_TILES is empty.")
 
     val_contexts = []
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    ds = int(cfg.model.backbone.resample_factor or 1)
     for val_path in val_paths:
         logger.info("tune: preparing validation tile %s", val_path)
         (
@@ -585,12 +631,12 @@ def tune_on_validation_multi(
         )
 
     # XGB training (shared across road penalties)
-    use_gpu_xgb = getattr(cfg, "XGB_USE_GPU", True)
-    param_grid = getattr(cfg, "XGB_PARAM_GRID", None)
-    num_boost_round = getattr(cfg, "XGB_NUM_BOOST_ROUND", 300)
-    early_stop = getattr(cfg, "XGB_EARLY_STOP", 40)
-    verbose_eval = getattr(cfg, "XGB_VERBOSE_EVAL", 50)
-    val_fraction = getattr(cfg, "XGB_VAL_FRACTION", 0.2)
+    use_gpu_xgb = cfg.search.xgb.use_gpu
+    param_grid = cfg.search.xgb.param_grid
+    num_boost_round = cfg.search.xgb.num_boost_round
+    early_stop = cfg.search.xgb.early_stop
+    verbose_eval = cfg.search.xgb.verbose_eval
+    val_fraction = cfg.search.xgb.val_fraction
     if param_grid is None:
         param_grid = [None]
 
@@ -631,7 +677,7 @@ def tune_on_validation_multi(
             )
         xgb_candidates.append({"bst": bst, "params": params_used})
 
-    roads_penalties = [float(p) for p in getattr(cfg, "ROADS_PENALTY_VALUES", [1.0])]
+    roads_penalties = [float(p) for p in cfg.postprocess.roads.penalty_values]
     best_bundle = None
     best_champion_iou = None
 
@@ -640,7 +686,7 @@ def tune_on_validation_multi(
 
         # kNN tuning (weighted-mean IoU across val tiles)
         best_raw_config = None
-        for k in cfg.K_VALUES:
+        for k in cfg.search.knn.k_values:
             stats_by_thr = {
                 thr: {
                     "iou": 0.0,
@@ -650,7 +696,7 @@ def tune_on_validation_multi(
                     "w": 0.0,
                     "n": 0,
                 }
-                for thr in cfg.THRESHOLDS
+                for thr in cfg.search.knn.thresholds.values
             }
             for ctx in val_contexts:
                 logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
@@ -668,7 +714,7 @@ def tune_on_validation_multi(
                     aggregate_layers=None,
                     feature_dir=feature_dir,
                     image_id=ctx["image_id"],
-                    neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                    neg_alpha=cfg.model.banks.neg_alpha,
                     prefetched_tiles=ctx["prefetched_b"],
                     use_fp16_matmul=USE_FP16_KNN,
                     context_radius=context_radius,
@@ -679,7 +725,7 @@ def tune_on_validation_multi(
                 try:
                     metrics_list = compute_metrics_batch_gpu(
                         score_full,
-                        cfg.THRESHOLDS,
+                        cfg.search.knn.thresholds.values,
                         ctx["sh_buffer_mask"],
                         ctx["gt_mask_eval"],
                         device=device,
@@ -688,7 +734,7 @@ def tune_on_validation_multi(
                     torch.cuda.empty_cache()
                     metrics_list = compute_metrics_batch_cpu(
                         score_full,
-                        cfg.THRESHOLDS,
+                        cfg.search.knn.thresholds.values,
                         ctx["sh_buffer_mask"],
                         ctx["gt_mask_eval"],
                     )
@@ -741,7 +787,7 @@ def tune_on_validation_multi(
                     "w": 0.0,
                     "n": 0,
                 }
-                for thr in cfg.THRESHOLDS
+                for thr in cfg.search.knn.thresholds.values
             }
             for ctx in val_contexts:
                 logger.info("tune: XGB scoring on %s", ctx["path"])
@@ -762,7 +808,7 @@ def tune_on_validation_multi(
                 try:
                     metrics_list = compute_metrics_batch_gpu(
                         score_full,
-                        cfg.THRESHOLDS,
+                        cfg.search.knn.thresholds.values,
                         ctx["sh_buffer_mask"],
                         ctx["gt_mask_eval"],
                         device=device,
@@ -771,7 +817,7 @@ def tune_on_validation_multi(
                     torch.cuda.empty_cache()
                     metrics_list = compute_metrics_batch_cpu(
                         score_full,
-                        cfg.THRESHOLDS,
+                        cfg.search.knn.thresholds.values,
                         ctx["sh_buffer_mask"],
                         ctx["gt_mask_eval"],
                     )
@@ -860,7 +906,7 @@ def tune_on_validation_multi(
                 aggregate_layers=None,
                 feature_dir=feature_dir,
                 image_id=ctx["image_id"],
-                neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+                neg_alpha=cfg.model.banks.neg_alpha,
                 prefetched_tiles=ctx["prefetched_b"],
                 use_fp16_matmul=USE_FP16_KNN,
                 context_radius=context_radius,
@@ -886,17 +932,17 @@ def tune_on_validation_multi(
     # CRF tuning across val tiles
     crf_candidates = [
         (psf, pw, pxy, bw, bxy, brgb)
-        for psf in cfg.PROB_SOFTNESS_VALUES
-        for pw in cfg.POS_W_VALUES
-        for pxy in cfg.POS_XY_STD_VALUES
-        for bw in cfg.BILATERAL_W_VALUES
-        for bxy in cfg.BILATERAL_XY_STD_VALUES
-        for brgb in cfg.BILATERAL_RGB_STD_VALUES
+        for psf in cfg.search.crf.prob_softness_values
+        for pw in cfg.search.crf.pos_w_values
+        for pxy in cfg.search.crf.pos_xy_std_values
+        for bw in cfg.search.crf.bilateral_w_values
+        for bxy in cfg.search.crf.bilateral_xy_std_values
+        for brgb in cfg.search.crf.bilateral_rgb_std_values
     ]
     best_crf_cfg = None
     best_crf_iou = None
     crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
-    num_workers = int(getattr(cfg, "CRF_NUM_WORKERS", 1) or 1)
+    num_workers = int(cfg.search.crf.num_workers or 1)
     logger.info(
         "tune: CRF grid search configs=%s, workers=%s",
         len(crf_candidates),
@@ -935,11 +981,11 @@ def tune_on_validation_multi(
     # Shadow tuning across val tiles
     best_shadow_cfg = None
     best_shadow_iou = None
-    protect_scores = getattr(cfg, "SHADOW_PROTECT_SCORES", [0.5])
-    for weights in cfg.SHADOW_WEIGHT_SETS:
+    protect_scores = cfg.postprocess.shadow.protect_scores
+    for weights in cfg.postprocess.shadow.weight_sets:
         iou_by_key = {
             (thr, protect_score): {"sum": 0.0, "w": 0.0}
-            for thr in cfg.SHADOW_THRESHOLDS
+            for thr in cfg.postprocess.shadow.thresholds
             for protect_score in protect_scores
         }
         for ctx in val_contexts:
@@ -969,7 +1015,9 @@ def tune_on_validation_multi(
             gt_vals = flat_gt[flat_base]
             if vals.size == 0:
                 continue
-            thr_arr = np.array(cfg.SHADOW_THRESHOLDS, dtype=np.float32).reshape(-1, 1)
+            thr_arr = np.array(
+                cfg.postprocess.shadow.thresholds, dtype=np.float32
+            ).reshape(-1, 1)
             mask_thr = vals[None, :] >= thr_arr
             gt_bool = gt_vals.astype(bool)
             score_vals = score_full.reshape(-1)[flat_base]
@@ -993,7 +1041,7 @@ def tune_on_validation_multi(
                     .astype(np.float64)
                 )
                 iou = tp / (tp + fp + fn + 1e-8)
-                for i, thr in enumerate(cfg.SHADOW_THRESHOLDS):
+                for i, thr in enumerate(cfg.postprocess.shadow.thresholds):
                     stats = iou_by_key[(thr, protect_score)]
                     stats["sum"] += float(iou[i]) * weight
                     stats["w"] += weight
@@ -1083,7 +1131,7 @@ def infer_on_holdout(
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
     gt_weight = float(gt_mask_eval.sum())
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    ds = int(cfg.model.backbone.resample_factor or 1)
     roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
     roads_penalty = float(tuned.get("roads_penalty", 1.0))
 
@@ -1117,7 +1165,7 @@ def infer_on_holdout(
         aggregate_layers=None,
         feature_dir=feature_dir,
         image_id=image_id_b,
-        neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+        neg_alpha=cfg.model.banks.neg_alpha,
         prefetched_tiles=prefetched_b,
         use_fp16_matmul=USE_FP16_KNN,
         context_radius=context_radius,
@@ -1153,7 +1201,7 @@ def infer_on_holdout(
         champion_score = score_xgb
 
     crf_cfg = tuned["best_crf_config"]
-    mask_crf_knn, prob_crf_knn = refine_with_densecrf(
+    mask_crf_knn = refine_with_densecrf(
         img_b,
         score_knn,
         knn_thr,
@@ -1165,9 +1213,8 @@ def infer_on_holdout(
         bilateral_w=crf_cfg["bilateral_w"],
         bilateral_xy_std=crf_cfg["bilateral_xy_std"],
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
-        return_prob=True,
     )
-    mask_crf_xgb, prob_crf_xgb = refine_with_densecrf(
+    mask_crf_xgb = refine_with_densecrf(
         img_b,
         score_xgb,
         xgb_thr,
@@ -1179,33 +1226,17 @@ def infer_on_holdout(
         bilateral_w=crf_cfg["bilateral_w"],
         bilateral_xy_std=crf_cfg["bilateral_xy_std"],
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
-        return_prob=True,
     )
     if champion_source == "raw":
         best_crf_mask = mask_crf_knn
     else:
         best_crf_mask = mask_crf_xgb
 
-    bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
-    bridge_mask = best_crf_mask
-    if bridge_enabled:
-        prob_crf = prob_crf_knn if champion_source == "raw" else prob_crf_xgb
-        bridge_mask = bridge_skeleton_gaps(
-            best_crf_mask,
-            prob_crf,
-            max_gap_px=int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            max_pairs_per_endpoint=int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            max_avg_cost=float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            bridge_width_px=int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            min_component_area_px=int(getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)),
-            spur_prune_iters=int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
-        )
-
     shadow_cfg = tuned["shadow_cfg"]
     protect_score = shadow_cfg.get("protect_score")
     shadow_mask = _apply_shadow_filter(
         img_b,
-        bridge_mask,
+        best_crf_mask,
         shadow_cfg["weights"],
         shadow_cfg["threshold"],
         champion_score,
@@ -1234,10 +1265,7 @@ def infer_on_holdout(
     champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
     metrics_champion_raw = compute_metrics(champ_raw_mask, gt_mask_eval)
     metrics_champion_crf = compute_metrics(best_crf_mask, gt_mask_eval)
-    metrics_champion_bridge = compute_metrics(bridge_mask, gt_mask_eval)
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
-
-    skel, endpoints = skeletonize_with_endpoints(bridge_mask)
     metrics_map = {
         "knn_raw": metrics_knn,
         "knn_crf": metrics_knn_crf,
@@ -1247,7 +1275,6 @@ def infer_on_holdout(
         "xgb_shadow": metrics_xgb_shadow,
         "champion_raw": metrics_champion_raw,
         "champion_crf": metrics_champion_crf,
-        "champion_bridge": metrics_champion_bridge,
         "champion_shadow": shadow_metrics,
     }
     metrics_map = {
@@ -1262,7 +1289,6 @@ def infer_on_holdout(
         "xgb_shadow": shadow_mask_xgb,
         "champion_raw": champ_raw_mask,
         "champion_crf": best_crf_mask,
-        "champion_bridge": bridge_mask,
         "champion_shadow": shadow_mask,
     }
     save_unified_plot(
@@ -1271,15 +1297,12 @@ def infer_on_holdout(
         labels_sh=labels_sh,
         masks=masks_map,
         metrics=metrics_map,
-        plot_dir=cfg.PLOT_DIR,
+        plot_dir=cfg.io.paths.plot_dir,
         image_id_b=image_id_b,
         show_metrics=plot_with_metrics and gt_available,
         gt_available=gt_available,
         similarity_map=score_knn_raw,
         score_maps={"knn": score_knn, "xgb": score_xgb},
-        skeleton=skel,
-        endpoints=endpoints,
-        bridge_enabled=bridge_enabled,
     )
 
     champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
@@ -1299,7 +1322,6 @@ def infer_on_holdout(
             "xgb_shadow": shadow_mask_xgb,
             "champion_raw": champ_raw_mask,
             "champion_crf": best_crf_mask,
-            "champion_bridge": bridge_mask,
             "champion_shadow": shadow_mask,
         },
     }
@@ -1314,15 +1336,15 @@ def main():
     """
 
     t0_main = time_start()
-    model_name = cfg.MODEL_NAME
+    model_name = cfg.model.backbone.name
 
     # ------------------------------------------------------------
     # Output organization (one folder per run)
     # ------------------------------------------------------------
-    output_root = getattr(cfg, "OUTPUT_DIR", "output")
+    output_root = cfg.io.paths.output_dir
     os.makedirs(output_root, exist_ok=True)
-    resume_run = bool(getattr(cfg, "RESUME_RUN", False))
-    resume_dir = getattr(cfg, "RESUME_RUN_DIR", None)
+    resume_run = bool(cfg.runtime.resume_run)
+    resume_dir = cfg.runtime.resume_run_dir
     if resume_run:
         if not resume_dir:
             raise ValueError("RESUME_RUN_DIR must be set when RESUME_RUN=True")
@@ -1350,10 +1372,10 @@ def main():
     shape_dir = os.path.join(run_dir, "shapes")
     os.makedirs(plot_dir, exist_ok=True)
     os.makedirs(shape_dir, exist_ok=True)
-    cfg.PLOT_DIR = plot_dir
-    cfg.BEST_SETTINGS_PATH = os.path.join(run_dir, "best_settings.yml")
-    cfg.LOG_PATH = os.path.join(run_dir, "run.log")
-    setup_logging(getattr(cfg, "LOG_PATH", None))
+    cfg.io.paths.plot_dir = plot_dir
+    cfg.io.paths.best_settings_path = os.path.join(run_dir, "best_settings.yml")
+    cfg.io.paths.log_path = os.path.join(run_dir, "run.log")
+    setup_logging(cfg.io.paths.log_path)
     processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
     processed_tiles: set[str] = set()
     if resume_run and os.path.exists(processed_log_path):
@@ -1370,7 +1392,7 @@ def main():
                     processed_tiles.add(record["tile_path"])
         logger.info("resume: loaded %s processed tiles", len(processed_tiles))
 
-    union_backup_every = int(getattr(cfg, "UNION_BACKUP_EVERY", 10) or 0)
+    union_backup_every = int(cfg.runtime.union_backup_every or 0)
     union_root = os.path.join(shape_dir, "unions")
     union_streams = ["knn", "xgb", "champion"]
     union_variants = ["raw", "crf", "shadow"]
@@ -1421,28 +1443,28 @@ def main():
     _log_phase("START", "init_model")
     model, processor, device = init_model(model_name)
     _log_phase("END", "init_model")
-    ps = getattr(cfg, "PATCH_SIZE", model.config.patch_size)
-    tile_size = getattr(cfg, "TILE_SIZE", 1024)
-    stride = getattr(cfg, "STRIDE", tile_size)
+    ps = cfg.model.backbone.patch_size
+    tile_size = cfg.model.tiling.tile_size
+    stride = cfg.model.tiling.stride
 
     # ------------------------------------------------------------
     # Resolve paths to imagery + SH_2022 + GT vector labels
     # ------------------------------------------------------------
-    source_tile_default = cfg.SOURCE_TILE
-    source_label_raster = cfg.SOURCE_LABEL_RASTER
-    gt_vector_paths = cfg.EVAL_GT_VECTORS
-    auto_split_tiles = getattr(cfg, "AUTO_SPLIT_TILES", False)
+    source_tile_default = cfg.io.paths.source_tile
+    source_label_raster = cfg.io.paths.source_label_raster
+    gt_vector_paths = cfg.io.paths.eval_gt_vectors
+    auto_split_tiles = cfg.io.auto_split.enabled
 
     # ------------------------------------------------------------
     # Resolve one or more labeled source images (Image A list)
     # ------------------------------------------------------------
     if auto_split_tiles:
-        tiles_dir = getattr(cfg, "TILES_DIR", "data/tiles")
-        tile_glob = getattr(cfg, "TILE_GLOB", "*.tif")
-        val_fraction = float(getattr(cfg, "VAL_SPLIT_FRACTION", 0.2))
-        seed = int(getattr(cfg, "SPLIT_SEED", 42))
-        downsample_factor = getattr(cfg, "GT_PRESENCE_DOWNSAMPLE", None)
-        num_workers = getattr(cfg, "GT_PRESENCE_WORKERS", None)
+        tiles_dir = cfg.io.auto_split.tiles_dir
+        tile_glob = cfg.io.auto_split.tile_glob
+        val_fraction = float(cfg.io.auto_split.val_split_fraction)
+        seed = int(cfg.io.auto_split.split_seed)
+        downsample_factor = cfg.io.auto_split.gt_presence_downsample
+        num_workers = cfg.io.auto_split.gt_presence_workers
         img_a_paths, val_tiles, holdout_tiles = resolve_tile_splits_from_gt(
             tiles_dir,
             tile_glob,
@@ -1459,12 +1481,12 @@ def main():
             len(holdout_tiles),
         )
     else:
-        img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [source_tile_default]
-        val_tiles = cfg.VAL_TILES
-        holdout_tiles = cfg.HOLDOUT_TILES
+        img_a_paths = cfg.io.paths.source_tiles or [source_tile_default]
+        val_tiles = cfg.io.paths.val_tiles
+        holdout_tiles = cfg.io.paths.holdout_tiles
     lab_a_paths = [source_label_raster] * len(img_a_paths)
 
-    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
+    context_radius = int(cfg.model.banks.feat_context_radius or 0)
 
     # ------------------------------------------------------------
     # Resolve validation + holdout tiles (required)
@@ -1477,11 +1499,11 @@ def main():
     # ------------------------------------------------------------
     # Feature caching
     # ------------------------------------------------------------
-    feature_cache_mode = getattr(cfg, "FEATURE_CACHE_MODE", "disk")
+    feature_cache_mode = cfg.runtime.feature_cache_mode
     if feature_cache_mode not in {"disk", "memory"}:
         raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
     if feature_cache_mode == "disk":
-        feature_dir = cfg.FEATURE_DIR
+        feature_dir = cfg.io.paths.feature_dir
         os.makedirs(feature_dir, exist_ok=True)
     else:
         feature_dir = None
@@ -1497,69 +1519,84 @@ def main():
     neg_banks = []
     X_list = []
     y_list = []
+    aug_modes = _source_augmentation_modes()
+    logger.info("source augmentations: %s", ", ".join(aug_modes))
     for img_a_path, lab_a_path, image_id_a in zip(
         img_a_paths, lab_a_paths, image_id_a_list, strict=True
     ):
-        logger.info("source A: %s (labels: %s)", img_a_path, lab_a_path)
-        ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
-        img_a = load_dop20_image(img_a_path, downsample_factor=ds)
-        labels_A = reproject_labels_to_image(
+        logger.info("source A base: %s (labels: %s)", img_a_path, lab_a_path)
+        ds = int(cfg.model.backbone.resample_factor or 1)
+        img_a_base = load_dop20_image(img_a_path, downsample_factor=ds)
+        labels_a_base = reproject_labels_to_image(
             img_a_path, lab_a_path, downsample_factor=ds
         )
-        prefetched_a = None
-        if feature_cache_mode == "memory":
-            logger.info("prefetch: Image A %s", image_id_a)
-            prefetched_a = prefetch_features_single_scale_image(
+        for aug_mode in aug_modes:
+            image_id_aug = (
+                image_id_a if aug_mode == "orig" else f"{image_id_a}_{aug_mode}"
+            )
+            img_a, labels_a = _apply_source_augmentation(
+                img_a_base, labels_a_base, aug_mode
+            )
+            logger.info(
+                "source A augmented: %s mode=%s image_id=%s",
+                img_a_path,
+                aug_mode,
+                image_id_aug,
+            )
+            prefetched_a = None
+            if feature_cache_mode == "memory":
+                logger.info("prefetch: Image A %s", image_id_aug)
+                prefetched_a = prefetch_features_single_scale_image(
+                    img_a,
+                    model,
+                    processor,
+                    device,
+                    ps,
+                    tile_size,
+                    stride,
+                    None,
+                    None,
+                    image_id_aug,
+                )
+
+            pos_bank_i, neg_bank_i = build_banks_single_scale(
                 img_a,
+                labels_a,
                 model,
                 processor,
                 device,
                 ps,
                 tile_size,
                 stride,
+                cfg.model.banks.pos_frac_thresh,
                 None,
-                None,
-                image_id_a,
+                feature_dir,
+                image_id_aug,
+                cfg.io.paths.bank_cache_dir,
+                context_radius=context_radius,
+                prefetched_tiles=prefetched_a,
             )
+            if pos_bank_i.size > 0:
+                pos_banks.append(pos_bank_i)
+            if neg_bank_i is not None and len(neg_bank_i) > 0:
+                neg_banks.append(neg_bank_i)
 
-        pos_bank_i, neg_bank_i = build_banks_single_scale(
-            img_a,
-            labels_A,
-            model,
-            processor,
-            device,
-            ps,
-            tile_size,
-            stride,
-            getattr(cfg, "POS_FRAC_THRESH", 0.1),
-            None,
-            feature_dir,
-            image_id_a,
-            cfg.BANK_CACHE_DIR,
-            context_radius=context_radius,
-            prefetched_tiles=prefetched_a,
-        )
-        if pos_bank_i.size > 0:
-            pos_banks.append(pos_bank_i)
-        if neg_bank_i is not None and len(neg_bank_i) > 0:
-            neg_banks.append(neg_bank_i)
-
-        X_i, y_i = build_xgb_dataset(
-            img_a,
-            labels_A,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            image_id_a,
-            pos_frac=cfg.POS_FRAC_THRESH,
-            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
-            context_radius=context_radius,
-            prefetched_tiles=prefetched_a,
-        )
-        if X_i.size > 0 and y_i.size > 0:
-            X_list.append(X_i)
-            y_list.append(y_i)
+            x_i, y_i = build_xgb_dataset(
+                img_a,
+                labels_a,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                image_id_aug,
+                pos_frac=cfg.model.banks.pos_frac_thresh,
+                max_neg=cfg.model.banks.max_neg_bank,
+                context_radius=context_radius,
+                prefetched_tiles=prefetched_a,
+            )
+            if x_i.size > 0 and y_i.size > 0:
+                X_list.append(x_i)
+                y_list.append(y_i)
 
     if not pos_banks:
         raise ValueError("no positive banks were built; check SOURCE_TILES and labels")
@@ -1641,33 +1678,65 @@ def main():
         }
 
     inference_best_settings_path = os.path.join(run_dir, "inference_best_setting.yml")
+    bst = tuned["bst"]
+    xgb_model_info: dict[str, object] = {}
+    if bst is not None:
+        best_iter = getattr(bst, "best_iteration", None)
+        best_score = getattr(bst, "best_score", None)
+        xgb_model_info = {
+            "best_iteration": int(best_iter) if best_iter is not None else None,
+            "best_score": float(best_score) if best_score is not None else None,
+            "num_features": int(bst.num_features()),
+            "attributes": bst.attributes(),
+        }
+    model_info = {
+        "backbone": {
+            "name": cfg.model.backbone.name,
+            "patch_size": cfg.model.backbone.patch_size,
+            "resample_factor": cfg.model.backbone.resample_factor,
+        },
+        "tiling": {"tile_size": tile_size, "stride": stride},
+        "augmentation": {
+            "enabled": cfg.model.augmentation.enabled,
+            "modes": aug_modes,
+        },
+        "xgb_search": {
+            "use_gpu": cfg.search.xgb.use_gpu,
+            "num_boost_round": cfg.search.xgb.num_boost_round,
+            "early_stop": cfg.search.xgb.early_stop,
+            "param_grid_size": len(cfg.search.xgb.param_grid),
+        },
+        "knn_search": {
+            "k_values": cfg.search.knn.k_values,
+            "threshold_range": {
+                "start": cfg.search.knn.thresholds.start,
+                "stop": cfg.search.knn.thresholds.stop,
+                "count": cfg.search.knn.thresholds.count,
+            },
+        },
+    }
     export_best_settings(
         tuned["best_raw_config"],
         tuned["best_crf_config"],
-        cfg.MODEL_NAME,
-        getattr(cfg, "SOURCE_TILES", None) or cfg.SOURCE_TILE,
+        cfg.model.backbone.name,
+        cfg.io.paths.source_tiles or cfg.io.paths.source_tile,
         f"holdout_tiles={len(holdout_tiles)}",
         float(val_buffer_m) if val_buffer_m is not None else 0.0,
         float(val_pixel_size_m) if val_pixel_size_m is not None else 0.0,
         shadow_cfg=tuned["shadow_cfg"],
+        best_xgb_config=tuned["best_xgb_config"],
+        champion_source=tuned["champion_source"],
+        xgb_model_info=xgb_model_info,
+        model_info=model_info,
         extra_settings={
             "tile_size": tile_size,
             "stride": stride,
             "patch_size": ps,
             "feat_context_radius": context_radius,
-            "neg_alpha": getattr(cfg, "NEG_ALPHA", 1.0),
-            "pos_frac_thresh": getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            "neg_alpha": cfg.model.banks.neg_alpha,
+            "pos_frac_thresh": cfg.model.banks.pos_frac_thresh,
             "roads_penalty": tuned.get("roads_penalty", 1.0),
-            "roads_mask_path": getattr(cfg, "ROADS_MASK_PATH", None),
-            "gap_bridging": bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False)),
-            "bridge_max_gap_px": int(getattr(cfg, "BRIDGE_MAX_GAP_PX", 25)),
-            "bridge_max_pairs": int(getattr(cfg, "BRIDGE_MAX_PAIRS", 3)),
-            "bridge_max_avg_cost": float(getattr(cfg, "BRIDGE_MAX_AVG_COST", 1.0)),
-            "bridge_width_px": int(getattr(cfg, "BRIDGE_WIDTH_PX", 2)),
-            "bridge_min_component_px": int(
-                getattr(cfg, "BRIDGE_MIN_COMPONENT_PX", 300)
-            ),
-            "bridge_spur_prune_iters": int(getattr(cfg, "BRIDGE_SPUR_PRUNE_ITERS", 15)),
+            "roads_mask_path": cfg.io.paths.roads_mask_path,
             "val_tiles_count": len(val_tiles),
             "holdout_tiles_count": len(holdout_tiles),
             "weighted_phase_metrics": weighted_phase_metrics,
@@ -1724,9 +1793,8 @@ def main():
             fh.write(json.dumps(record) + "\n")
     _log_phase("END", "holdout_inference")
 
-    bridge_enabled = bool(getattr(cfg, "ENABLE_GAP_BRIDGING", False))
-    _summarize_phase_metrics(val_phase_metrics, "validation", bridge_enabled)
-    _summarize_phase_metrics(holdout_phase_metrics, "holdout", bridge_enabled)
+    _summarize_phase_metrics(val_phase_metrics, "validation")
+    _summarize_phase_metrics(holdout_phase_metrics, "holdout")
 
     # ------------------------------------------------------------
     # Consolidate tile-level feature files (.npy) → one per image

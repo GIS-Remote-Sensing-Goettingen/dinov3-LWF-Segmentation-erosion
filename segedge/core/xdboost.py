@@ -9,6 +9,7 @@ import numpy as np
 import xgboost as xgb
 from skimage.transform import resize
 
+from .config_loader import cfg
 from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
@@ -62,7 +63,7 @@ def build_xgb_dataset(
 
     X_pos, X_neg = [], []
     missing_feature_tiles = 0
-    resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
+    resample_factor = int(cfg.model.backbone.resample_factor or 1)
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
         prefetched = prefetched_tiles.get((y, x)) if prefetched_tiles else None
         if prefetched is not None:

@@ -8,8 +8,7 @@ import os
 import numpy as np
 from skimage.morphology import disk, erosion
 
-import config as cfg
-
+from .config_loader import cfg
 from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
@@ -118,7 +117,7 @@ def build_banks_single_scale(
 
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
-        resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        resample_factor = int(cfg.model.backbone.resample_factor or 1)
         cleanup_bank_cache(
             bank_cache_dir, image_id, ps, context_radius, resample_factor
         )
@@ -137,12 +136,12 @@ def build_banks_single_scale(
     pos_list, neg_list = [], []
     cached_tiles = computed_tiles = 0
 
-    erosion_radius = int(getattr(cfg, "BANK_EROSION_RADIUS", 2) or 0)
+    erosion_radius = int(cfg.model.banks.bank_erosion_radius or 0)
     if erosion_radius > 0:
         labels_eroded = erosion((labels_a > 0).astype(bool), disk(erosion_radius))
     else:
         labels_eroded = (labels_a > 0).astype(bool)
-    resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    resample_factor = int(cfg.model.backbone.resample_factor or 1)
 
     for y, x, img_tile, lab_tile in tile_iterator(
         img_a, labels_eroded, tile_size, stride
@@ -236,7 +235,7 @@ def build_banks_single_scale(
 
     logger.info("Positive bank size: %s patches", len(pos_bank))
     if neg_bank is not None:
-        max_neg = getattr(cfg, "MAX_NEG_BANK", 8000)
+        max_neg = cfg.model.banks.max_neg_bank
         logger.info("Negative bank size: %s patches", len(neg_bank))
         if len(neg_bank) > max_neg:
             rng = np.random.default_rng(42)

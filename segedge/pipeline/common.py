@@ -20,9 +20,8 @@ from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
 from transformers import AutoImageProcessor, AutoModel
 
-import config as cfg
-
 from ..core.banks import build_banks_single_scale
+from ..core.config_loader import cfg
 from ..core.io_utils import (
     build_sh_buffer_mask,
     load_dop20_image,
@@ -258,9 +257,9 @@ def resolve_tile_splits_from_gt(
     if not tile_paths:
         raise ValueError(f"no tiles found in {tiles_dir} with {tile_glob}")
     if downsample_factor is None:
-        downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        downsample_factor = int(cfg.model.backbone.resample_factor or 1)
 
-    raster_path = getattr(cfg, "SOURCE_LABEL_RASTER", None)
+    raster_path = cfg.io.paths.source_label_raster
     filtered_paths = []
     excluded_by_raster = 0
     if raster_path:
@@ -407,10 +406,10 @@ def build_banks_for_sources(
         >>> callable(build_banks_for_sources)
         True
     """
-    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
-    lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
-    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    img_a_paths = cfg.io.paths.source_tiles or [cfg.io.paths.source_tile]
+    lab_a_paths = [cfg.io.paths.source_label_raster] * len(img_a_paths)
+    context_radius = int(cfg.model.banks.feat_context_radius or 0)
+    ds = int(cfg.model.backbone.resample_factor or 1)
 
     pos_banks = []
     neg_banks = []
@@ -430,11 +429,11 @@ def build_banks_for_sources(
             ps,
             tile_size,
             stride,
-            getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            cfg.model.banks.pos_frac_thresh,
             None,
             feature_dir,
             image_id_a,
-            cfg.BANK_CACHE_DIR,
+            cfg.io.paths.bank_cache_dir,
             context_radius=context_radius,
         )
         if pos_i.size > 0:
@@ -470,10 +469,10 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
     """
     from ..core.xdboost import build_xgb_dataset
 
-    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
-    lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
-    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    img_a_paths = cfg.io.paths.source_tiles or [cfg.io.paths.source_tile]
+    lab_a_paths = [cfg.io.paths.source_label_raster] * len(img_a_paths)
+    context_radius = int(cfg.model.banks.feat_context_radius or 0)
+    ds = int(cfg.model.backbone.resample_factor or 1)
 
     X_list = []
     y_list = []
@@ -491,8 +490,8 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
             stride,
             feature_dir,
             image_id_a,
-            pos_frac=cfg.POS_FRAC_THRESH,
-            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
+            pos_frac=cfg.model.banks.pos_frac_thresh,
+            max_neg=cfg.model.banks.max_neg_bank,
             context_radius=context_radius,
         )
         if X_i.size > 0 and y_i.size > 0:
@@ -518,20 +517,20 @@ def prep_b_tile(img_path, gt_paths):
         >>> callable(prep_b_tile)
         True
     """
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    ds = int(cfg.model.backbone.resample_factor or 1)
     img_b = load_dop20_image(img_path, downsample_factor=ds)
     labels_sh = reproject_labels_to_image(
-        img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds
+        img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
     )
     gt_mask_b = rasterize_vector_labels(gt_paths, img_path, downsample_factor=ds)
 
     with __import__("rasterio").open(img_path) as src:
         pixel_size_m = abs(src.transform.a)
     pixel_size_m = pixel_size_m * ds
-    buffer_m = cfg.BUFFER_M
+    buffer_m = cfg.model.priors.buffer_m
     buffer_pixels = int(round(buffer_m / pixel_size_m))
     sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
-    if getattr(cfg, "CLIP_GT_TO_BUFFER", False):
+    if cfg.model.priors.clip_gt_to_buffer:
         gt_mask_eval = np.logical_and(gt_mask_b, sh_buffer_mask)
     else:
         gt_mask_eval = gt_mask_b

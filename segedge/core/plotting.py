@@ -235,7 +235,6 @@ def save_unified_plot(
     score_maps: dict | None = None,
     skeleton=None,
     endpoints=None,
-    bridge_enabled: bool = False,
 ):
     """Save a unified multi-panel plot for all phases.
 
@@ -253,7 +252,6 @@ def save_unified_plot(
         score_maps (dict | None): Optional score heatmaps (kNN/XGB).
         skeleton (np.ndarray | None): Optional skeleton mask.
         endpoints (np.ndarray | None): Optional endpoint coordinates.
-        bridge_enabled (bool): Whether bridge mask is present.
 
     Examples:
         >>> callable(save_unified_plot)
@@ -304,8 +302,6 @@ def save_unified_plot(
         ("champion_raw", "Champion raw"),
         ("champion_crf", "Champion CRF"),
     ]
-    if bridge_enabled:
-        phase_order.append(("champion_bridge", "Champion bridge"))
     phase_order.append(("champion_shadow", "Champion shadow"))
 
     for key, label in phase_order:

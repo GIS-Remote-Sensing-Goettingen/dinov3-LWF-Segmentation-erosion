@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Add source-tile augmentation (flip + 90-degree rotations), compact repetitive timing logs, and richer best-settings YAML model details.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/timing_utils.py`, `segedge/pipeline/run.py`, `segedge/core/io_utils.py`, `KB.md`, `CHANGELOG.md`
+- reason: Improve source diversity during bank/XGB building, reduce log spam from per-tile timers, and export clearer model/tuning context.
+- problems fixed: Adds configurable augmentation, collapses noisy repeated timing lines into compact summaries, and records XGB/champion/model metadata in `inference_best_setting.yml`.
+
+- Description: Remove continuity bridging and migrate runtime config from `config.py` to commented `config.yml` with typed loader access.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/core/plotting.py`, `segedge/core/continuity.py`, `segedge/core/features.py`, `segedge/core/xdboost.py`, `segedge/core/io_utils.py`, `segedge/core/knn.py`, `segedge/core/banks.py`, `segedge/core/timing_utils.py`, `segedge/pipeline/common.py`, `tests/test_e2e_smoke.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Simplify champion postprocessing and centralize configuration in a structured YAML format.
+- problems fixed: Removes over-connecting bridge phase regressions and replaces flat Python constants with a readable, validated runtime config.
+
 - Description: Switch roads masking to per-tile spatial index rasterization.
 - file touched: `config.py`, `segedge/pipeline/run.py`, `KB.md`, `CHANGELOG.md`
 - reason: Avoid OOM from global raster builds while keeping tile-resolution masking.

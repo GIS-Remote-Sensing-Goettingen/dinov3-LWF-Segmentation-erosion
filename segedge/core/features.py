@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from scipy.ndimage import uniform_filter
 
+from .config_loader import cfg
 from .timing_utils import DEBUG_TIMING, DEBUG_TIMING_VERBOSE, time_end, time_start
 
 logger = logging.getLogger(__name__)
@@ -478,8 +479,8 @@ def prefetch_features_single_scale_image(
     t0 = time_start()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0
-    resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
-    batch_size = int(getattr(__import__("config"), "FEATURE_BATCH_SIZE", 1) or 1)
+    resample_factor = int(cfg.model.backbone.resample_factor or 1)
+    batch_size = int(cfg.runtime.feature_batch_size or 1)
     batch_size = max(1, batch_size)
     pending: dict[tuple[int, int], list[tuple[int, int, np.ndarray, int, int]]] = {}
 
