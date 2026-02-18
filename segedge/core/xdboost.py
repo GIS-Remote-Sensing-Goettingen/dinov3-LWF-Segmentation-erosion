@@ -9,6 +9,7 @@ import numpy as np
 import xgboost as xgb
 from skimage.transform import resize
 
+from .config_loader import cfg
 from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
@@ -62,7 +63,7 @@ def build_xgb_dataset(
 
     X_pos, X_neg = [], []
     missing_feature_tiles = 0
-    resample_factor = int(getattr(__import__("config"), "RESAMPLE_FACTOR", 1) or 1)
+    resample_factor = int(cfg.model.backbone.resample_factor or 1)
     for y, x, img_tile, lab_tile in tile_iterator(img, labels, tile_size, stride):
         prefetched = prefetched_tiles.get((y, x)) if prefetched_tiles else None
         if prefetched is not None:
@@ -145,7 +146,14 @@ def build_xgb_dataset(
     return X, y
 
 
-def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=50):
+def train_xgb_classifier(
+    X,
+    y,
+    use_gpu=False,
+    num_boost_round=300,
+    verbose_eval=50,
+    param_overrides: dict | None = None,
+):
     """Train a binary XGBoost classifier for patch embeddings.
 
     Args:
@@ -154,6 +162,7 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         use_gpu (bool): Use GPU histogram algorithm when available.
         num_boost_round (int): Number of boosting rounds.
         verbose_eval (int): Verbosity interval.
+        param_overrides (dict | None): Optional parameter overrides.
 
     Returns:
         xgb.Booster: Trained XGBoost booster.
@@ -174,6 +183,9 @@ def train_xgb_classifier(X, y, use_gpu=False, num_boost_round=300, verbose_eval=
         "min_child_weight": 3,
         "tree_method": "gpu_hist" if use_gpu else "hist",
     }
+    if param_overrides:
+        params.update(param_overrides)
+        params["tree_method"] = "gpu_hist" if use_gpu else "hist"
     try:
         bst = xgb.train(
             params,

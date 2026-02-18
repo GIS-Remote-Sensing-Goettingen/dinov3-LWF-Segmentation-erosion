@@ -10,8 +10,7 @@ import torch
 from numpy import ndarray
 from skimage.transform import resize
 
-import config as cfg
-
+from .config_loader import cfg
 from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
@@ -83,7 +82,7 @@ def zero_shot_knn_single_scale_B_with_saliency(
     saliency_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
     cached_tiles = computed_tiles = 0
-    resample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    resample_factor = int(cfg.model.backbone.resample_factor or 1)
 
     pos_bank_t = torch.from_numpy(pos_bank.astype(np.float32)).to(device)
     pos_bank_t_half = (
@@ -324,7 +323,7 @@ def grid_search_k_threshold(
             aggregate_layers=None,
             feature_dir=feature_dir,
             image_id=image_id_b,
-            neg_alpha=getattr(cfg, "NEG_ALPHA", 1.0),
+            neg_alpha=cfg.model.banks.neg_alpha,
             prefetched_tiles=prefetched_tiles_b,
             use_fp16_matmul=use_fp16_matmul,
             context_radius=context_radius,
@@ -332,7 +331,7 @@ def grid_search_k_threshold(
         time_end(f"grid_search_score_full(k={k})", t0_k_score)
 
         metrics_raw_list = None
-        if getattr(cfg, "USE_GPU_THRESHOLD_METRICS", True) and device.type == "cuda":
+        if cfg.search.knn.use_gpu_threshold_metrics and device.type == "cuda":
             try:
                 metrics_raw_list = compute_metrics_batch_gpu(
                     score_map=score_full,
@@ -340,7 +339,7 @@ def grid_search_k_threshold(
                     sh_mask=sh_buffer_mask_b,
                     gt_mask=gt_mask_b,
                     device=device,
-                    batch_size=getattr(cfg, "THRESHOLD_BATCH_SIZE", 8),
+                    batch_size=cfg.search.knn.threshold_batch_size,
                 )
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
@@ -352,7 +351,7 @@ def grid_search_k_threshold(
                 thresholds=thresholds,
                 sh_mask=sh_buffer_mask_b,
                 gt_mask=gt_mask_b,
-                batch_size=getattr(cfg, "THRESHOLD_CPU_BATCH_SIZE", 16),
+                batch_size=cfg.search.knn.threshold_cpu_batch_size,
             )
 
         for metrics_raw in metrics_raw_list:

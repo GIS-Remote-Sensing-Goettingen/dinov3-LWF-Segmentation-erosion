@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import config as cfg
+from segedge.core.config_loader import cfg
 from segedge.core.io_utils import (
     build_sh_buffer_mask,
     load_dop20_image,
@@ -35,16 +35,16 @@ def test_e2e_smoke_single_tile():
         >>> True
         True
     """
-    tile_candidates = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
+    tile_candidates = cfg.io.paths.source_tiles or [cfg.io.paths.source_tile]
     existing_tiles = _existing_paths(tile_candidates)
     if not existing_tiles:
         pytest.skip("no configured tiles found on disk")
 
-    labels_path = Path(cfg.SOURCE_LABEL_RASTER)
+    labels_path = Path(cfg.io.paths.source_label_raster)
     if not labels_path.exists():
         pytest.skip("label raster not found on disk")
 
-    gt_paths = _existing_paths(list(cfg.EVAL_GT_VECTORS))
+    gt_paths = _existing_paths(list(cfg.io.paths.eval_gt_vectors))
     if not gt_paths:
         pytest.skip("no GT vector labels found on disk")
 
@@ -55,7 +55,7 @@ def test_e2e_smoke_single_tile():
     labels_sh = reproject_labels_to_image(str(tile_path), str(labels_path))
     gt_mask = rasterize_vector_labels([str(p) for p in gt_paths], str(tile_path))
 
-    buffer_m = cfg.BUFFER_M
+    buffer_m = cfg.model.priors.buffer_m
     with __import__("rasterio").open(str(tile_path)) as src:
         pixel_size_m = abs(src.transform.a)
     buffer_pixels = int(round(buffer_m / pixel_size_m))

@@ -20,9 +20,9 @@ from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
 from transformers import AutoImageProcessor, AutoModel
 
-import config as cfg
-
 from ..core.banks import build_banks_single_scale
+from ..core.config_loader import cfg
+from ..core.features import prefetch_features_single_scale_image
 from ..core.io_utils import (
     build_sh_buffer_mask,
     load_dop20_image,
@@ -250,6 +250,60 @@ def resolve_tile_splits_from_gt(
         >>> callable(resolve_tile_splits_from_gt)
         True
     """
+    gt_tiles, holdout_tiles = resolve_tiles_from_gt_presence(
+        tiles_dir,
+        tile_glob,
+        gt_vector_paths,
+        downsample_factor=downsample_factor,
+        num_workers=num_workers,
+    )
+
+    if not gt_tiles:
+        raise ValueError("no tiles overlap GT vectors; cannot build source/val")
+    if len(gt_tiles) == 1:
+        logger.warning(
+            "only one GT tile found; using it for both source and validation"
+        )
+        return gt_tiles, gt_tiles, holdout_tiles
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(gt_tiles))
+    rng.shuffle(indices)
+    val_count = max(1, int(round(len(gt_tiles) * val_fraction)))
+    if val_count >= len(gt_tiles):
+        val_count = len(gt_tiles) - 1
+    val_idx = set(indices[:val_count].tolist())
+    source_tiles = [p for i, p in enumerate(gt_tiles) if i not in val_idx]
+    val_tiles = [p for i, p in enumerate(gt_tiles) if i in val_idx]
+    return source_tiles, val_tiles, holdout_tiles
+
+
+def resolve_tiles_from_gt_presence(
+    tiles_dir: str,
+    tile_glob: str,
+    gt_vector_paths: list[str],
+    downsample_factor: int | None = None,
+    num_workers: int | None = None,
+) -> tuple[list[str], list[str]]:
+    """Resolve GT-positive and inference tiles from a directory.
+
+    Tiles with any GT overlap are returned as GT-positive tiles. Remaining tiles
+    are returned as inference tiles.
+
+    Args:
+        tiles_dir (str): Directory containing tiles.
+        tile_glob (str): Glob pattern for tile files.
+        gt_vector_paths (list[str]): Ground-truth vector paths.
+        downsample_factor (int | None): Downsample factor for GT presence checks.
+        num_workers (int | None): Worker count for GT presence checks.
+
+    Returns:
+        tuple[list[str], list[str]]: GT-positive tiles, inference tiles.
+
+    Examples:
+        >>> callable(resolve_tiles_from_gt_presence)
+        True
+    """
     if not gt_vector_paths:
         raise ValueError("EVAL_GT_VECTORS must be set for auto split")
     if not os.path.isdir(tiles_dir):
@@ -258,9 +312,9 @@ def resolve_tile_splits_from_gt(
     if not tile_paths:
         raise ValueError(f"no tiles found in {tiles_dir} with {tile_glob}")
     if downsample_factor is None:
-        downsample_factor = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+        downsample_factor = int(cfg.model.backbone.resample_factor or 1)
 
-    raster_path = getattr(cfg, "SOURCE_LABEL_RASTER", None)
+    raster_path = cfg.io.paths.source_label_raster
     filtered_paths = []
     excluded_by_raster = 0
     if raster_path:
@@ -306,14 +360,14 @@ def resolve_tile_splits_from_gt(
         num_workers,
     )
     gt_tiles = []
-    holdout_tiles = []
+    inference_tiles = []
     if num_workers <= 1:
         for tile_path in tile_paths:
             has_gt = _tile_has_gt(tile_path, gt_vector_paths, downsample_factor)
             if has_gt:
                 gt_tiles.append(tile_path)
             else:
-                holdout_tiles.append(tile_path)
+                inference_tiles.append(tile_path)
     else:
         chunk_count = max(1, num_workers * 4)
         chunk_size = max(1, (len(tile_paths) + chunk_count - 1) // chunk_count)
@@ -331,26 +385,9 @@ def resolve_tile_splits_from_gt(
                 repeat(downsample_factor),
             ):
                 gt_tiles.extend(gt_chunk)
-                holdout_tiles.extend(holdout_chunk)
+                inference_tiles.extend(holdout_chunk)
 
-    if not gt_tiles:
-        raise ValueError("no tiles overlap GT vectors; cannot build source/val")
-    if len(gt_tiles) == 1:
-        logger.warning(
-            "only one GT tile found; using it for both source and validation"
-        )
-        return gt_tiles, gt_tiles, holdout_tiles
-
-    rng = np.random.default_rng(seed)
-    indices = np.arange(len(gt_tiles))
-    rng.shuffle(indices)
-    val_count = max(1, int(round(len(gt_tiles) * val_fraction)))
-    if val_count >= len(gt_tiles):
-        val_count = len(gt_tiles) - 1
-    val_idx = set(indices[:val_count].tolist())
-    source_tiles = [p for i, p in enumerate(gt_tiles) if i not in val_idx]
-    val_tiles = [p for i, p in enumerate(gt_tiles) if i in val_idx]
-    return source_tiles, val_tiles, holdout_tiles
+    return sorted(gt_tiles), sorted(inference_tiles)
 
 
 def init_model(model_name: str):
@@ -386,6 +423,216 @@ def init_model(model_name: str):
     return model, processor, device
 
 
+def _source_augmentation_modes() -> list[str]:
+    """Return enabled source augmentation modes from config.
+
+    Examples:
+        >>> "orig" in _source_augmentation_modes()
+        True
+    """
+    aug = cfg.model.augmentation
+    if not aug.enabled:
+        return ["orig"]
+    modes: list[str] = []
+    if aug.include_identity:
+        modes.append("orig")
+    if aug.horizontal_flip:
+        modes.append("flip_lr")
+    if aug.vertical_flip:
+        modes.append("flip_ud")
+    for deg in aug.rotations_deg:
+        d = int(deg) % 360
+        if d == 0:
+            if not aug.include_identity:
+                modes.append("orig")
+            continue
+        if d not in {90, 180, 270}:
+            logger.warning("skipping unsupported augmentation rotation: %s", deg)
+            continue
+        modes.append(f"rot{d}")
+    if not modes:
+        modes = ["orig"]
+    deduped = []
+    seen: set[str] = set()
+    for mode in modes:
+        if mode in seen:
+            continue
+        deduped.append(mode)
+        seen.add(mode)
+    return deduped
+
+
+def _apply_source_augmentation(
+    img: np.ndarray,
+    labels: np.ndarray,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a geometric augmentation to source image and labels.
+
+    Examples:
+        >>> import numpy as np
+        >>> x = np.zeros((2, 2, 3), dtype=np.uint8)
+        >>> y = np.zeros((2, 2), dtype=np.uint8)
+        >>> _apply_source_augmentation(x, y, "orig")[0].shape
+        (2, 2, 3)
+    """
+    if mode == "orig":
+        return img, labels
+    if mode == "flip_lr":
+        return np.flip(img, axis=1).copy(), np.flip(labels, axis=1).copy()
+    if mode == "flip_ud":
+        return np.flip(img, axis=0).copy(), np.flip(labels, axis=0).copy()
+    if mode.startswith("rot"):
+        deg = int(mode.replace("rot", ""))
+        if deg % 90 != 0:
+            raise ValueError(f"rotation must be multiple of 90, got {deg}")
+        k = (deg // 90) % 4
+        return np.rot90(img, k).copy(), np.rot90(labels, k).copy()
+    raise ValueError(f"unknown augmentation mode: {mode}")
+
+
+def build_training_artifacts_for_tiles(
+    source_tiles: list[str],
+    source_label_raster: str,
+    model,
+    processor,
+    device,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_cache_mode: str,
+    feature_dir: str | None,
+    context_radius: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[str], list[str]]:
+    """Build banks and XGB training data from a set of source tiles.
+
+    Args:
+        source_tiles (list[str]): Source tile paths.
+        source_label_raster (str): Source label raster path.
+        model: DINO model.
+        processor: DINO processor.
+        device: Torch device.
+        ps (int): Patch size.
+        tile_size (int): Tile size in pixels.
+        stride (int): Tile stride.
+        feature_cache_mode (str): Either ``disk`` or ``memory``.
+        feature_dir (str | None): Feature cache directory.
+        context_radius (int): Feature context radius.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[str], list[str]]:
+            Positive bank, negative bank, XGB feature matrix, XGB labels,
+            base image ids, augmentation modes.
+
+    Examples:
+        >>> callable(build_training_artifacts_for_tiles)
+        True
+    """
+    from ..core.xdboost import build_xgb_dataset
+
+    if not source_tiles:
+        raise ValueError("source tile list is empty")
+    aug_modes = _source_augmentation_modes()
+    logger.info("source augmentations: %s", ", ".join(aug_modes))
+
+    pos_banks = []
+    neg_banks = []
+    x_list = []
+    y_list = []
+    base_image_ids = [os.path.splitext(os.path.basename(p))[0] for p in source_tiles]
+    ds = int(cfg.model.backbone.resample_factor or 1)
+
+    for img_a_path, image_id_a in zip(source_tiles, base_image_ids, strict=True):
+        logger.info("source A base: %s (labels: %s)", img_a_path, source_label_raster)
+        img_a_base = load_dop20_image(img_a_path, downsample_factor=ds)
+        labels_a_base = reproject_labels_to_image(
+            img_a_path, source_label_raster, downsample_factor=ds
+        )
+        for aug_mode in aug_modes:
+            image_id_aug = (
+                image_id_a if aug_mode == "orig" else f"{image_id_a}_{aug_mode}"
+            )
+            img_a, labels_a = _apply_source_augmentation(
+                img_a_base, labels_a_base, aug_mode
+            )
+            logger.info(
+                "source A augmented: %s mode=%s image_id=%s",
+                img_a_path,
+                aug_mode,
+                image_id_aug,
+            )
+            prefetched_a = None
+            if feature_cache_mode == "memory":
+                logger.info("prefetch: Image A %s", image_id_aug)
+                prefetched_a = prefetch_features_single_scale_image(
+                    img_a,
+                    model,
+                    processor,
+                    device,
+                    ps,
+                    tile_size,
+                    stride,
+                    None,
+                    None,
+                    image_id_aug,
+                )
+
+            pos_bank_i, neg_bank_i = build_banks_single_scale(
+                img_a,
+                labels_a,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                cfg.model.banks.pos_frac_thresh,
+                None,
+                feature_dir,
+                image_id_aug,
+                cfg.io.paths.bank_cache_dir,
+                context_radius=context_radius,
+                prefetched_tiles=prefetched_a,
+            )
+            if pos_bank_i.size > 0:
+                pos_banks.append(pos_bank_i)
+            if neg_bank_i is not None and len(neg_bank_i) > 0:
+                neg_banks.append(neg_bank_i)
+
+            x_i, y_i = build_xgb_dataset(
+                img_a,
+                labels_a,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                image_id_aug,
+                pos_frac=cfg.model.banks.pos_frac_thresh,
+                max_neg=cfg.model.banks.max_neg_bank,
+                context_radius=context_radius,
+                prefetched_tiles=prefetched_a,
+            )
+            if x_i.size > 0 and y_i.size > 0:
+                x_list.append(x_i)
+                y_list.append(y_i)
+
+    if not pos_banks:
+        raise ValueError("no positive banks were built; check source tiles and labels")
+    pos_bank = np.concatenate(pos_banks, axis=0)
+    neg_bank = np.concatenate(neg_banks, axis=0) if neg_banks else None
+    logger.info(
+        "combined banks: pos=%s, neg=%s",
+        len(pos_bank),
+        0 if neg_bank is None else len(neg_bank),
+    )
+
+    x = np.vstack(x_list) if x_list else np.empty((0, 0), dtype=np.float32)
+    y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
+    if x.size == 0 or y.size == 0:
+        raise ValueError("XGBoost dataset is empty; check source tiles and labels")
+    return pos_bank, neg_bank, x, y, base_image_ids, aug_modes
+
+
 def build_banks_for_sources(
     model, processor, device, ps, tile_size, stride, feature_dir
 ):
@@ -407,10 +654,10 @@ def build_banks_for_sources(
         >>> callable(build_banks_for_sources)
         True
     """
-    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
-    lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
-    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    img_a_paths = cfg.io.paths.source_tiles or [cfg.io.paths.source_tile]
+    lab_a_paths = [cfg.io.paths.source_label_raster] * len(img_a_paths)
+    context_radius = int(cfg.model.banks.feat_context_radius or 0)
+    ds = int(cfg.model.backbone.resample_factor or 1)
 
     pos_banks = []
     neg_banks = []
@@ -430,11 +677,11 @@ def build_banks_for_sources(
             ps,
             tile_size,
             stride,
-            getattr(cfg, "POS_FRAC_THRESH", 0.1),
+            cfg.model.banks.pos_frac_thresh,
             None,
             feature_dir,
             image_id_a,
-            cfg.BANK_CACHE_DIR,
+            cfg.io.paths.bank_cache_dir,
             context_radius=context_radius,
         )
         if pos_i.size > 0:
@@ -470,10 +717,10 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
     """
     from ..core.xdboost import build_xgb_dataset
 
-    img_a_paths = getattr(cfg, "SOURCE_TILES", None) or [cfg.SOURCE_TILE]
-    lab_a_paths = [cfg.SOURCE_LABEL_RASTER] * len(img_a_paths)
-    context_radius = int(getattr(cfg, "FEAT_CONTEXT_RADIUS", 0) or 0)
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    img_a_paths = cfg.io.paths.source_tiles or [cfg.io.paths.source_tile]
+    lab_a_paths = [cfg.io.paths.source_label_raster] * len(img_a_paths)
+    context_radius = int(cfg.model.banks.feat_context_radius or 0)
+    ds = int(cfg.model.backbone.resample_factor or 1)
 
     X_list = []
     y_list = []
@@ -491,8 +738,8 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
             stride,
             feature_dir,
             image_id_a,
-            pos_frac=cfg.POS_FRAC_THRESH,
-            max_neg=getattr(cfg, "MAX_NEG_BANK", 8000),
+            pos_frac=cfg.model.banks.pos_frac_thresh,
+            max_neg=cfg.model.banks.max_neg_bank,
             context_radius=context_radius,
         )
         if X_i.size > 0 and y_i.size > 0:
@@ -518,20 +765,20 @@ def prep_b_tile(img_path, gt_paths):
         >>> callable(prep_b_tile)
         True
     """
-    ds = int(getattr(cfg, "RESAMPLE_FACTOR", 1) or 1)
+    ds = int(cfg.model.backbone.resample_factor or 1)
     img_b = load_dop20_image(img_path, downsample_factor=ds)
     labels_sh = reproject_labels_to_image(
-        img_path, cfg.SOURCE_LABEL_RASTER, downsample_factor=ds
+        img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
     )
     gt_mask_b = rasterize_vector_labels(gt_paths, img_path, downsample_factor=ds)
 
     with __import__("rasterio").open(img_path) as src:
         pixel_size_m = abs(src.transform.a)
     pixel_size_m = pixel_size_m * ds
-    buffer_m = cfg.BUFFER_M
+    buffer_m = cfg.model.priors.buffer_m
     buffer_pixels = int(round(buffer_m / pixel_size_m))
     sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
-    if getattr(cfg, "CLIP_GT_TO_BUFFER", False):
+    if cfg.model.priors.clip_gt_to_buffer:
         gt_mask_eval = np.logical_and(gt_mask_b, sh_buffer_mask)
     else:
         gt_mask_eval = gt_mask_b

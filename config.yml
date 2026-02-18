@@ -1,0 +1,200 @@
+# SegEdge runtime configuration.
+# Organized for readability by pipeline stage.
+
+io:
+  paths:
+    # Single-tile fallbacks (kept for compatibility; LOO uses auto_split tiles).
+    source_tile: data/tiles/dop20_596000_5974000_1km_20cm.tif
+    target_tile: data/dop20_592000_5982000_1km_20cm.tif
+
+    # Labels and GT vectors.
+    source_label_raster: data/lables/planet_labels_2022.tif
+    eval_gt_vectors:
+      - data/lables/lables_1.shp
+      - data/lables/lables_2.shp
+      - data/lables/lables_3.shp
+      - data/lables/labels_final.shp
+
+    # Manual tile lists are deprecated when using directory-driven LOO.
+    source_tiles: []
+    val_tiles: []
+    holdout_tiles: []
+
+    # Outputs and caches.
+    feature_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/features
+    bank_cache_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/banks
+    output_dir: output
+    plot_dir: output/plots
+    best_settings_path: output/best_settings.yml
+    log_path: output/run.log
+
+    # Optional roads mask vector for score penalties.
+    roads_mask_path: data/roads/roads_mask.shp
+
+  auto_split:
+    enabled: true
+    # Input directory scanned for tiles.
+    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
+    tile_glob: "*.tif"
+    # Kept for backward compatibility with non-LOO mode.
+    val_split_fraction: 0.5
+    split_seed: 42
+    # null -> fallback to model.backbone.resample_factor
+    gt_presence_downsample: null
+    # null -> fallback to SLURM_CPUS_PER_TASK / cpu_count
+    gt_presence_workers: null
+
+model:
+  backbone:
+    name: facebook/dinov3-vitl16-pretrain-sat493m
+    patch_size: 16
+    # 1 means full resolution.
+    resample_factor: 1
+
+  tiling:
+    tile_size: 2048
+    stride: 512
+
+  priors:
+    buffer_m: 5.0
+    clip_gt_to_buffer: true
+
+  banks:
+    pos_frac_thresh: 0.05
+    neg_alpha: 1.0
+    feat_context_radius: 0
+    bank_erosion_radius: 0
+    max_neg_bank: 8000
+
+  augmentation:
+    enabled: true
+    include_identity: true
+    horizontal_flip: true
+    vertical_flip: true
+    # Use right-angle rotations to avoid interpolation artifacts.
+    rotations_deg: [90, 180, 270]
+
+training:
+  loo:
+    # Leave-one-out over all GT-positive tiles discovered from auto_split.tiles_dir.
+    enabled: true
+    # Minimum train tiles per fold (warning only when not met).
+    min_train_tiles: 1
+
+search:
+  knn:
+    k_values: [25, 50, 75, 100, 150, 200, 250, 275 , 300]
+    thresholds:
+      start: 0.01
+      stop: 0.5
+      count: 25
+    use_fp16_knn: true
+    use_gpu_threshold_metrics: true
+    threshold_batch_size: 16
+    threshold_cpu_batch_size: 32
+
+  crf:
+    prob_softness_values: [0.03]
+    pos_w_values: [4.0]
+    pos_xy_std_values: [3.0]
+    bilateral_w_values: [7.0]
+    bilateral_xy_std_values: [25.0]
+    bilateral_rgb_std_values: [3.0]
+    num_workers: 16
+    max_configs: 1
+
+  xgb:
+    use_gpu: true
+    val_fraction: 0.3
+    num_boost_round: 1200
+    early_stop: 80
+    verbose_eval: 50
+    param_grid:
+      - max_depth: 6
+        eta: 0.05
+        colsample_bytree: 0.3
+        subsample: 0.9
+        reg_alpha: 0.05
+        min_child_weight: 1
+      - max_depth: 7
+        eta: 0.03
+        colsample_bytree: 0.3
+        subsample: 0.9
+        reg_alpha: 0.05
+        min_child_weight: 1
+      - max_depth: 6
+        eta: 0.05
+        colsample_bytree: 0.3
+        subsample: 0.9
+        reg_alpha: 0.1
+        min_child_weight: 1
+      # Tier 1: baseline, balanced
+      - max_depth: 5
+        eta: 0.05
+        subsample: 0.8
+        colsample_bytree: 0.4
+        min_child_weight: 5
+        gamma: 0.0
+        reg_alpha: 0.0
+        reg_lambda: 1.0
+        scale_pos_weight: 5
+
+      # Tier 2: more conservative (often reduces forest bleed)
+      - max_depth: 4
+        eta: 0.05
+        subsample: 0.7
+        colsample_bytree: 0.3
+        min_child_weight: 10
+        gamma: 1.0
+        reg_alpha: 0.1
+        reg_lambda: 2.0
+        scale_pos_weight: 8
+
+      # Tier 3: higher capacity + stronger regularization
+      - max_depth: 6
+        eta: 0.03
+        subsample: 0.8
+        colsample_bytree: 0.5
+        min_child_weight: 3
+        gamma: 0.0
+        reg_alpha: 0.05
+        reg_lambda: 1.5
+        scale_pos_weight: 5
+
+      # Tier 4: very conservative (precision-oriented)
+      - max_depth: 3
+        eta: 0.05
+        subsample: 0.6
+        colsample_bytree: 0.3
+        min_child_weight: 15
+        gamma: 2.0
+        reg_alpha: 0.2
+        reg_lambda: 3.0
+        scale_pos_weight: 10
+
+
+postprocess:
+  shadow:
+    weight_sets:
+      - [1.0, 1.0, 1.0]
+      - [0.7, 1.0, 1.0]
+      - [0.5, 0.8, 1.0]
+      - [0.5, 1.0, 0.5]
+      - [0.5, 0.5, 1.0]
+      - [0.1, 0.5, 0.5]
+    thresholds: [20, 40, 60, 80, 100, 120, 160, 180, 210, 240, 270, 300, 330, 360, 450, 500]
+    protect_scores: [0.3, 0.4, 0.5, 0.6]
+
+  roads:
+    penalty_values: [0.8,0.7, 0.6, 0.5]
+
+runtime:
+  feature_cache_mode: memory
+  feature_batch_size: 4
+  resume_run: false
+  resume_run_dir: null
+  union_backup_every: 10
+  union_backup_dir: null
+  debug_timing: true
+  debug_timing_verbose: false
+  compact_timing_logs: true

@@ -20,21 +20,20 @@ This document gives a complete, self-contained description of the SegEdge zero-s
   1. Load imagery + SH_2022 raster + GT vector labels.
   2. Buffer SH_2022 to constrain predictions.
   3. Extract/cached DINO features (patch size 16), with optional batching.
-  4. Build banks (positives/negatives) from A.
+  4. Build banks (positives/negatives) from A, with optional source augmentation (flips/90-degree rotations).
   5. Score B with kNN (pos − α·neg) over k grid; sweep thresholds.
   6. Optional XGBoost classifier on patch features; sweep thresholds.
   7. Choose champion (best IoU between kNN and XGB).
   8. Median filter champion mask; CRF search around champion.
-  9. Continuity bridging (skeleton + shortest path) to close small gaps.
-  10. Shadow filtering (RGB weighted dark-pixel removal).
-  11. Export unified plots, rolling union shapefiles (holdout-only), and inference best-settings YAML.
+  9. Shadow filtering (RGB weighted dark-pixel removal).
+  10. Export unified plots, rolling union shapefiles (holdout-only), and inference best-settings YAML.
 - Design choices: zero-shot (no fine-tuning of backbone), aggressive caching, grid-search for self-calibration, post-hoc refinements (CRF, shadow) to clean edges/dark areas.
 - Backbone detail: DINOv3 ViT-L/16 (sat493m pretrain), embedding dim ~1024, patch grid size Hp×Wp where Hp = H/16, Wp = W/16 on each tile.
 
 ---
 
 ## 3) Data & Labeling Details
-- Inputs (config.py):
+- Inputs (config.yml):
   - Image A: `data/dop20_593000_5979000_1km_20cm.tif`
   - Image B: `data/dop20_592000_5982000_1km_20cm.tif`
   - SH_2022 raster: `data/planet_labels_2022.tif`
@@ -44,7 +43,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - Tiling: default `TILE_SIZE=1024`, `STRIDE=512`; tiles cropped to multiples of patch size (16).
 - Patch labeling for A: `labels_to_patch_masks` marks a patch positive if FG fraction ≥ `POS_FRAC_THRESH` (default 0.1); negative if zero FG.
 - CRS: Vector CRS is reprojected to raster CRS when needed; if vector CRS missing, assumes EPSG:4326 with a warning.
-- Auto split: `AUTO_SPLIT_TILES=True` scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then splits GT-positive tiles into source/val and the rest into holdout.
+- Auto split: `io.auto_split.enabled=true` scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then separates GT-positive tiles (for LOO folds) from inference-only tiles (no GT overlap).
 - GT presence scan uses cached vector intersection (no per-tile rasterization) and can run in parallel.
 - All downstream masks can be clipped to the SH buffer to enforce spatial priors.
 - Typical buffer: 8 m → at 0.2 m/pixel, buffer_pixels ≈ 40 (configurable).
@@ -61,7 +60,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
   - Threshold sweep via GPU/CPU batch metrics.
 - **XGBoost classifier** (`xdboost.py`):
   - Trains on patch features from A (pos/neg); optional hyperparam search by IoU on B (`hyperparam_search_xgb_iou`).
-  - Params grid in `config.XGB_PARAM_GRID`; uses logloss for training/early stop but selection by IoU on B after threshold sweep.
+  - Params grid in `config.yml` under `search.xgb.param_grid`; uses logloss for training/early stop but selection by IoU on B after threshold sweep.
 - **Champion selection**: Pick the model (kNN or XGB) with best IoU on B; its score map/threshold drive CRF.
 - **Median filter**: 3×3 applied after thresholding (kNN and XGB) to remove speckle.
 - **Bank sizes (typical)**: Positives ~6–10k patches; negatives capped at `MAX_NEG_BANK` (default 8000) to control memory.
@@ -78,37 +77,24 @@ This document gives a complete, self-contained description of the SegEdge zero-s
   - Grid search over softness/weights/sigmas; optional downsample; process-based parallelism.
 - **Shadow filter** (`shadow_filter.py`):
   - Under the CRF mask, compute weighted RGB sums; sweep thresholds to drop dark pixels; select best IoU.
-- **Continuity bridging** (`continuity.py`):
-  - Skeletonize CRF mask and connect nearby endpoints via shortest paths on a cost map from CRF posterior.
-  - Dilation restores a thin ribbon; optional spur pruning and small-component removal.
 - **Resize strategy**: Patch scores are resized to pixel grid with bilinear (order=1, anti_aliasing=True) before accumulation; overlaps averaged by weights.
 
 ---
 
-## 6) Configuration & Runtime Controls (config.py)
-- Paths: `SOURCE_TILE`, `TARGET_TILE`, `SOURCE_LABEL_RASTER`, `EVAL_GT_VECTOR`/`EVAL_GT_VECTORS`, `FEATURE_DIR`, `BANK_CACHE_DIR`, `PLOT_DIR`, `BEST_SETTINGS_PATH`.
-- Geometry: `BUFFER_M`, `TILE_SIZE`, `STRIDE`, `PATCH_SIZE`.
-- Auto split: `AUTO_SPLIT_TILES`, `TILES_DIR`, `TILE_GLOB`, `VAL_SPLIT_FRACTION`, `SPLIT_SEED`.
-- GT scan: `GT_PRESENCE_WORKERS`, `GT_PRESENCE_DOWNSAMPLE`.
-- Banks/Scoring: `NEG_ALPHA`, `POS_FRAC_THRESH`, `MAX_NEG_BANK`.
-- kNN grid: `K_VALUES`, `THRESHOLDS`, `USE_FP16_KNN`, `USE_GPU_THRESHOLD_METRICS`, batch sizes.
-- CRF grid: softness/weights/sigmas, `CRF_NUM_WORKERS`, `CRF_MAX_CONFIGS` (from main).
-- XGBoost: `XGB_USE_GPU`, `XGB_PARAM_GRID`, `XGB_NUM_BOOST_ROUND`, `XGB_EARLY_STOP`, `XGB_VERBOSE_EVAL`, `XGB_VAL_FRACTION`.
-- Shadow: `SHADOW_WEIGHT_SETS`, `SHADOW_THRESHOLDS`.
-- Roads penalty: `ROADS_MASK_PATH`, `ROADS_PENALTY_VALUES`.
-- Bridging: `ENABLE_GAP_BRIDGING`, `BRIDGE_MAX_GAP_PX`, `BRIDGE_MAX_PAIRS`, `BRIDGE_MAX_AVG_COST`, `BRIDGE_WIDTH_PX`, `BRIDGE_MIN_COMPONENT_PX`, `BRIDGE_SPUR_PRUNE_ITERS`.
-- Evaluation: `CLIP_GT_TO_BUFFER`.
-- Batching: `FEATURE_BATCH_SIZE` controls per-forward tile batching in prefetch.
-- Resume: `RESUME_RUN`, `RESUME_RUN_DIR` for continuing holdout inference.
-- Rolling unions: `UNION_BACKUP_EVERY`, `UNION_BACKUP_DIR`.
-- Plots: saved to `PLOT_DIR`, with overlays for kNN vs XGB vs GT, champion pre-CRF, and raw/CRF/shadow panels.
-- kNN neg weighting: `NEG_ALPHA` controls subtraction of negative bank similarity; set to 1.0 by default; lowering reduces penalty from negatives.
+## 6) Configuration & Runtime Controls (config.yml)
+- Runtime config source: `config.yml` loaded through `segedge/core/config_loader.py` into a typed object.
+- Main sections: `io`, `model`, `search`, `postprocess`, `runtime`.
+- kNN thresholds are stored as a range spec (`start`, `stop`, `count`) and expanded at load time.
+- Champion postprocess chain is `raw -> CRF -> shadow` (no continuity bridge stage).
+- Source augmentation is controlled via `model.augmentation` (flip and rotation options).
+- Timing log compaction is controlled via `runtime.compact_timing_logs`.
 
 ---
 
 ## 7) Code Architecture (modules)
 - `main.py`: CLI wrapper for the full pipeline (delegates to `segedge/pipeline/run.py`).
-- `config.py`: All tunable paths/hyperparams.
+- `config.yml`: All tunable paths/hyperparams.
+- `segedge/core/config_loader.py`: Typed YAML loader used by runtime modules.
 - `segedge/pipeline/run.py`: Orchestrator—loads data, builds banks, runs kNN + XGB, selects champion, plots, CRF, shadow filter, exports shapefiles/YAML.
 - `segedge/pipeline/common.py`: Shared helpers for entrypoints.
 - `segedge/core/timing_utils.py`: Timing helpers + debug flags.
@@ -163,23 +149,24 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 
 ## 10) How to Reproduce & Evaluate
 1. Ensure deps installed (PyTorch, transformers, xgboost, pydensecrf, rasterio, skimage, scipy).
-2. Set paths/hyperparams in `config.py` as needed.
+2. Set paths/hyperparams in `config.yml` as needed.
 3. Run `python main.py` from the repo root.
 4. Outputs:
     - Unified plots in `output/run_*/plots/` (`*_unified.png`). Holdout plots omit metric text.
     - Rolling unions in `output/run_*/shapes/unions/{knn|xgb|champion}/{raw|crf|shadow}/union.shp` (holdout-only).
     - Union backups every N tiles in `.../backups/` when `UNION_BACKUP_EVERY > 0`.
     - Processed tile log: `output/run_*/processed_tiles.jsonl` for resume.
+    - Rolling checkpoint: `output/run_*/rolling_best_setting.yml` updated during LOO folds and holdout inference.
     - Phase summary logs: mean/median metrics per phase and deltas for champion chain.
     - Best settings YAML in `output/run_*/best_settings.yml` (or `BEST_SETTINGS_PATH`).
     - Consolidated features: `FEATURE_DIR/{image_id}_features_full.npy`.
 5. Evaluation metric: IoU (primary), plus F1/P/R—computed on B; if `CLIP_GT_TO_BUFFER=True`, GT is masked to SH buffer so max IoU can reach 1.0.
 6. Champion selection: compare best IoU from kNN vs XGB (after median filter); champion feeds CRF; shadow filter runs after CRF.
-7. Tuning objective: configs are selected by weighted-mean IoU across validation tiles, weighted by GT-positive pixel count.
+7. Tuning objective: configs are selected with leave-one-out (LOO) folds over GT-positive tiles; fold metrics are summarized with weighted means plus mean/std across folds.
 - Plots to inspect:
-   - `*_unified.png`: RGB, source label raster, GT (if available), DINO similarity, kNN/XGB score heatmaps, masks, skeleton + endpoints.
+- `*_unified.png`: RGB, source label raster, GT (if available), DINO similarity, kNN/XGB score heatmaps, and phase masks.
 - Shapefiles to consume: rolling unions under `shapes/unions/` (kNN/XGB/Champion × raw/CRF/shadow).
-- `inference_best_setting.yml` records the frozen configs and weighted-mean metrics after validation.
+- `inference_best_setting.yml` records the selected configs, fold-level summaries, and mean/std metrics from the LOO process.
 - Typical run flow in main: build banks → prefetch B → kNN grid → fine-tune → median filter → XGB IoU search → overlays → CRF → shadow → exports.
 - Roads penalty: if configured, kNN/XGB score maps are multiplied by a roads mask penalty before thresholds/CRF.
 - Roads masking: per-tile rasterization using a cached spatial index (no global raster build).
@@ -197,7 +184,6 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - Metrics: `metrics_utils.compute_metrics_batch_gpu/cpu`, `compute_metrics`.
 - CRF: `crf_utils.crf_grid_search`, `refine_with_densecrf`.
 - Shadow: `shadow_filter.shadow_filter_grid`.
-- Continuity: `continuity.bridge_skeleton_gaps`, `continuity.skeletonize_with_endpoints`.
 - Plots: `plotting.save_unified_plot`.
 - Exports: `io_utils.append_mask_to_union_shapefile`, `backup_union_shapefile`, `count_shapefile_features`, `export_best_settings`.
 
@@ -205,14 +191,14 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 
 ## 12) Environment, Dependencies, and Run Recipes
 - Python: 3.12 (current environment). Key libs (install via pip/conda as available, no network inside sandbox):
-  - torch (with CUDA if available), transformers, xgboost, pydensecrf, rasterio, fiona, shapely, pyproj, skimage, scipy, matplotlib, numpy.
+  - torch (with CUDA if available), transformers, xgboost, pydensecrf, rasterio, fiona, shapely, pyproj, skimage, scipy, matplotlib, numpy, pyyaml.
   - If xgboost lacks GPU, it will auto-fall back to CPU (`tree_method=hist`).
 - Run recipes:
   - Full pipeline (kNN + XGB + CRF + shadow): `python main.py`
-  - Disable XGB search: set `XGB_PARAM_GRID = []` or `None` in `config.py`.
-  - Force CPU for XGB: `XGB_USE_GPU = False`.
+  - Disable XGB search: set `search.xgb.param_grid: []` in `config.yml`.
+  - Force CPU for XGB: set `search.xgb.use_gpu: false`.
   - Speed CRF: increase `downsample_factor` (in `crf_grid_search` call) or reduce `CRF_MAX_CONFIGS`.
-  - kNN-only comparison: set `XGB_PARAM_GRID = []` and inspect plots/shapefiles.
+  - kNN-only comparison: set `search.xgb.param_grid: []` and inspect plots/shapefiles.
 - Outputs to expect:
   - Plots in `PLOT_DIR`: `*_knn_vs_xgb.png`, `*_champion_pre_crf.png`, `*_raw_crf.png`.
   - Shapefiles: `_pred_mask_best_raw.shp`, `_pred_mask_best_crf.shp`, `_pred_mask_best_shadow.shp`.
@@ -233,7 +219,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 ## 14) Failure/Edge Case Handling
 - CRS issues: If IoU ~0, verify CRS logs (vector reproject warning) and SH buffer alignment.
 - Cache corruption: Delete affected tile features in `FEATURE_DIR` and rerun; banks will rebuild.
-- GPU OOM: Switch XGB to CPU (`XGB_USE_GPU=False`), reduce `num_boost_round`/`max_depth`; downsample CRF and reduce `CRF_MAX_CONFIGS`; ensure FP16 matmul is optional.
+- GPU OOM: Switch XGB to CPU (`search.xgb.use_gpu: false`), reduce `num_boost_round`/`max_depth`; downsample CRF and reduce `search.crf.max_configs`; ensure FP16 matmul is optional.
 - Missing features: If a tile .npy is absent, XGB scorer skips it; recompute features for completeness.
 
 ---
@@ -247,7 +233,7 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 
 ## 16) Exports & Schemas
 - Shapefiles: Polygons of predicted FG; schema has a single `id` int field; CRS matches the reference raster of Image B.
-- Inference best settings: Captures tuned configs, shadow/roads/bridge settings, counts, and weighted metrics for each phase.
+- Inference best settings: Captures tuned configs, shadow/roads settings, counts, and weighted metrics for each phase.
 - Feature consolidations: `{image_id}_features_full.npy` are (N_patches × C) arrays; useful for offline analysis or alternate classifiers.
 
 ---
