@@ -65,11 +65,11 @@ model:
     feat_context_radius: 0
     bank_erosion_radius: 0
     # Cap positives to keep XGB search tractable on CPU.
-    max_pos_bank: 120000
-    max_neg_bank: 8000
+    max_pos_bank: 100000
+    max_neg_bank: 1000000
 
   augmentation:
-    enabled: true
+    enabled: false
     include_identity: true
     horizontal_flip: true
     vertical_flip: true
