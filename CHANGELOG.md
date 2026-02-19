@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Fix LOO tile eligibility mismatch by requiring effective GT positives after optional SH-buffer clipping.
+- file touched: `segedge/pipeline/common.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Prevent tiles with vector overlap but zero post-clip GT from entering LOO train/val.
+- problems fixed: Auto split now performs a second eligibility pass and moves tiles with zero effective GT pixels to inference tiles, avoiding no-GT validation plots during training.
+
 - Description: Restore variable XGB threshold selection for tuning runs.
 - file touched: `config.yml`, `CHANGELOG.md`
 - reason: Keep threshold adaptive per fold/run instead of pinning to a single fixed value.

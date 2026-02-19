@@ -20,8 +20,10 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 ## Workflow
 1. Configure paths and hyperparameters in `config.yml`.
 2. If `io.auto_split.enabled=true`, tiles are discovered from `io.auto_split.tiles_dir`.
-   GT-overlap tiles are used for leave-one-out (LOO) folds (`training.loo`), and tiles
-   without GT are treated as inference-only holdout tiles.
+   GT-overlap tiles are first identified by vector intersection, then filtered to keep
+   only tiles with effective GT positives after optional SH-buffer clipping. These tiles
+   are used for leave-one-out (LOO) folds (`training.loo`), and remaining tiles are
+   treated as inference-only holdout tiles.
    Fold validation can use multi-tile windows (`training.loo.val_tiles_per_fold`) and
    skip low-signal folds by GT-positive threshold (`training.loo.low_gt_policy`).
 3. Training artifacts are built per fold from source tiles:

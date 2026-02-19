@@ -224,6 +224,65 @@ def _tiles_with_gt_chunk(
     return gt_tiles, holdout_tiles
 
 
+def _tile_effective_gt_pixels(
+    tile_path: str,
+    gt_vector_paths: list[str],
+    downsample_factor: int,
+) -> int:
+    """Return effective GT-positive pixel count for a tile.
+
+    Effective GT matches runtime evaluation behavior:
+    GT rasterized to tile, optionally clipped to SH buffer when configured.
+
+    Examples:
+        >>> callable(_tile_effective_gt_pixels)
+        True
+    """
+    ds = int(downsample_factor or 1)
+    img_b = load_dop20_image(tile_path, downsample_factor=ds)
+    labels_sh = reproject_labels_to_image(
+        tile_path, cfg.io.paths.source_label_raster, downsample_factor=ds
+    )
+    gt_mask = rasterize_vector_labels(gt_vector_paths, tile_path, downsample_factor=ds)
+    with rio_open(tile_path) as src:
+        pixel_size_m = abs(src.transform.a) * ds
+    buffer_m = float(cfg.model.priors.buffer_m)
+    buffer_pixels = int(round(buffer_m / pixel_size_m))
+    sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
+    if cfg.model.priors.clip_gt_to_buffer:
+        gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
+    else:
+        gt_mask_eval = gt_mask
+    # Keep shapes aligned with runtime expectation.
+    if gt_mask_eval.shape != img_b.shape[:2]:
+        return 0
+    return int(gt_mask_eval.sum())
+
+
+def _tiles_with_effective_gt_chunk(
+    tile_paths: list[str],
+    gt_vector_paths: list[str],
+    downsample_factor: int,
+) -> tuple[list[str], list[str]]:
+    """Split a chunk into effective-GT and no-effective-GT tiles.
+
+    Examples:
+        >>> callable(_tiles_with_effective_gt_chunk)
+        True
+    """
+    gt_tiles = []
+    holdout_tiles = []
+    for tile_path in tile_paths:
+        gt_pixels = _tile_effective_gt_pixels(
+            tile_path, gt_vector_paths, downsample_factor
+        )
+        if gt_pixels > 0:
+            gt_tiles.append(tile_path)
+        else:
+            holdout_tiles.append(tile_path)
+    return gt_tiles, holdout_tiles
+
+
 def resolve_tile_splits_from_gt(
     tiles_dir: str,
     tile_glob: str,
@@ -291,8 +350,9 @@ def resolve_tiles_from_gt_presence(
 ) -> tuple[list[str], list[str]]:
     """Resolve GT-positive and inference tiles from a directory.
 
-    Tiles with any GT overlap are returned as GT-positive tiles. Remaining tiles
-    are returned as inference tiles.
+    Tiles are first filtered by GT vector overlap. Then a second pass keeps only
+    tiles with effective GT positives in runtime evaluation space (post clipping
+    to SH buffer if configured). Remaining tiles are returned as inference tiles.
 
     Args:
         tiles_dir (str): Directory containing tiles.
@@ -390,6 +450,46 @@ def resolve_tiles_from_gt_presence(
             ):
                 gt_tiles.extend(gt_chunk)
                 inference_tiles.extend(holdout_chunk)
+
+    if gt_tiles:
+        logger.info(
+            "auto split: validating effective GT pixels on %s GT-overlap tiles",
+            len(gt_tiles),
+        )
+        filtered_gt_tiles = []
+        dropped_post_clip = 0
+        if num_workers <= 1:
+            for tile_path in gt_tiles:
+                if (
+                    _tile_effective_gt_pixels(
+                        tile_path, gt_vector_paths, downsample_factor
+                    )
+                    > 0
+                ):
+                    filtered_gt_tiles.append(tile_path)
+                else:
+                    inference_tiles.append(tile_path)
+                    dropped_post_clip += 1
+        else:
+            chunk_count = max(1, num_workers * 4)
+            chunk_size = max(1, (len(gt_tiles) + chunk_count - 1) // chunk_count)
+            gt_chunks = _chunk_tiles(gt_tiles, chunk_size)
+            with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                for gt_chunk, holdout_chunk in ex.map(
+                    _tiles_with_effective_gt_chunk,
+                    gt_chunks,
+                    repeat(gt_vector_paths),
+                    repeat(downsample_factor),
+                ):
+                    filtered_gt_tiles.extend(gt_chunk)
+                    inference_tiles.extend(holdout_chunk)
+                    dropped_post_clip += len(holdout_chunk)
+        if dropped_post_clip:
+            logger.info(
+                "auto split: excluded %s tiles with zero effective GT after clipping",
+                dropped_post_clip,
+            )
+        gt_tiles = filtered_gt_tiles
 
     return sorted(gt_tiles), sorted(inference_tiles)
 
