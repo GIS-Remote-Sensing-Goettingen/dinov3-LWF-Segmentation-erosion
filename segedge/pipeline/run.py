@@ -8,6 +8,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from typing import Callable
 
 import numpy as np
 import torch
@@ -84,6 +85,60 @@ CRF_MAX_CONFIGS = cfg.search.crf.max_configs
 logger = logging.getLogger(__name__)
 
 
+class TimeBudgetExceededError(RuntimeError):
+    """Raised when runtime budget is exceeded during tuning checkpoints."""
+
+
+def _build_loo_folds(
+    gt_tiles: list[str],
+    val_tiles_per_fold: int,
+) -> list[dict[str, list[str]]]:
+    """Build deterministic cyclic LOO-style folds with configurable val window.
+
+    Examples:
+        >>> folds = _build_loo_folds(["a", "b", "c", "d"], 2)
+        >>> len(folds), folds[0]["val_paths"], folds[0]["train_paths"]
+        (4, ['a', 'b'], ['c', 'd'])
+    """
+    n_tiles = len(gt_tiles)
+    if n_tiles == 0:
+        return []
+    val_count = max(1, int(val_tiles_per_fold))
+    if val_count >= n_tiles:
+        raise ValueError("training.loo.val_tiles_per_fold must be < number of GT tiles")
+    folds: list[dict[str, list[str]]] = []
+    for i in range(n_tiles):
+        val_paths = [gt_tiles[(i + j) % n_tiles] for j in range(val_count)]
+        val_set = set(val_paths)
+        train_paths = [p for p in gt_tiles if p not in val_set]
+        folds.append({"train_paths": train_paths, "val_paths": val_paths})
+    return folds
+
+
+def _aggregate_fold_metrics(results: list[dict]) -> dict[str, dict[str, float]]:
+    """Aggregate per-tile metrics in a fold using GT-weighted means.
+
+    Examples:
+        >>> rows = [{"metrics": {"champion_shadow": {"iou": 0.5, "_weight": 2.0}}}]
+        >>> out = _aggregate_fold_metrics(rows)
+        >>> round(out["champion_shadow"]["iou"], 3)
+        0.5
+    """
+    if not results:
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    metric_keys = ["iou", "f1", "precision", "recall"]
+    for phase in results[0]["metrics"].keys():
+        rows = [r["metrics"][phase] for r in results]
+        weights = [float(r.get("_weight", 0.0)) for r in rows]
+        out[phase] = {
+            k: _weighted_mean([r.get(k, 0.0) for r in rows], weights)
+            for k in metric_keys
+        }
+        out[phase]["_weight"] = float(sum(weights))
+    return out
+
+
 def tune_on_validation_multi(
     val_paths: list[str],
     gt_vector_paths: list[str],
@@ -101,6 +156,7 @@ def tune_on_validation_multi(
     stride: int,
     feature_dir: str | None,
     context_radius: int,
+    should_stop: Callable[[], bool] | None = None,
 ):
     """Tune hyperparameters using weighted-mean IoU across validation tiles.
 
@@ -121,6 +177,8 @@ def tune_on_validation_multi(
         stride (int): Tile stride.
         feature_dir (str | None): Feature cache directory.
         context_radius (int): Feature context radius.
+        should_stop (callable | None): Optional callback returning True when
+            tuning should stop (for time-budget cutover).
 
     Returns:
         dict: Tuned configurations and models.
@@ -132,9 +190,15 @@ def tune_on_validation_multi(
     if not val_paths:
         raise ValueError("VAL_TILES is empty.")
 
+    def _maybe_stop(stage: str) -> None:
+        if should_stop is not None and should_stop():
+            raise TimeBudgetExceededError(stage)
+
+    _maybe_stop("validation_context_build")
     val_contexts = []
     ds = int(cfg.model.backbone.resample_factor or 1)
     for val_path in val_paths:
+        _maybe_stop("validation_context_build")
         logger.info("tune: preparing validation tile %s", val_path)
         (
             img_b,
@@ -187,6 +251,7 @@ def tune_on_validation_multi(
     early_stop = cfg.search.xgb.early_stop
     verbose_eval = cfg.search.xgb.verbose_eval
     val_fraction = cfg.search.xgb.val_fraction
+    fixed_xgb_threshold = cfg.search.xgb.fixed_threshold
     if param_grid is None:
         param_grid = [None]
     feature_names = (
@@ -204,6 +269,7 @@ def tune_on_validation_multi(
 
     xgb_candidates = []
     for overrides in param_grid:
+        _maybe_stop("xgb_candidate_train")
         if overrides is None:
             bst = train_xgb_classifier(
                 X,
@@ -218,7 +284,11 @@ def tune_on_validation_multi(
             bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
                 X,
                 y,
-                [0.5],
+                (
+                    [float(fixed_xgb_threshold)]
+                    if fixed_xgb_threshold is not None
+                    else [0.5]
+                ),
                 val_contexts[0]["sh_buffer_mask"],
                 val_contexts[0]["gt_mask_eval"],
                 val_contexts[0]["img_b"],
@@ -247,11 +317,13 @@ def tune_on_validation_multi(
     best_champion_iou = None
 
     for penalty in roads_penalties:
+        _maybe_stop("roads_penalty_search")
         logger.info("tune: roads penalty=%s", penalty)
 
         # kNN tuning (weighted-mean IoU across val tiles)
         best_raw_config = None
         for k in cfg.search.knn.k_values:
+            _maybe_stop("knn_k_search")
             stats_by_thr = {
                 thr: {
                     "iou": 0.0,
@@ -264,6 +336,7 @@ def tune_on_validation_multi(
                 for thr in cfg.search.knn.thresholds.values
             }
             for ctx in val_contexts:
+                _maybe_stop("knn_tile_scoring")
                 logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
                 score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
                     img_b=ctx["img_b"],
@@ -340,7 +413,13 @@ def tune_on_validation_multi(
         # XGB tuning (weighted-mean IoU across val tiles)
         best_xgb_config = None
         best_bst = None
+        xgb_thresholds = (
+            [float(fixed_xgb_threshold)]
+            if fixed_xgb_threshold is not None
+            else list(cfg.search.knn.thresholds.values)
+        )
         for candidate in xgb_candidates:
+            _maybe_stop("xgb_candidate_eval")
             bst = candidate["bst"]
             params_used = candidate["params"]
             stats_by_thr = {
@@ -352,9 +431,10 @@ def tune_on_validation_multi(
                     "w": 0.0,
                     "n": 0,
                 }
-                for thr in cfg.search.knn.thresholds.values
+                for thr in xgb_thresholds
             }
             for ctx in val_contexts:
+                _maybe_stop("xgb_tile_scoring")
                 logger.info("tune: XGB scoring on %s", ctx["path"])
                 score_full = xgb_score_image_b(
                     ctx["img_b"],
@@ -374,7 +454,7 @@ def tune_on_validation_multi(
                 try:
                     metrics_list = compute_metrics_batch_gpu(
                         score_full,
-                        cfg.search.knn.thresholds.values,
+                        xgb_thresholds,
                         ctx["sh_buffer_mask"],
                         ctx["gt_mask_eval"],
                         device=device,
@@ -383,7 +463,7 @@ def tune_on_validation_multi(
                     torch.cuda.empty_cache()
                     metrics_list = compute_metrics_batch_cpu(
                         score_full,
-                        cfg.search.knn.thresholds.values,
+                        xgb_thresholds,
                         ctx["sh_buffer_mask"],
                         ctx["gt_mask_eval"],
                     )
@@ -457,6 +537,7 @@ def tune_on_validation_multi(
         else best_xgb_config["threshold"]
     )
     for ctx in val_contexts:
+        _maybe_stop("champion_score_rebuild")
         if champion_source == "raw":
             score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
                 img_b=ctx["img_b"],
@@ -506,6 +587,7 @@ def tune_on_validation_multi(
         for bxy in cfg.search.crf.bilateral_xy_std_values
         for brgb in cfg.search.crf.bilateral_rgb_std_values
     ]
+    _maybe_stop("crf_search")
     best_crf_cfg = None
     best_crf_iou = None
     crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
@@ -519,6 +601,7 @@ def tune_on_validation_multi(
     if num_workers > 1:
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
             for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
+                _maybe_stop("crf_search")
                 if best_crf_iou is None or med_iou > best_crf_iou:
                     best_crf_iou = med_iou
                     best_crf_cfg = {
@@ -531,6 +614,7 @@ def tune_on_validation_multi(
                     }
     else:
         for cand in crf_candidates:
+            _maybe_stop("crf_search")
             med_iou, _ = _eval_crf_config(cand)
             if best_crf_iou is None or med_iou > best_crf_iou:
                 best_crf_iou = med_iou
@@ -550,12 +634,14 @@ def tune_on_validation_multi(
     best_shadow_iou = None
     protect_scores = cfg.postprocess.shadow.protect_scores
     for weights in cfg.postprocess.shadow.weight_sets:
+        _maybe_stop("shadow_search")
         iou_by_key = {
             (thr, protect_score): {"sum": 0.0, "w": 0.0}
             for thr in cfg.postprocess.shadow.thresholds
             for protect_score in protect_scores
         }
         for ctx in val_contexts:
+            _maybe_stop("shadow_tile_scoring")
             logger.info("tune: shadow scoring on %s", ctx["path"])
             score_full = ctx["score_full"]
             thr_center = ctx["thr_center"]
@@ -839,12 +925,24 @@ def infer_on_holdout(
     metrics_champion_raw = compute_metrics(champ_raw_mask, gt_mask_eval)
     metrics_champion_crf = compute_metrics(best_crf_mask, gt_mask_eval)
     shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
+    proposal_cfg = cfg.postprocess.novel_proposals
+    if proposal_cfg.source == "champion_score":
+        proposal_threshold = (
+            float(proposal_cfg.score_threshold)
+            if proposal_cfg.score_threshold is not None
+            else champion_thr
+        )
+        proposal_source_mask = champion_score >= proposal_threshold
+    else:
+        proposal_source_mask = shadow_mask
     proposal_bundle = filter_novel_proposals(
         shadow_mask,
         labels_sh,
         champion_score,
         roads_mask,
         pixel_size_m,
+        sh_buffer_mask=sh_buffer_mask,
+        proposal_source_mask=proposal_source_mask,
     )
     proposal_candidate_mask = proposal_bundle["candidate_mask"]
     proposal_accepted_mask = proposal_bundle["accepted_mask"]
@@ -1206,11 +1304,18 @@ def main():
 
     context_radius = int(cfg.model.banks.feat_context_radius or 0)
     min_train_tiles = int(cfg.training.loo.min_train_tiles or 1)
+    val_tiles_per_fold = int(cfg.training.loo.val_tiles_per_fold or 1)
+    min_gt_positive_pixels = int(cfg.training.loo.min_gt_positive_pixels or 0)
+    low_gt_policy = str(cfg.training.loo.low_gt_policy)
 
     # Resolve required tile sets
     # ------------------------------------------------------------
     if not val_tiles:
         raise ValueError("no GT-positive tiles resolved for LOO training")
+    if len(val_tiles) <= val_tiles_per_fold:
+        raise ValueError(
+            "training.loo.val_tiles_per_fold must be < number of GT-positive tiles"
+        )
     if not holdout_tiles:
         logger.warning("no inference-only tiles resolved; skipping holdout inference")
 
@@ -1242,8 +1347,10 @@ def main():
     val_buffer_m = None
     val_pixel_size_m = None
     loo_fold_records = []
+    skipped_fold_records = []
     best_fold_runtime_artifacts: dict | None = None
     best_fold_runtime_iou = -1.0
+    tile_gt_positive_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------
     # LOO tuning/search: train on N-1 GT tiles, validate on the left-out tile
@@ -1259,25 +1366,68 @@ def main():
         budget_deadline_ts = compute_budget_deadline(
             budget_clock_start_ts, budget_hours
         )
+
+    def _is_budget_exceeded_now() -> bool:
+        return bool(budget_enabled and is_budget_exceeded(budget_deadline_ts))
+
+    def _get_tile_gt_positive_pixels(tile_path: str) -> int:
+        if tile_path in tile_gt_positive_cache:
+            return tile_gt_positive_cache[tile_path]
+        _, _, _, gt_mask_eval_tile, _, _, _ = load_b_tile_context(
+            tile_path, gt_vector_paths
+        )
+        pixels = int(gt_mask_eval_tile.sum()) if gt_mask_eval_tile is not None else 0
+        tile_gt_positive_cache[tile_path] = pixels
+        return pixels
+
+    loo_folds = _build_loo_folds(val_tiles, val_tiles_per_fold)
+    fold_total = len(loo_folds)
     _log_phase("START", "loo_validation_tuning")
-    for fold_idx, val_path in enumerate(val_tiles, start=1):
-        if budget_enabled and is_budget_exceeded(budget_deadline_ts):
+    for fold_idx, fold in enumerate(loo_folds, start=1):
+        train_tiles = list(fold["train_paths"])
+        val_paths = list(fold["val_paths"])
+        if _is_budget_exceeded_now():
             cutover_triggered = True
             cutover_stage = "loo_validation_tuning"
             logger.warning(
                 "time budget exceeded before LOO fold %s/%s; cutover_mode=%s",
                 fold_idx,
-                len(val_tiles),
+                fold_total,
                 budget_cutover_mode,
             )
             break
-        train_tiles = [p for p in gt_tiles if p != val_path]
+
+        fold_gt_positive_pixels = int(
+            sum(_get_tile_gt_positive_pixels(p) for p in val_paths)
+        )
+        if (
+            low_gt_policy == "skip_fold"
+            and fold_gt_positive_pixels < min_gt_positive_pixels
+        ):
+            logger.warning(
+                "LOO fold %s/%s skipped: val_tiles=%s gt_positive_pixels=%s < min_gt_positive_pixels=%s",
+                fold_idx,
+                fold_total,
+                len(val_paths),
+                fold_gt_positive_pixels,
+                min_gt_positive_pixels,
+            )
+            skipped_fold_records.append(
+                {
+                    "fold_index": int(fold_idx),
+                    "val_tiles": list(val_paths),
+                    "reason": "low_gt",
+                    "gt_positive_pixels": int(fold_gt_positive_pixels),
+                }
+            )
+            continue
+
         if not train_tiles:
             logger.warning(
                 "LOO fold %s has no train tiles; reusing validation tile as source",
                 fold_idx,
             )
-            train_tiles = [val_path]
+            train_tiles = [val_paths[0]]
         if len(train_tiles) < min_train_tiles:
             logger.warning(
                 "LOO fold %s train tiles=%s < min_train_tiles=%s",
@@ -1286,93 +1436,129 @@ def main():
                 min_train_tiles,
             )
         logger.info(
-            "LOO fold %s/%s train_tiles=%s val_tile=%s",
+            "LOO fold %s/%s train_tiles=%s val_tiles=%s",
             fold_idx,
-            len(val_tiles),
+            fold_total,
             len(train_tiles),
-            val_path,
+            len(val_paths),
         )
-        (
-            pos_bank_fold,
-            neg_bank_fold,
-            x_fold,
-            y_fold,
-            image_id_a_fold,
-            aug_modes_fold,
-            xgb_feature_stats_fold,
-            feature_layout_fold,
-        ) = build_training_artifacts_for_tiles(
-            train_tiles,
-            source_label_raster,
-            model,
-            processor,
-            device,
-            ps,
-            tile_size,
-            stride,
-            feature_cache_mode,
-            feature_dir,
-            context_radius,
-        )
-        tuned_fold = tune_on_validation_multi(
-            [val_path],
-            gt_vector_paths,
-            model,
-            processor,
-            device,
-            pos_bank_fold,
-            neg_bank_fold,
-            x_fold,
-            y_fold,
-            xgb_feature_stats_fold,
-            feature_layout_fold,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            context_radius,
-        )
-        fold_result = infer_on_holdout(
-            val_path,
-            gt_vector_paths,
-            model,
-            processor,
-            device,
-            pos_bank_fold,
-            neg_bank_fold,
-            tuned_fold,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            shape_dir,
-            context_radius,
-            plot_with_metrics=True,
-        )
-        if fold_result["gt_available"]:
-            _update_phase_metrics(val_phase_metrics, fold_result["metrics"])
-        if val_buffer_m is None:
-            val_buffer_m = fold_result["buffer_m"]
-            val_pixel_size_m = fold_result["pixel_size_m"]
+        try:
+            (
+                pos_bank_fold,
+                neg_bank_fold,
+                x_fold,
+                y_fold,
+                image_id_a_fold,
+                aug_modes_fold,
+                xgb_feature_stats_fold,
+                feature_layout_fold,
+            ) = build_training_artifacts_for_tiles(
+                train_tiles,
+                source_label_raster,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                feature_cache_mode,
+                feature_dir,
+                context_radius,
+            )
+            tuned_fold = tune_on_validation_multi(
+                val_paths,
+                gt_vector_paths,
+                model,
+                processor,
+                device,
+                pos_bank_fold,
+                neg_bank_fold,
+                x_fold,
+                y_fold,
+                xgb_feature_stats_fold,
+                feature_layout_fold,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                context_radius,
+                should_stop=_is_budget_exceeded_now,
+            )
+            fold_val_results: list[dict] = []
+            for val_path in val_paths:
+                if _is_budget_exceeded_now():
+                    raise TimeBudgetExceededError("fold_validation_inference")
+                fold_result = infer_on_holdout(
+                    val_path,
+                    gt_vector_paths,
+                    model,
+                    processor,
+                    device,
+                    pos_bank_fold,
+                    neg_bank_fold,
+                    tuned_fold,
+                    ps,
+                    tile_size,
+                    stride,
+                    feature_dir,
+                    shape_dir,
+                    context_radius,
+                    plot_with_metrics=True,
+                )
+                fold_val_results.append(fold_result)
+                if fold_result["gt_available"]:
+                    _update_phase_metrics(val_phase_metrics, fold_result["metrics"])
+                if val_buffer_m is None:
+                    val_buffer_m = fold_result["buffer_m"]
+                    val_pixel_size_m = fold_result["pixel_size_m"]
+        except TimeBudgetExceededError as exc:
+            cutover_triggered = True
+            cutover_stage = "loo_validation_tuning"
+            logger.warning(
+                "time budget exceeded during LOO fold %s/%s at stage=%s; stopping training",
+                fold_idx,
+                fold_total,
+                str(exc),
+            )
+            if loo_fold_records:
+                current_best_fold = max(
+                    loo_fold_records,
+                    key=lambda r: float(r["val_champion_shadow_iou"]),
+                )
+                write_rolling_best_config(
+                    rolling_best_settings_path,
+                    stage="loo_validation_tuning_cutover",
+                    tuned=current_best_fold["tuned"],
+                    fold_done=len(loo_fold_records),
+                    fold_total=fold_total,
+                    holdout_done=len(processed_tiles),
+                    holdout_total=len(holdout_tiles),
+                    best_fold=current_best_fold,
+                    time_budget=_current_time_budget_status(),
+                )
+            break
+
+        fold_metrics = _aggregate_fold_metrics(fold_val_results)
+        fold_iou = float(fold_metrics["champion_shadow"]["iou"])
+        val_tile_summary = ",".join(val_paths)
         loo_fold_records.append(
             {
                 "fold_index": fold_idx,
-                "val_tile": val_path,
+                "val_tile": val_tile_summary,
+                "val_tiles": list(val_paths),
                 "train_tiles_count": len(train_tiles),
-                "val_champion_shadow_iou": float(
-                    fold_result["metrics"]["champion_shadow"]["iou"]
-                ),
+                "val_champion_shadow_iou": fold_iou,
+                "val_gt_positive_pixels": int(fold_gt_positive_pixels),
                 "roads_penalty": float(tuned_fold.get("roads_penalty", 1.0)),
                 "champion_source": tuned_fold["champion_source"],
                 "best_raw_config": tuned_fold["best_raw_config"],
                 "best_xgb_config": tuned_fold["best_xgb_config"],
                 "best_crf_config": tuned_fold["best_crf_config"],
                 "best_shadow_config": tuned_fold["shadow_cfg"],
-                "phase_metrics": fold_result["metrics"],
+                "phase_metrics": fold_metrics,
                 "tuned": tuned_fold,
             }
         )
-        fold_iou = float(fold_result["metrics"]["champion_shadow"]["iou"])
         if fold_iou > best_fold_runtime_iou:
             best_fold_runtime_iou = fold_iou
             best_fold_runtime_artifacts = {
@@ -1392,7 +1578,7 @@ def main():
             stage="loo_validation_tuning",
             tuned=current_best_fold["tuned"],
             fold_done=len(loo_fold_records),
-            fold_total=len(val_tiles),
+            fold_total=fold_total,
             holdout_done=len(processed_tiles),
             holdout_total=len(holdout_tiles),
             best_fold=current_best_fold,
@@ -1403,6 +1589,10 @@ def main():
         if cutover_triggered:
             raise ValueError(
                 "time budget exhausted before any LOO fold completed; cannot continue to inference"
+            )
+        if skipped_fold_records:
+            raise ValueError(
+                "LOO tuning produced no fold records because all folds were skipped by low-GT policy"
             )
         raise ValueError("LOO tuning produced no fold records")
 
@@ -1522,7 +1712,7 @@ def main():
         stage=final_stage_name,
         tuned=tuned,
         fold_done=len(loo_fold_records),
-        fold_total=len(val_tiles),
+        fold_total=fold_total,
         holdout_done=len(processed_tiles),
         holdout_total=len(holdout_tiles),
         best_fold=best_fold,
@@ -1535,8 +1725,10 @@ def main():
             {
                 "fold_index": int(fold["fold_index"]),
                 "val_tile": fold["val_tile"],
+                "val_tiles": list(fold.get("val_tiles", [])),
                 "train_tiles_count": int(fold["train_tiles_count"]),
                 "val_champion_shadow_iou": float(fold["val_champion_shadow_iou"]),
+                "val_gt_positive_pixels": int(fold.get("val_gt_positive_pixels", 0)),
                 "roads_penalty": float(fold["roads_penalty"]),
                 "champion_source": fold["champion_source"],
                 "best_raw_config": fold["best_raw_config"],
@@ -1594,6 +1786,7 @@ def main():
             "use_gpu": cfg.search.xgb.use_gpu,
             "num_boost_round": cfg.search.xgb.num_boost_round,
             "early_stop": cfg.search.xgb.early_stop,
+            "fixed_threshold": cfg.search.xgb.fixed_threshold,
             "param_grid_size": len(cfg.search.xgb.param_grid),
         },
         "knn_search": {
@@ -1645,6 +1838,9 @@ def main():
             "roads_mask_path": cfg.io.paths.roads_mask_path,
             "novel_proposals": {
                 "enabled": cfg.postprocess.novel_proposals.enabled,
+                "search_scope": cfg.postprocess.novel_proposals.search_scope,
+                "source": cfg.postprocess.novel_proposals.source,
+                "score_threshold": cfg.postprocess.novel_proposals.score_threshold,
                 "min_area_px": cfg.postprocess.novel_proposals.min_area_px,
                 "min_length_m": cfg.postprocess.novel_proposals.min_length_m,
                 "max_width_m": cfg.postprocess.novel_proposals.max_width_m,
@@ -1667,10 +1863,15 @@ def main():
             "loo": {
                 "enabled": True,
                 "fold_count": len(loo_fold_export),
+                "fold_total": fold_total,
                 "min_train_tiles": min_train_tiles,
+                "val_tiles_per_fold": val_tiles_per_fold,
+                "min_gt_positive_pixels": min_gt_positive_pixels,
+                "low_gt_policy": low_gt_policy,
                 "selected_fold_index": int(best_fold["fold_index"]),
                 "selected_val_tile": best_fold["val_tile"],
                 "phase_metrics_mean_std": loo_phase_mean_std,
+                "skipped_folds": skipped_fold_records,
                 "folds": loo_fold_export,
             },
         },
@@ -1735,7 +1936,7 @@ def main():
             stage="holdout_inference",
             tuned=tuned,
             fold_done=len(loo_fold_records),
-            fold_total=len(val_tiles),
+            fold_total=fold_total,
             holdout_done=holdout_tiles_processed,
             holdout_total=len(holdout_tiles),
             best_fold=best_fold,

@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Restore variable XGB threshold selection for tuning runs.
+- file touched: `config.yml`, `CHANGELOG.md`
+- reason: Keep threshold adaptive per fold/run instead of pinning to a single fixed value.
+- problems fixed: Sets `search.xgb.fixed_threshold` back to `null`, so XGB threshold is selected from the configured threshold range.
+
+- Description: Add fast-stable LOO tuning defaults with fixed XGB threshold/config, low-GT fold skipping, and outside-SH proposal candidate scope.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`, `ARCHITECTURE.md`
+- reason: Reduce wasted tuning time on sparse folds, preserve best-so-far under 10h budget, and surface novel linear-feature proposals beyond SH bounds during inference.
+- problems fixed: Shrinks kNN/XGB search space, supports 2-tile validation folds, skips low-signal folds, applies budget checks at tuning checkpoints, pins XGB threshold when configured, and enables whole-tile proposal sourcing for accepted/rejected overlays and shapefiles.
+
 - Description: Add time-budget cutover that uses best-so-far settings and transitions to inference after budget expiry.
 - file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`, `ARCHITECTURE.md`
 - reason: Long LOO runs need a deterministic wall-clock stop point with interruption-safe continuation to inference.

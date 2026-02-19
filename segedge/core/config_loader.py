@@ -169,6 +169,9 @@ class LOOConfig:
 
     enabled: bool
     min_train_tiles: int
+    val_tiles_per_fold: int
+    min_gt_positive_pixels: int
+    low_gt_policy: str
 
 
 @dataclass
@@ -213,6 +216,7 @@ class XGBConfig:
     num_boost_round: int
     early_stop: int
     verbose_eval: int
+    fixed_threshold: float | None
     param_grid: list[dict[str, Any]]
 
 
@@ -246,6 +250,9 @@ class NovelProposalsConfig:
     """Shape-based proposal filtering for novel candidate objects."""
 
     enabled: bool
+    search_scope: str
+    source: str
+    score_threshold: float | None
     min_area_px: int
     min_length_m: float
     max_width_m: float
@@ -569,6 +576,14 @@ def load_config(path: str | Path | None = None) -> Config:
         loo=LOOConfig(
             enabled=bool(training_loo.get("enabled", True)),
             min_train_tiles=int(training_loo.get("min_train_tiles", 1)),
+            val_tiles_per_fold=int(training_loo.get("val_tiles_per_fold", 1)),
+            min_gt_positive_pixels=int(training_loo.get("min_gt_positive_pixels", 0)),
+            low_gt_policy=_as_enum(
+                training_loo.get("low_gt_policy", "keep_fold"),
+                "training.loo.low_gt_policy",
+                {"skip_fold", "keep_fold"},
+                "keep_fold",
+            ),
         )
     )
 
@@ -613,6 +628,11 @@ def load_config(path: str | Path | None = None) -> Config:
             num_boost_round=int(search_xgb["num_boost_round"]),
             early_stop=int(search_xgb["early_stop"]),
             verbose_eval=int(search_xgb["verbose_eval"]),
+            fixed_threshold=(
+                None
+                if search_xgb.get("fixed_threshold") is None
+                else float(search_xgb.get("fixed_threshold"))
+            ),
             param_grid=list(search_xgb["param_grid"]),
         ),
     )
@@ -639,6 +659,23 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
         novel_proposals=NovelProposalsConfig(
             enabled=bool(post_novel.get("enabled", False)),
+            search_scope=_as_enum(
+                post_novel.get("search_scope", "sh_buffer"),
+                "postprocess.novel_proposals.search_scope",
+                {"sh_buffer", "whole_tile"},
+                "sh_buffer",
+            ),
+            source=_as_enum(
+                post_novel.get("source", "champion_mask"),
+                "postprocess.novel_proposals.source",
+                {"champion_mask", "champion_score"},
+                "champion_mask",
+            ),
+            score_threshold=(
+                None
+                if post_novel.get("score_threshold") is None
+                else float(post_novel.get("score_threshold"))
+            ),
             min_area_px=int(post_novel.get("min_area_px", 100)),
             min_length_m=float(post_novel.get("min_length_m", 30.0)),
             max_width_m=float(post_novel.get("max_width_m", 12.0)),
@@ -710,6 +747,14 @@ def load_config(path: str | Path | None = None) -> Config:
     )
     if runtime_cfg.time_budget.hours <= 0:
         raise ValueError("'runtime.time_budget.hours' must be > 0")
+    if training_cfg.loo.val_tiles_per_fold <= 0:
+        raise ValueError("'training.loo.val_tiles_per_fold' must be > 0")
+    if training_cfg.loo.min_gt_positive_pixels < 0:
+        raise ValueError("'training.loo.min_gt_positive_pixels' must be >= 0")
+    if search_cfg.xgb.fixed_threshold is not None and not (
+        0.0 <= search_cfg.xgb.fixed_threshold <= 1.0
+    ):
+        raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
 
     return Config(
         io=IOConfig(paths=io_paths_cfg, auto_split=io_auto_split_cfg),

@@ -663,10 +663,33 @@ def filter_novel_proposals(
     score_map: np.ndarray,
     roads_mask: np.ndarray | None,
     pixel_size_m: float,
+    sh_buffer_mask: np.ndarray | None = None,
+    proposal_source_mask: np.ndarray | None = None,
 ) -> dict[str, object]:
-    """Filter candidate components using elongated-object heuristics."""
+    """Filter candidate components using elongated-object heuristics.
+
+    The candidate source can be supplied explicitly (for example thresholded
+    champion score across the whole tile), and scope can be constrained by
+    SH buffer or expanded to whole tile via config.
+
+    Examples:
+        >>> callable(filter_novel_proposals)
+        True
+    """
     p = cfg.postprocess.novel_proposals
-    candidate_mask = np.logical_and(champion_mask.astype(bool), ~(labels_sh > 0))
+    if proposal_source_mask is None:
+        source_mask = champion_mask.astype(bool)
+    else:
+        source_mask = proposal_source_mask.astype(bool)
+    if p.search_scope == "sh_buffer":
+        if sh_buffer_mask is None:
+            scope_mask = np.ones_like(source_mask, dtype=bool)
+        else:
+            scope_mask = sh_buffer_mask.astype(bool)
+    else:
+        scope_mask = np.ones_like(source_mask, dtype=bool)
+    candidate_mask = np.logical_and(source_mask, scope_mask)
+    candidate_mask = np.logical_and(candidate_mask, ~(labels_sh > 0))
     if not bool(p.enabled):
         return {
             "candidate_mask": candidate_mask,

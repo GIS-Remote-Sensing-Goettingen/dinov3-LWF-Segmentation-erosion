@@ -22,6 +22,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 2. If `io.auto_split.enabled=true`, tiles are discovered from `io.auto_split.tiles_dir`.
    GT-overlap tiles are used for leave-one-out (LOO) folds (`training.loo`), and tiles
    without GT are treated as inference-only holdout tiles.
+   Fold validation can use multi-tile windows (`training.loo.val_tiles_per_fold`) and
+   skip low-signal folds by GT-positive threshold (`training.loo.low_gt_policy`).
 3. Training artifacts are built per fold from source tiles:
    kNN banks and XGB data can fuse DINO patch embeddings with optional image patch cues
    (`model.hybrid_features`), with train-fold-only z-score stats for XGB.
@@ -32,7 +34,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    inference using best-so-far fold settings.
 7. In inference, champion masks can spawn `postprocess.novel_proposals` outside the
    incomplete source label raster; connected components are filtered by shape
-   heuristics and exported as accepted/rejected proposal layers.
+   heuristics and exported as accepted/rejected proposal layers. Candidate scope can be
+   SH-buffer constrained or whole-tile (`postprocess.novel_proposals.search_scope`).
 8. Plot outputs include unified phase panels plus diagnostics (core qualitative
    boundary errors, score+threshold histogram inset, disagreement/entropy maps,
    proposal overlays, and XGB DINO-channel importance).
