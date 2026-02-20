@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import logging
 import os
@@ -16,6 +17,7 @@ import yaml
 from pyproj import CRS, Transformer
 from scipy.ndimage import binary_erosion, distance_transform_edt
 from scipy.ndimage import label as ndi_label
+from scipy.ndimage import median_filter
 from shapely.geometry import box, mapping, shape
 from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
@@ -24,15 +26,28 @@ from skimage.transform import resize
 
 from ..core.config_loader import cfg
 from ..core.crf_utils import refine_with_densecrf
-from ..core.features import hybrid_feature_spec_hash
+from ..core.features import (
+    hybrid_feature_spec_hash,
+    prefetch_features_single_scale_image,
+)
 from ..core.io_utils import (
     build_sh_buffer_mask,
+    export_mask_to_shapefile,
     load_dop20_image,
     rasterize_vector_labels,
     reproject_labels_to_image,
 )
+from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.metrics_utils import compute_metrics
+from ..core.plotting import (
+    save_core_qualitative_plot,
+    save_disagreement_entropy_plot,
+    save_proposal_overlay_plot,
+    save_score_threshold_plot,
+    save_unified_plot,
+)
 from ..core.timing_utils import time_end, time_start
+from ..core.xdboost import xgb_score_image_b
 
 logger = logging.getLogger(__name__)
 
@@ -605,9 +620,13 @@ def _compute_component_shape_metrics(
             "circularity": 1.0,
             "mean_score": 0.0,
             "road_overlap": 0.0,
+            "centroid_row": 0.0,
+            "centroid_col": 0.0,
         }
 
     coords = np.argwhere(component_mask)
+    centroid_row = float(coords[:, 0].mean())
+    centroid_col = float(coords[:, 1].mean())
     pca_ratio = 1.0
     if coords.shape[0] >= 2:
         centered = coords.astype(np.float32) - coords.mean(axis=0, keepdims=True)
@@ -654,6 +673,8 @@ def _compute_component_shape_metrics(
         "circularity": float(circularity),
         "mean_score": float(mean_score),
         "road_overlap": float(road_overlap),
+        "centroid_row": centroid_row,
+        "centroid_col": centroid_col,
     }
 
 
@@ -690,9 +711,21 @@ def filter_novel_proposals(
         scope_mask = np.ones_like(source_mask, dtype=bool)
     candidate_mask = np.logical_and(source_mask, scope_mask)
     candidate_mask = np.logical_and(candidate_mask, ~(labels_sh > 0))
+
+    if sh_buffer_mask is None:
+        buffer_mask = np.zeros_like(candidate_mask, dtype=bool)
+    else:
+        buffer_mask = sh_buffer_mask.astype(bool)
+    candidate_inside = np.logical_and(candidate_mask, buffer_mask)
+    candidate_outside = np.logical_and(candidate_mask, ~buffer_mask)
     if not bool(p.enabled):
         return {
             "candidate_mask": candidate_mask,
+            "candidate_inside_mask": candidate_inside,
+            "candidate_outside_mask": candidate_outside,
+            "accepted_inside_mask": np.zeros_like(candidate_mask, dtype=bool),
+            "accepted_outside_mask": np.zeros_like(candidate_mask, dtype=bool),
+            "evaluated_outside_mask": np.zeros_like(candidate_mask, dtype=bool),
             "accepted_mask": np.zeros_like(candidate_mask, dtype=bool),
             "rejected_mask": np.zeros_like(candidate_mask, dtype=bool),
             "records": [],
@@ -703,15 +736,41 @@ def filter_novel_proposals(
     else:
         structure = np.ones((3, 3), dtype=np.uint8)
 
-    comp_labels, comp_count = ndi_label(
-        candidate_mask.astype(np.uint8), structure=structure
-    )
-    accepted_mask = np.zeros_like(candidate_mask, dtype=bool)
+    accepted_inside_mask = np.zeros_like(candidate_mask, dtype=bool)
+    accepted_outside_mask = np.zeros_like(candidate_mask, dtype=bool)
     rejected_mask = np.zeros_like(candidate_mask, dtype=bool)
     records = []
+    component_id = 0
 
-    for comp_id in range(1, int(comp_count) + 1):
-        comp = comp_labels == comp_id
+    # Inside-buffer components are accepted by policy.
+    inside_labels, inside_count = ndi_label(
+        candidate_inside.astype(np.uint8), structure=structure
+    )
+    for local_id in range(1, int(inside_count) + 1):
+        component_id += 1
+        comp = inside_labels == local_id
+        metrics = _compute_component_shape_metrics(
+            comp, score_map, roads_mask, pixel_size_m
+        )
+        accepted_inside_mask |= comp
+        records.append(
+            {
+                "component_id": int(component_id),
+                "accepted": True,
+                "acceptance_score": 1.0,
+                "reject_reasons": [],
+                "zone": "inside_buffer_auto",
+                **metrics,
+            }
+        )
+
+    outside_labels, outside_count = ndi_label(
+        candidate_outside.astype(np.uint8), structure=structure
+    )
+    total_checks = 8.0
+    for local_id in range(1, int(outside_count) + 1):
+        component_id += 1
+        comp = outside_labels == local_id
         metrics = _compute_component_shape_metrics(
             comp, score_map, roads_mask, pixel_size_m
         )
@@ -726,28 +785,42 @@ def filter_novel_proposals(
             "min_mean_score": metrics["mean_score"] >= float(p.min_mean_score),
             "max_road_overlap": metrics["road_overlap"] <= float(p.max_road_overlap),
         }
+        passed_checks = float(sum(1 for ok in checks.values() if ok))
+        acceptance_score = passed_checks / total_checks
         accepted = all(checks.values())
         if accepted:
-            accepted_mask |= comp
+            accepted_outside_mask |= comp
         else:
             rejected_mask |= comp
         records.append(
             {
-                "component_id": int(comp_id),
+                "component_id": int(component_id),
                 "accepted": bool(accepted),
+                "acceptance_score": float(acceptance_score),
                 "reject_reasons": [k for k, ok in checks.items() if not ok],
+                "zone": "outside_evaluated",
                 **metrics,
             }
         )
 
+    accepted_mask = np.logical_or(accepted_inside_mask, accepted_outside_mask)
+    evaluated_outside_mask = candidate_outside
     logger.info(
-        "novel proposals: candidates=%s accepted=%s rejected=%s",
-        int(comp_count),
+        "novel proposals: candidates=%s inside_auto=%s outside_eval=%s accepted=%s rejected=%s preset=%s",
+        int(component_id),
+        int(inside_count),
+        int(outside_count),
         int(sum(1 for r in records if r["accepted"])),
         int(sum(1 for r in records if not r["accepted"])),
+        str(getattr(p, "heuristic_preset", "unknown")),
     )
     return {
         "candidate_mask": candidate_mask,
+        "candidate_inside_mask": candidate_inside,
+        "candidate_outside_mask": candidate_outside,
+        "accepted_inside_mask": accepted_inside_mask,
+        "accepted_outside_mask": accepted_outside_mask,
+        "evaluated_outside_mask": evaluated_outside_mask,
         "accepted_mask": accepted_mask,
         "rejected_mask": rejected_mask,
         "records": records,
@@ -933,3 +1006,452 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         buffer_m,
         pixel_size_m,
     )
+
+
+def infer_on_holdout(
+    holdout_path: str,
+    gt_vector_paths: list[str] | None,
+    model,
+    processor,
+    device,
+    pos_bank: np.ndarray,
+    neg_bank: np.ndarray | None,
+    tuned: dict,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str | None,
+    shape_dir: str,
+    plot_dir: str,
+    context_radius: int,
+    plot_with_metrics: bool = True,
+) -> dict[str, object]:
+    """Run inference on a holdout tile using tuned settings.
+
+    Examples:
+        >>> callable(infer_on_holdout)
+        True
+    """
+    logger.info("inference: holdout tile %s", holdout_path)
+    (
+        img_b,
+        labels_sh,
+        _,
+        gt_mask_eval,
+        sh_buffer_mask,
+        buffer_m,
+        pixel_size_m,
+    ) = load_b_tile_context(holdout_path, gt_vector_paths)
+    gt_available = gt_mask_eval is not None
+    if gt_mask_eval is None:
+        logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
+        gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
+    gt_weight = float(gt_mask_eval.sum())
+    ds = int(cfg.model.backbone.resample_factor or 1)
+    roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
+    roads_penalty = float(tuned.get("roads_penalty", 1.0))
+    xgb_feature_stats = tuned.get("xgb_feature_stats")
+
+    image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
+    prefetched_b = prefetch_features_single_scale_image(
+        img_b,
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        None,
+        feature_dir,
+        image_id_b,
+    )
+
+    knn_enabled = bool(tuned.get("knn_enabled", cfg.search.knn.enabled))
+    xgb_enabled = bool(tuned.get("xgb_enabled", cfg.search.xgb.enabled))
+    crf_enabled = bool(tuned.get("crf_enabled", cfg.search.crf.enabled))
+    if not (knn_enabled or xgb_enabled):
+        raise ValueError("both kNN and XGB are disabled for inference")
+
+    score_knn_raw = None
+    score_knn = None
+    score_xgb = None
+    mask_knn = np.zeros_like(sh_buffer_mask, dtype=bool)
+    mask_xgb = np.zeros_like(sh_buffer_mask, dtype=bool)
+    knn_thr = None
+    xgb_thr = None
+    metrics_knn = None
+    metrics_xgb = None
+
+    if knn_enabled:
+        k = int(tuned["best_raw_config"]["k"])
+        knn_thr = float(tuned["best_raw_config"]["threshold"])
+        score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
+            img_b,
+            pos_bank,
+            neg_bank,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            k=k,
+            aggregate_layers=None,
+            feature_dir=feature_dir,
+            image_id=image_id_b,
+            neg_alpha=cfg.model.banks.neg_alpha,
+            prefetched_tiles=prefetched_b,
+            use_fp16_matmul=cfg.search.knn.use_fp16_knn,
+            context_radius=context_radius,
+        )
+        score_knn_raw = score_knn
+        score_knn = _apply_roads_penalty(score_knn, roads_mask, roads_penalty)
+        mask_knn = (score_knn >= knn_thr) & sh_buffer_mask
+        mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
+        metrics_knn = compute_metrics(mask_knn, gt_mask_eval)
+
+    bst = tuned.get("bst")
+    if xgb_enabled:
+        if bst is None:
+            raise ValueError("XGB enabled but no trained booster is available")
+        xgb_thr = float(tuned["best_xgb_config"]["threshold"])
+        score_xgb = xgb_score_image_b(
+            img_b,
+            bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            image_id_b,
+            prefetched_tiles=prefetched_b,
+            context_radius=context_radius,
+            xgb_feature_stats=xgb_feature_stats,
+        )
+        score_xgb = _apply_roads_penalty(score_xgb, roads_mask, roads_penalty)
+        mask_xgb = (score_xgb >= xgb_thr) & sh_buffer_mask
+        mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
+        metrics_xgb = compute_metrics(mask_xgb, gt_mask_eval)
+
+    champion_source = str(tuned.get("champion_source", "xgb"))
+    if knn_enabled and xgb_enabled:
+        if champion_source not in {"raw", "xgb"}:
+            champion_source = "xgb"
+    elif xgb_enabled:
+        champion_source = "xgb"
+    else:
+        champion_source = "raw"
+
+    if champion_source == "raw":
+        active_stream = "knn"
+        active_label = "kNN"
+        champion_score = score_knn
+        champion_thr = float(knn_thr)
+        active_raw_mask = mask_knn
+    else:
+        active_stream = "xgb"
+        active_label = "XGB"
+        champion_score = score_xgb
+        champion_thr = float(xgb_thr)
+        active_raw_mask = mask_xgb
+
+    crf_cfg = dict(tuned.get("best_crf_config") or {})
+    crf_cfg_enabled = bool(crf_cfg.get("enabled", True)) and crf_enabled
+    mask_crf_knn = mask_knn
+    mask_crf_xgb = mask_xgb
+    if crf_cfg_enabled:
+        if knn_enabled and score_knn is not None and knn_thr is not None:
+            mask_crf_knn = refine_with_densecrf(
+                img_b,
+                score_knn,
+                knn_thr,
+                sh_buffer_mask,
+                prob_softness=crf_cfg["prob_softness"],
+                n_iters=5,
+                pos_w=crf_cfg["pos_w"],
+                pos_xy_std=crf_cfg["pos_xy_std"],
+                bilateral_w=crf_cfg["bilateral_w"],
+                bilateral_xy_std=crf_cfg["bilateral_xy_std"],
+                bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+            )
+        if xgb_enabled and score_xgb is not None and xgb_thr is not None:
+            mask_crf_xgb = refine_with_densecrf(
+                img_b,
+                score_xgb,
+                xgb_thr,
+                sh_buffer_mask,
+                prob_softness=crf_cfg["prob_softness"],
+                n_iters=5,
+                pos_w=crf_cfg["pos_w"],
+                pos_xy_std=crf_cfg["pos_xy_std"],
+                bilateral_w=crf_cfg["bilateral_w"],
+                bilateral_xy_std=crf_cfg["bilateral_xy_std"],
+                bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+            )
+
+    best_crf_mask = mask_crf_knn if champion_source == "raw" else mask_crf_xgb
+    active_crf_mask = best_crf_mask
+
+    shadow_cfg = tuned["shadow_cfg"]
+    protect_score = shadow_cfg.get("protect_score")
+    shadow_mask = _apply_shadow_filter(
+        img_b,
+        best_crf_mask,
+        shadow_cfg["weights"],
+        shadow_cfg["threshold"],
+        champion_score,
+        protect_score,
+    )
+    shadow_mask_knn = (
+        _apply_shadow_filter(
+            img_b,
+            mask_crf_knn,
+            shadow_cfg["weights"],
+            shadow_cfg["threshold"],
+            score_knn,
+            protect_score,
+        )
+        if knn_enabled and score_knn is not None
+        else np.zeros_like(sh_buffer_mask, dtype=bool)
+    )
+    shadow_mask_xgb = (
+        _apply_shadow_filter(
+            img_b,
+            mask_crf_xgb,
+            shadow_cfg["weights"],
+            shadow_cfg["threshold"],
+            score_xgb,
+            protect_score,
+        )
+        if xgb_enabled and score_xgb is not None
+        else np.zeros_like(sh_buffer_mask, dtype=bool)
+    )
+    active_shadow_mask = shadow_mask
+
+    metrics_champion_raw = compute_metrics(active_raw_mask, gt_mask_eval)
+    metrics_champion_crf = compute_metrics(active_crf_mask, gt_mask_eval)
+    shadow_metrics = compute_metrics(active_shadow_mask, gt_mask_eval)
+    metrics_knn_crf = (
+        compute_metrics(mask_crf_knn, gt_mask_eval) if knn_enabled else None
+    )
+    metrics_knn_shadow = (
+        compute_metrics(shadow_mask_knn, gt_mask_eval) if knn_enabled else None
+    )
+    metrics_xgb_crf = (
+        compute_metrics(mask_crf_xgb, gt_mask_eval) if xgb_enabled else None
+    )
+    metrics_xgb_shadow = (
+        compute_metrics(shadow_mask_xgb, gt_mask_eval) if xgb_enabled else None
+    )
+
+    proposal_cfg = cfg.postprocess.novel_proposals
+    if proposal_cfg.source == "champion_score":
+        proposal_threshold = (
+            float(proposal_cfg.score_threshold)
+            if proposal_cfg.score_threshold is not None
+            else champion_thr
+        )
+        proposal_source_mask = champion_score >= proposal_threshold
+    else:
+        proposal_source_mask = active_shadow_mask
+    proposal_bundle = filter_novel_proposals(
+        active_shadow_mask,
+        labels_sh,
+        champion_score,
+        roads_mask,
+        pixel_size_m,
+        sh_buffer_mask=sh_buffer_mask,
+        proposal_source_mask=proposal_source_mask,
+    )
+    proposal_candidate_mask = proposal_bundle["candidate_mask"]
+    proposal_candidate_inside_mask = proposal_bundle.get(
+        "candidate_inside_mask", np.zeros_like(proposal_candidate_mask, dtype=bool)
+    )
+    proposal_evaluated_outside_mask = proposal_bundle.get(
+        "evaluated_outside_mask", np.zeros_like(proposal_candidate_mask, dtype=bool)
+    )
+    proposal_accepted_inside_mask = proposal_bundle.get(
+        "accepted_inside_mask", np.zeros_like(proposal_candidate_mask, dtype=bool)
+    )
+    proposal_accepted_outside_mask = proposal_bundle.get(
+        "accepted_outside_mask", np.zeros_like(proposal_candidate_mask, dtype=bool)
+    )
+    proposal_accepted_mask = proposal_bundle["accepted_mask"]
+    proposal_rejected_mask = proposal_bundle["rejected_mask"]
+
+    if cfg.postprocess.novel_proposals.enabled:
+        proposal_dir = os.path.join(shape_dir, "proposals")
+        os.makedirs(proposal_dir, exist_ok=True)
+        if proposal_accepted_mask.any():
+            export_mask_to_shapefile(
+                proposal_accepted_mask,
+                holdout_path,
+                os.path.join(proposal_dir, f"{image_id_b}_accepted.shp"),
+            )
+        if proposal_rejected_mask.any():
+            export_mask_to_shapefile(
+                proposal_rejected_mask,
+                holdout_path,
+                os.path.join(proposal_dir, f"{image_id_b}_rejected.shp"),
+            )
+        records_path = os.path.join(proposal_dir, f"{image_id_b}_proposal_records.csv")
+        records = list(proposal_bundle.get("records", []))
+        with open(records_path, "w", newline="", encoding="utf-8") as fh:
+            fieldnames = [
+                "component_id",
+                "zone",
+                "accepted",
+                "acceptance_score",
+                "reject_reasons",
+                "area_px",
+                "length_m",
+                "mean_width_m",
+                "skeleton_ratio",
+                "pca_ratio",
+                "circularity",
+                "mean_score",
+                "road_overlap",
+                "centroid_row",
+                "centroid_col",
+            ]
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for rec in records:
+                writer.writerow(
+                    {
+                        "component_id": rec.get("component_id"),
+                        "zone": rec.get("zone"),
+                        "accepted": rec.get("accepted"),
+                        "acceptance_score": rec.get("acceptance_score"),
+                        "reject_reasons": ";".join(rec.get("reject_reasons", [])),
+                        "area_px": rec.get("area_px"),
+                        "length_m": rec.get("length_m"),
+                        "mean_width_m": rec.get("mean_width_m"),
+                        "skeleton_ratio": rec.get("skeleton_ratio"),
+                        "pca_ratio": rec.get("pca_ratio"),
+                        "circularity": rec.get("circularity"),
+                        "mean_score": rec.get("mean_score"),
+                        "road_overlap": rec.get("road_overlap"),
+                        "centroid_row": rec.get("centroid_row"),
+                        "centroid_col": rec.get("centroid_col"),
+                    }
+                )
+
+    if active_stream == "xgb":
+        champion_prob = np.clip(champion_score.astype(np.float32), 1e-6, 1.0 - 1e-6)
+    else:
+        s = champion_score.astype(np.float32)
+        smin = float(np.min(s))
+        smax = float(np.max(s))
+        champion_prob = (s - smin) / (smax - smin + 1e-8)
+        champion_prob = np.clip(champion_prob, 1e-6, 1.0 - 1e-6)
+    disagreement_map = None
+    if score_xgb is not None and score_knn is not None:
+        disagreement_map = np.abs(score_xgb - score_knn).astype(np.float32)
+    entropy_map = (
+        -champion_prob * np.log(champion_prob)
+        - (1.0 - champion_prob) * np.log(1.0 - champion_prob)
+    ).astype(np.float32)
+
+    metrics_map: dict[str, dict[str, float]] = {
+        "champion_raw": metrics_champion_raw,
+        "champion_crf": metrics_champion_crf,
+        "champion_shadow": shadow_metrics,
+    }
+    if knn_enabled:
+        metrics_map["knn_raw"] = metrics_knn
+        metrics_map["knn_crf"] = metrics_knn_crf
+        metrics_map["knn_shadow"] = metrics_knn_shadow
+    if xgb_enabled:
+        metrics_map["xgb_raw"] = metrics_xgb
+        metrics_map["xgb_crf"] = metrics_xgb_crf
+        metrics_map["xgb_shadow"] = metrics_xgb_shadow
+    metrics_map = {
+        key: {**metrics, "_weight": gt_weight} for key, metrics in metrics_map.items()
+    }
+
+    plot_masks = {
+        f"{active_stream}_raw": active_raw_mask,
+        f"{active_stream}_crf": active_crf_mask,
+        f"{active_stream}_shadow": active_shadow_mask,
+    }
+    plot_score_maps = {active_stream: champion_score}
+
+    save_unified_plot(
+        img_b=img_b,
+        gt_mask=gt_mask_eval,
+        labels_sh=labels_sh,
+        masks=plot_masks,
+        metrics=metrics_map,
+        plot_dir=plot_dir,
+        image_id_b=image_id_b,
+        show_metrics=plot_with_metrics and gt_available,
+        gt_available=gt_available,
+        similarity_map=score_knn_raw if active_stream == "knn" else None,
+        score_maps=plot_score_maps,
+        proposal_masks={
+            "candidate": proposal_candidate_mask,
+            "accepted": proposal_accepted_mask,
+            "rejected": proposal_rejected_mask,
+        },
+    )
+    save_core_qualitative_plot(
+        img_b=img_b,
+        gt_mask=gt_mask_eval,
+        pred_mask=active_shadow_mask,
+        plot_dir=plot_dir,
+        image_id_b=image_id_b,
+        gt_available=gt_available,
+        model_label=active_label,
+        boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
+    )
+    save_score_threshold_plot(
+        score_map=champion_score,
+        threshold=champion_thr,
+        sh_buffer_mask=sh_buffer_mask,
+        plot_dir=plot_dir,
+        image_id_b=image_id_b,
+        model_label=active_label,
+    )
+    save_disagreement_entropy_plot(
+        disagreement_map=disagreement_map,
+        entropy_map=entropy_map,
+        candidate_mask=proposal_candidate_mask,
+        plot_dir=plot_dir,
+        image_id_b=image_id_b,
+        model_label=active_label,
+    )
+    save_proposal_overlay_plot(
+        img_b=img_b,
+        prediction_mask=active_shadow_mask,
+        candidate_mask=proposal_candidate_mask,
+        candidate_inside_mask=proposal_candidate_inside_mask,
+        evaluated_outside_mask=proposal_evaluated_outside_mask,
+        accepted_mask=proposal_accepted_mask,
+        accepted_inside_mask=proposal_accepted_inside_mask,
+        accepted_outside_mask=proposal_accepted_outside_mask,
+        rejected_mask=proposal_rejected_mask,
+        proposal_records=proposal_bundle.get("records"),
+        plot_dir=plot_dir,
+        image_id_b=image_id_b,
+        model_label=active_label,
+        accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
+        reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
+        candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
+    )
+
+    return_masks = {
+        f"{active_stream}_raw": active_raw_mask,
+        f"{active_stream}_crf": active_crf_mask,
+        f"{active_stream}_shadow": active_shadow_mask,
+    }
+    return {
+        "ref_path": holdout_path,
+        "image_id": image_id_b,
+        "active_stream": active_stream,
+        "gt_available": gt_available,
+        "buffer_m": buffer_m,
+        "pixel_size_m": pixel_size_m,
+        "metrics": metrics_map,
+        "masks": return_masks,
+        "proposals": proposal_bundle,
+    }

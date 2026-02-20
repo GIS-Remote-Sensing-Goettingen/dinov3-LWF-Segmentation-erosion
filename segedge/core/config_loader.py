@@ -185,6 +185,7 @@ class TrainingConfig:
 class KNNConfig:
     """kNN search settings."""
 
+    enabled: bool
     k_values: list[int]
     thresholds: ThresholdRangeConfig
     use_fp16_knn: bool
@@ -197,6 +198,7 @@ class KNNConfig:
 class CRFConfig:
     """CRF search settings."""
 
+    enabled: bool
     prob_softness_values: list[float]
     pos_w_values: list[float]
     pos_xy_std_values: list[float]
@@ -211,6 +213,7 @@ class CRFConfig:
 class XGBConfig:
     """XGBoost search settings."""
 
+    enabled: bool
     use_gpu: bool
     val_fraction: float
     num_boost_round: int
@@ -250,6 +253,7 @@ class NovelProposalsConfig:
     """Shape-based proposal filtering for novel candidate objects."""
 
     enabled: bool
+    heuristic_preset: str
     search_scope: str
     source: str
     score_threshold: float | None
@@ -371,6 +375,52 @@ def _as_rgb_tuple(value: Any, field_name: str) -> tuple[int, int, int]:
     if any(v < 0 or v > 255 for v in rgb):
         raise ValueError(f"'{field_name}' values must be in [0, 255]")
     return rgb
+
+
+def _novel_heuristic_defaults(preset: str) -> dict[str, float]:
+    presets: dict[str, dict[str, float]] = {
+        "strict": {
+            "min_area_px": 200,
+            "min_length_m": 35.0,
+            "max_width_m": 10.0,
+            "min_skeleton_ratio": 12.0,
+            "min_pca_ratio": 3.5,
+            "max_circularity": 0.2,
+            "min_mean_score": 0.4,
+            "max_road_overlap": 0.4,
+        },
+        "balanced": {
+            "min_area_px": 150,
+            "min_length_m": 30.0,
+            "max_width_m": 12.0,
+            "min_skeleton_ratio": 10.0,
+            "min_pca_ratio": 3.0,
+            "max_circularity": 0.3,
+            "min_mean_score": 0.33,
+            "max_road_overlap": 0.5,
+        },
+        "lax": {
+            "min_area_px": 100,
+            "min_length_m": 20.0,
+            "max_width_m": 18.0,
+            "min_skeleton_ratio": 6.0,
+            "min_pca_ratio": 2.0,
+            "max_circularity": 0.45,
+            "min_mean_score": 0.2,
+            "max_road_overlap": 0.8,
+        },
+        "very_lax": {
+            "min_area_px": 50,
+            "min_length_m": 10.0,
+            "max_width_m": 30.0,
+            "min_skeleton_ratio": 3.0,
+            "min_pca_ratio": 1.3,
+            "max_circularity": 0.7,
+            "min_mean_score": 0.1,
+            "max_road_overlap": 1.0,
+        },
+    }
+    return presets[preset]
 
 
 def _load_hybrid_block(
@@ -589,6 +639,7 @@ def load_config(path: str | Path | None = None) -> Config:
 
     search_cfg = SearchConfig(
         knn=KNNConfig(
+            enabled=bool(search_knn.get("enabled", True)),
             k_values=[int(v) for v in search_knn["k_values"]],
             thresholds=_load_thresholds(
                 _require_mapping(search_knn["thresholds"], "search.knn.thresholds")
@@ -599,6 +650,7 @@ def load_config(path: str | Path | None = None) -> Config:
             threshold_cpu_batch_size=int(search_knn["threshold_cpu_batch_size"]),
         ),
         crf=CRFConfig(
+            enabled=bool(search_crf.get("enabled", True)),
             prob_softness_values=_as_list_float(
                 search_crf["prob_softness_values"], "search.crf.prob_softness_values"
             ),
@@ -623,6 +675,7 @@ def load_config(path: str | Path | None = None) -> Config:
             max_configs=int(search_crf["max_configs"]),
         ),
         xgb=XGBConfig(
+            enabled=bool(search_xgb.get("enabled", True)),
             use_gpu=bool(search_xgb["use_gpu"]),
             val_fraction=float(search_xgb["val_fraction"]),
             num_boost_round=int(search_xgb["num_boost_round"]),
@@ -642,6 +695,14 @@ def load_config(path: str | Path | None = None) -> Config:
         raise ValueError("'postprocess.shadow.weight_sets' must be a list")
     weight_sets = [tuple(float(x) for x in row) for row in weight_sets_raw]
 
+    heuristic_preset = _as_enum(
+        post_novel.get("heuristic_preset", "balanced"),
+        "postprocess.novel_proposals.heuristic_preset",
+        {"strict", "balanced", "lax", "very_lax"},
+        "balanced",
+    )
+    heuristic_defaults = _novel_heuristic_defaults(heuristic_preset)
+
     postprocess_cfg = PostprocessConfig(
         shadow=ShadowConfig(
             weight_sets=weight_sets,
@@ -659,6 +720,7 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
         novel_proposals=NovelProposalsConfig(
             enabled=bool(post_novel.get("enabled", False)),
+            heuristic_preset=heuristic_preset,
             search_scope=_as_enum(
                 post_novel.get("search_scope", "sh_buffer"),
                 "postprocess.novel_proposals.search_scope",
@@ -676,14 +738,34 @@ def load_config(path: str | Path | None = None) -> Config:
                 if post_novel.get("score_threshold") is None
                 else float(post_novel.get("score_threshold"))
             ),
-            min_area_px=int(post_novel.get("min_area_px", 100)),
-            min_length_m=float(post_novel.get("min_length_m", 30.0)),
-            max_width_m=float(post_novel.get("max_width_m", 12.0)),
-            min_skeleton_ratio=float(post_novel.get("min_skeleton_ratio", 8.0)),
-            min_pca_ratio=float(post_novel.get("min_pca_ratio", 3.0)),
-            max_circularity=float(post_novel.get("max_circularity", 0.6)),
-            min_mean_score=float(post_novel.get("min_mean_score", 0.5)),
-            max_road_overlap=float(post_novel.get("max_road_overlap", 1.0)),
+            min_area_px=int(
+                post_novel.get("min_area_px", heuristic_defaults["min_area_px"])
+            ),
+            min_length_m=float(
+                post_novel.get("min_length_m", heuristic_defaults["min_length_m"])
+            ),
+            max_width_m=float(
+                post_novel.get("max_width_m", heuristic_defaults["max_width_m"])
+            ),
+            min_skeleton_ratio=float(
+                post_novel.get(
+                    "min_skeleton_ratio", heuristic_defaults["min_skeleton_ratio"]
+                )
+            ),
+            min_pca_ratio=float(
+                post_novel.get("min_pca_ratio", heuristic_defaults["min_pca_ratio"])
+            ),
+            max_circularity=float(
+                post_novel.get("max_circularity", heuristic_defaults["max_circularity"])
+            ),
+            min_mean_score=float(
+                post_novel.get("min_mean_score", heuristic_defaults["min_mean_score"])
+            ),
+            max_road_overlap=float(
+                post_novel.get(
+                    "max_road_overlap", heuristic_defaults["max_road_overlap"]
+                )
+            ),
             connectivity=int(post_novel.get("connectivity", 2)),
         ),
     )
@@ -751,6 +833,10 @@ def load_config(path: str | Path | None = None) -> Config:
         raise ValueError("'training.loo.val_tiles_per_fold' must be > 0")
     if training_cfg.loo.min_gt_positive_pixels < 0:
         raise ValueError("'training.loo.min_gt_positive_pixels' must be >= 0")
+    if not (search_cfg.knn.enabled or search_cfg.xgb.enabled):
+        raise ValueError(
+            "at least one model must be enabled: search.knn.enabled or search.xgb.enabled"
+        )
     if search_cfg.xgb.fixed_threshold is not None and not (
         0.0 <= search_cfg.xgb.fixed_threshold <= 1.0
     ):

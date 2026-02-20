@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Switch inference visual outputs to single active model panels (XGB or kNN), split plots by stage, and upgrade novel proposal acceptance/diagnostics.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `segedge/core/plotting.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Reduce confusion from multi-stream inference plots, allow disabling kNN/CRF cleanly, and make proposal decisions auditable.
+- problems fixed: Adds model enable toggles (`search.knn.enabled`, `search.xgb.enabled`, `search.crf.enabled`), writes validation/inference plots into separate folders, annotates proposal overlays with `component_id:acceptance_score`, auto-accepts proposal components inside SH buffer while evaluating outside components heuristically, and exports per-component proposal records with rejection reasons.
+
 - Description: Fix LOO tile eligibility mismatch by requiring effective GT positives after optional SH-buffer clipping.
 - file touched: `segedge/pipeline/common.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
 - reason: Prevent tiles with vector overlap but zero post-clip GT from entering LOO train/val.

@@ -128,6 +128,7 @@ training:
 
 search:
   knn:
+    enabled: false
     k_values: [15, 25, 30]
     thresholds:
       start: 0.01
@@ -139,6 +140,7 @@ search:
     threshold_cpu_batch_size: 32
 
   crf:
+    enabled: false
     prob_softness_values: [0.03]
     pos_w_values: [4.0]
     pos_xy_std_values: [3.0]
@@ -149,10 +151,11 @@ search:
     max_configs: 1
 
   xgb:
+    enabled: true
     # Set true only when CUDA-enabled XGBoost is installed.
     use_gpu: false
     val_fraction: 0.3
-    num_boost_round: 600
+    num_boost_round: 50
     early_stop: 40
     verbose_eval: 50
     # null -> evaluate XGB thresholds from search.knn.thresholds.
@@ -187,20 +190,22 @@ postprocess:
   # Propose new elongated LWF objects outside the incomplete label raster.
   novel_proposals:
     enabled: true
+    # strict | balanced | lax | very_lax
+    heuristic_preset: lax
     # whole_tile allows suggestions outside SH raster bounds.
     search_scope: whole_tile
     # champion_score | champion_mask
     source: champion_score
     # null -> use champion threshold per tile.
     score_threshold: null
-    min_area_px: 150
-    min_length_m: 30.0
-    max_width_m: 12.0
-    min_skeleton_ratio: 10.0
-    min_pca_ratio: 3.0
-    max_circularity: 0.5
-    min_mean_score: 0.55
-    max_road_overlap: 0.5
+    min_area_px: 100
+    min_length_m: 20.0
+    max_width_m: 18.0
+    min_skeleton_ratio: 6.0
+    min_pca_ratio: 2.0
+    max_circularity: 0.45
+    min_mean_score: 0.2
+    max_road_overlap: 0.8
     connectivity: 2
 
 runtime:

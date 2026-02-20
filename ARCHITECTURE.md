@@ -38,6 +38,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    incomplete source label raster; connected components are filtered by shape
    heuristics and exported as accepted/rejected proposal layers. Candidate scope can be
    SH-buffer constrained or whole-tile (`postprocess.novel_proposals.search_scope`).
-8. Plot outputs include unified phase panels plus diagnostics (core qualitative
-   boundary errors, score+threshold histogram inset, disagreement/entropy maps,
-   proposal overlays, and XGB DINO-channel importance).
+8. Plot outputs are split by stage under `plots/validation/` and
+   `plots/inference/`. Inference panels render only the active model stream
+   (XGB or kNN), and proposal overlays include per-component IDs with 0-1
+   acceptance scores. Proposal filtering auto-accepts components inside the SH
+   buffer and applies shape heuristics only to outside-buffer components.

@@ -62,6 +62,7 @@ def save_core_qualitative_plot(
     plot_dir: str,
     image_id_b: str,
     gt_available: bool,
+    model_label: str,
     boundary_band_px: int = 10,
 ) -> None:
     """Save core 4-panel qualitative diagnostics for one tile.
@@ -87,7 +88,7 @@ def save_core_qualitative_plot(
 
     pred_overlay = _overlay_mask(img_b, pred_mask, (255, 0, 0), alpha=0.45)
     axs[1, 0].imshow(pred_overlay)
-    axs[1, 0].set_title("Prediction overlay")
+    axs[1, 0].set_title(f"{model_label} prediction overlay")
     axs[1, 0].axis("off")
 
     if gt_available:
@@ -124,6 +125,7 @@ def save_score_threshold_plot(
     sh_buffer_mask: np.ndarray,
     plot_dir: str,
     image_id_b: str,
+    model_label: str,
 ) -> None:
     """Save score heatmap with threshold and in/out buffer histogram inset.
 
@@ -134,7 +136,7 @@ def save_score_threshold_plot(
     fig, ax = plt.subplots(1, 1, figsize=(10, 8))
     norm = _normalize_heatmap(score_map)
     im = ax.imshow(norm, cmap="magma")
-    ax.set_title(f"Champion score map (thr={threshold:.3f})")
+    ax.set_title(f"{model_label} score map (thr={threshold:.3f})")
     ax.axis("off")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.ax.set_ylabel("normalized score", rotation=270, labelpad=12)
@@ -163,11 +165,12 @@ def save_score_threshold_plot(
 
 
 def save_disagreement_entropy_plot(
-    disagreement_map: np.ndarray,
+    disagreement_map: np.ndarray | None,
     entropy_map: np.ndarray,
     candidate_mask: np.ndarray,
     plot_dir: str,
     image_id_b: str,
+    model_label: str,
 ) -> None:
     """Save disagreement and entropy diagnostics with proposal contour.
 
@@ -175,11 +178,13 @@ def save_disagreement_entropy_plot(
         >>> callable(save_disagreement_entropy_plot)
         True
     """
-    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-    panels = [
-        ("|score_xgb - score_knn|", disagreement_map, "inferno"),
-        ("Entropy uncertainty", entropy_map, "viridis"),
-    ]
+    has_disagreement = disagreement_map is not None
+    fig, axs = plt.subplots(1, 2 if has_disagreement else 1, figsize=(14, 6))
+    axs = np.atleast_1d(axs)
+    panels = []
+    if has_disagreement:
+        panels.append(("|score_xgb - score_knn|", disagreement_map, "inferno"))
+    panels.append((f"{model_label} entropy uncertainty", entropy_map, "viridis"))
     for ax, (title, data, cmap) in zip(axs, panels, strict=True):
         norm = _normalize_heatmap(data)
         im = ax.imshow(norm, cmap=cmap)
@@ -205,10 +210,16 @@ def save_proposal_overlay_plot(
     img_b: np.ndarray,
     prediction_mask: np.ndarray,
     candidate_mask: np.ndarray,
+    candidate_inside_mask: np.ndarray,
+    evaluated_outside_mask: np.ndarray,
     accepted_mask: np.ndarray,
+    accepted_inside_mask: np.ndarray,
+    accepted_outside_mask: np.ndarray,
     rejected_mask: np.ndarray,
+    proposal_records: list[dict] | None,
     plot_dir: str,
     image_id_b: str,
+    model_label: str,
     accept_rgb: tuple[int, int, int],
     reject_rgb: tuple[int, int, int],
     candidate_rgb: tuple[int, int, int],
@@ -219,15 +230,74 @@ def save_proposal_overlay_plot(
         >>> callable(save_proposal_overlay_plot)
         True
     """
+    inside_auto_rgb = (30, 200, 30)
     overlay = _overlay_mask(img_b, prediction_mask, (255, 0, 0), alpha=0.3)
-    overlay = _overlay_mask(overlay, candidate_mask, candidate_rgb, alpha=0.25)
-    overlay = _overlay_mask(overlay, rejected_mask, reject_rgb, alpha=0.65)
-    overlay = _overlay_mask(overlay, accepted_mask, accept_rgb, alpha=0.65)
+    overlay = _overlay_mask(overlay, candidate_mask, candidate_rgb, alpha=0.18)
+    overlay = _overlay_mask(overlay, evaluated_outside_mask, candidate_rgb, alpha=0.24)
+    overlay = _overlay_mask(overlay, accepted_inside_mask, inside_auto_rgb, alpha=0.72)
+    overlay = _overlay_mask(overlay, accepted_outside_mask, accept_rgb, alpha=0.72)
+    overlay = _overlay_mask(overlay, accepted_mask, accept_rgb, alpha=0.15)
+    overlay = _overlay_mask(overlay, rejected_mask, reject_rgb, alpha=0.72)
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     ax.imshow(overlay)
-    ax.set_title("Proposals: accepted vs rejected")
+    inside_auto_count = (
+        int(
+            sum(
+                1
+                for r in (proposal_records or [])
+                if r.get("zone") == "inside_buffer_auto"
+            )
+        )
+        if proposal_records is not None
+        else 0
+    )
+    accepted_count = (
+        int(sum(1 for r in (proposal_records or []) if bool(r.get("accepted"))))
+        if proposal_records is not None
+        else 0
+    )
+    rejected_count = (
+        int(sum(1 for r in (proposal_records or []) if not bool(r.get("accepted"))))
+        if proposal_records is not None
+        else 0
+    )
+    ax.set_title(
+        (
+            f"Proposals ({model_label}) inside-auto={inside_auto_count} "
+            f"accepted={accepted_count} rejected={rejected_count}"
+        )
+    )
     ax.axis("off")
+    if proposal_records:
+        for rec in proposal_records:
+            row = rec.get("centroid_row")
+            col = rec.get("centroid_col")
+            score = rec.get("acceptance_score")
+            comp_id = rec.get("component_id")
+            if row is None or col is None or score is None or comp_id is None:
+                continue
+            if not np.isfinite(float(row)) or not np.isfinite(float(col)):
+                continue
+            label = f"{int(comp_id)}:{float(score):.2f}"
+            is_accepted = bool(rec.get("accepted", False))
+            text_color = "white" if is_accepted else "black"
+            bbox_face = (0.0, 0.0, 0.0, 0.55) if is_accepted else (1.0, 1.0, 1.0, 0.65)
+            ax.text(
+                float(col),
+                float(row),
+                label,
+                color=text_color,
+                fontsize=10,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                bbox={
+                    "facecolor": bbox_face,
+                    "edgecolor": "none",
+                    "boxstyle": "round,pad=0.18",
+                },
+            )
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     out_path = os.path.join(plot_dir, f"{image_id_b}_proposal_overlay.png")

@@ -13,7 +13,6 @@ from typing import Callable
 import numpy as np
 import torch
 import yaml
-from scipy.ndimage import median_filter
 
 from ..core.config_loader import cfg
 from ..core.crf_utils import refine_with_densecrf
@@ -28,24 +27,15 @@ from ..core.io_utils import (
     consolidate_features_for_image,
     count_shapefile_features,
     export_best_settings,
-    export_mask_to_shapefile,
 )
 from ..core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ..core.logging_utils import setup_logging
 from ..core.metrics_utils import (
-    compute_metrics,
     compute_metrics_batch_cpu,
     compute_metrics_batch_gpu,
     compute_oracle_upper_bound,
 )
-from ..core.plotting import (
-    save_core_qualitative_plot,
-    save_dino_channel_importance_plot,
-    save_disagreement_entropy_plot,
-    save_proposal_overlay_plot,
-    save_score_threshold_plot,
-    save_unified_plot,
-)
+from ..core.plotting import save_dino_channel_importance_plot
 from ..core.timing_utils import time_end, time_start
 from ..core.xdboost import (
     hyperparam_search_xgb_iou,
@@ -59,7 +49,6 @@ from .common import (
 )
 from .runtime_utils import (
     _apply_roads_penalty,
-    _apply_shadow_filter,
     _eval_crf_config,
     _get_roads_mask,
     _init_crf_parallel,
@@ -69,7 +58,7 @@ from .runtime_utils import (
     _weighted_mean,
     build_time_budget_status,
     compute_budget_deadline,
-    filter_novel_proposals,
+    infer_on_holdout,
     is_budget_exceeded,
     load_b_tile_context,
     parse_utc_iso_to_epoch,
@@ -81,6 +70,9 @@ from .runtime_utils import (
 # Config-driven flags
 USE_FP16_KNN = cfg.search.knn.use_fp16_knn
 CRF_MAX_CONFIGS = cfg.search.crf.max_configs
+KNN_ENABLED = bool(cfg.search.knn.enabled)
+XGB_ENABLED = bool(cfg.search.xgb.enabled)
+CRF_ENABLED = bool(cfg.search.crf.enabled)
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +181,8 @@ def tune_on_validation_multi(
     """
     if not val_paths:
         raise ValueError("VAL_TILES is empty.")
+    if not (KNN_ENABLED or XGB_ENABLED):
+        raise ValueError("both kNN and XGB are disabled; enable at least one model")
 
     def _maybe_stop(stage: str) -> None:
         if should_stop is not None and should_stop():
@@ -268,49 +262,50 @@ def tune_on_validation_multi(
         feature_names = None
 
     xgb_candidates = []
-    for overrides in param_grid:
-        _maybe_stop("xgb_candidate_train")
-        if overrides is None:
-            bst = train_xgb_classifier(
-                X,
-                y,
-                use_gpu=use_gpu_xgb,
-                num_boost_round=num_boost_round,
-                verbose_eval=verbose_eval,
-                feature_names=feature_names,
-            )
-            params_used = None
-        else:
-            bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
-                X,
-                y,
-                (
-                    [float(fixed_xgb_threshold)]
-                    if fixed_xgb_threshold is not None
-                    else [0.5]
-                ),
-                val_contexts[0]["sh_buffer_mask"],
-                val_contexts[0]["gt_mask_eval"],
-                val_contexts[0]["img_b"],
-                ps,
-                tile_size,
-                stride,
-                feature_dir,
-                val_contexts[0]["image_id"],
-                prefetched_tiles=val_contexts[0]["prefetched_b"],
-                device=device,
-                use_gpu=use_gpu_xgb,
-                param_grid=[overrides],
-                num_boost_round=num_boost_round,
-                val_fraction=val_fraction,
-                early_stopping_rounds=early_stop,
-                verbose_eval=verbose_eval,
-                seed=42,
-                context_radius=context_radius,
-                xgb_feature_stats=xgb_feature_stats,
-                feature_names=feature_names,
-            )
-        xgb_candidates.append({"bst": bst, "params": params_used})
+    if XGB_ENABLED:
+        for overrides in param_grid:
+            _maybe_stop("xgb_candidate_train")
+            if overrides is None:
+                bst = train_xgb_classifier(
+                    X,
+                    y,
+                    use_gpu=use_gpu_xgb,
+                    num_boost_round=num_boost_round,
+                    verbose_eval=verbose_eval,
+                    feature_names=feature_names,
+                )
+                params_used = None
+            else:
+                bst, params_used, _, _, _ = hyperparam_search_xgb_iou(
+                    X,
+                    y,
+                    (
+                        [float(fixed_xgb_threshold)]
+                        if fixed_xgb_threshold is not None
+                        else [0.5]
+                    ),
+                    val_contexts[0]["sh_buffer_mask"],
+                    val_contexts[0]["gt_mask_eval"],
+                    val_contexts[0]["img_b"],
+                    ps,
+                    tile_size,
+                    stride,
+                    feature_dir,
+                    val_contexts[0]["image_id"],
+                    prefetched_tiles=val_contexts[0]["prefetched_b"],
+                    device=device,
+                    use_gpu=use_gpu_xgb,
+                    param_grid=[overrides],
+                    num_boost_round=num_boost_round,
+                    val_fraction=val_fraction,
+                    early_stopping_rounds=early_stop,
+                    verbose_eval=verbose_eval,
+                    seed=42,
+                    context_radius=context_radius,
+                    xgb_feature_stats=xgb_feature_stats,
+                    feature_names=feature_names,
+                )
+            xgb_candidates.append({"bst": bst, "params": params_used})
 
     roads_penalties = [float(p) for p in cfg.postprocess.roads.penalty_values]
     best_bundle = None
@@ -322,196 +317,205 @@ def tune_on_validation_multi(
 
         # kNN tuning (weighted-mean IoU across val tiles)
         best_raw_config = None
-        for k in cfg.search.knn.k_values:
-            _maybe_stop("knn_k_search")
-            stats_by_thr = {
-                thr: {
-                    "iou": 0.0,
-                    "f1": 0.0,
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "w": 0.0,
-                    "n": 0,
-                }
-                for thr in cfg.search.knn.thresholds.values
-            }
-            for ctx in val_contexts:
-                _maybe_stop("knn_tile_scoring")
-                logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
-                score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
-                    img_b=ctx["img_b"],
-                    pos_bank=pos_bank,
-                    neg_bank=neg_bank,
-                    model=model,
-                    processor=processor,
-                    device=device,
-                    ps=ps,
-                    tile_size=tile_size,
-                    stride=stride,
-                    k=k,
-                    aggregate_layers=None,
-                    feature_dir=feature_dir,
-                    image_id=ctx["image_id"],
-                    neg_alpha=cfg.model.banks.neg_alpha,
-                    prefetched_tiles=ctx["prefetched_b"],
-                    use_fp16_matmul=USE_FP16_KNN,
-                    context_radius=context_radius,
-                )
-                score_full = _apply_roads_penalty(
-                    score_full, ctx["roads_mask"], penalty
-                )
-                try:
-                    metrics_list = compute_metrics_batch_gpu(
-                        score_full,
-                        cfg.search.knn.thresholds.values,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                        device=device,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    metrics_list = compute_metrics_batch_cpu(
-                        score_full,
-                        cfg.search.knn.thresholds.values,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                    )
-                weight = float(ctx["gt_weight"])
-                for m in metrics_list:
-                    stats = stats_by_thr[m["threshold"]]
-                    stats["iou"] += float(m["iou"]) * weight
-                    stats["f1"] += float(m["f1"]) * weight
-                    stats["precision"] += float(m["precision"]) * weight
-                    stats["recall"] += float(m["recall"]) * weight
-                    stats["w"] += weight
-                    stats["n"] += 1
-
-            for thr, stats in stats_by_thr.items():
-                if stats["w"] > 0:
-                    weighted_iou = float(stats["iou"] / stats["w"])
-                    weighted_f1 = float(stats["f1"] / stats["w"])
-                    weighted_precision = float(stats["precision"] / stats["w"])
-                    weighted_recall = float(stats["recall"] / stats["w"])
-                else:
-                    weighted_iou = 0.0
-                    weighted_f1 = 0.0
-                    weighted_precision = 0.0
-                    weighted_recall = 0.0
-                if best_raw_config is None or weighted_iou > best_raw_config["iou"]:
-                    best_raw_config = {
-                        "k": k,
-                        "threshold": thr,
-                        "source": "raw",
-                        "iou": weighted_iou,
-                        "f1": weighted_f1,
-                        "precision": weighted_precision,
-                        "recall": weighted_recall,
+        if KNN_ENABLED:
+            for k in cfg.search.knn.k_values:
+                _maybe_stop("knn_k_search")
+                stats_by_thr = {
+                    thr: {
+                        "iou": 0.0,
+                        "f1": 0.0,
+                        "precision": 0.0,
+                        "recall": 0.0,
+                        "w": 0.0,
+                        "n": 0,
                     }
-        if best_raw_config is None:
-            raise ValueError("kNN tuning returned no results")
+                    for thr in cfg.search.knn.thresholds.values
+                }
+                for ctx in val_contexts:
+                    _maybe_stop("knn_tile_scoring")
+                    logger.info("tune: kNN scoring on %s (k=%s)", ctx["path"], k)
+                    score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
+                        img_b=ctx["img_b"],
+                        pos_bank=pos_bank,
+                        neg_bank=neg_bank,
+                        model=model,
+                        processor=processor,
+                        device=device,
+                        ps=ps,
+                        tile_size=tile_size,
+                        stride=stride,
+                        k=k,
+                        aggregate_layers=None,
+                        feature_dir=feature_dir,
+                        image_id=ctx["image_id"],
+                        neg_alpha=cfg.model.banks.neg_alpha,
+                        prefetched_tiles=ctx["prefetched_b"],
+                        use_fp16_matmul=USE_FP16_KNN,
+                        context_radius=context_radius,
+                    )
+                    score_full = _apply_roads_penalty(
+                        score_full, ctx["roads_mask"], penalty
+                    )
+                    try:
+                        metrics_list = compute_metrics_batch_gpu(
+                            score_full,
+                            cfg.search.knn.thresholds.values,
+                            ctx["sh_buffer_mask"],
+                            ctx["gt_mask_eval"],
+                            device=device,
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        metrics_list = compute_metrics_batch_cpu(
+                            score_full,
+                            cfg.search.knn.thresholds.values,
+                            ctx["sh_buffer_mask"],
+                            ctx["gt_mask_eval"],
+                        )
+                    weight = float(ctx["gt_weight"])
+                    for m in metrics_list:
+                        stats = stats_by_thr[m["threshold"]]
+                        stats["iou"] += float(m["iou"]) * weight
+                        stats["f1"] += float(m["f1"]) * weight
+                        stats["precision"] += float(m["precision"]) * weight
+                        stats["recall"] += float(m["recall"]) * weight
+                        stats["w"] += weight
+                        stats["n"] += 1
+
+                for thr, stats in stats_by_thr.items():
+                    if stats["w"] > 0:
+                        weighted_iou = float(stats["iou"] / stats["w"])
+                        weighted_f1 = float(stats["f1"] / stats["w"])
+                        weighted_precision = float(stats["precision"] / stats["w"])
+                        weighted_recall = float(stats["recall"] / stats["w"])
+                    else:
+                        weighted_iou = 0.0
+                        weighted_f1 = 0.0
+                        weighted_precision = 0.0
+                        weighted_recall = 0.0
+                    if best_raw_config is None or weighted_iou > best_raw_config["iou"]:
+                        best_raw_config = {
+                            "k": k,
+                            "threshold": thr,
+                            "source": "raw",
+                            "iou": weighted_iou,
+                            "f1": weighted_f1,
+                            "precision": weighted_precision,
+                            "recall": weighted_recall,
+                        }
+            if best_raw_config is None:
+                raise ValueError("kNN tuning returned no results")
 
         # XGB tuning (weighted-mean IoU across val tiles)
         best_xgb_config = None
         best_bst = None
-        xgb_thresholds = (
-            [float(fixed_xgb_threshold)]
-            if fixed_xgb_threshold is not None
-            else list(cfg.search.knn.thresholds.values)
-        )
-        for candidate in xgb_candidates:
-            _maybe_stop("xgb_candidate_eval")
-            bst = candidate["bst"]
-            params_used = candidate["params"]
-            stats_by_thr = {
-                thr: {
-                    "iou": 0.0,
-                    "f1": 0.0,
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "w": 0.0,
-                    "n": 0,
+        if XGB_ENABLED:
+            xgb_thresholds = (
+                [float(fixed_xgb_threshold)]
+                if fixed_xgb_threshold is not None
+                else list(cfg.search.knn.thresholds.values)
+            )
+            for candidate in xgb_candidates:
+                _maybe_stop("xgb_candidate_eval")
+                bst = candidate["bst"]
+                params_used = candidate["params"]
+                stats_by_thr = {
+                    thr: {
+                        "iou": 0.0,
+                        "f1": 0.0,
+                        "precision": 0.0,
+                        "recall": 0.0,
+                        "w": 0.0,
+                        "n": 0,
+                    }
+                    for thr in xgb_thresholds
                 }
-                for thr in xgb_thresholds
-            }
-            for ctx in val_contexts:
-                _maybe_stop("xgb_tile_scoring")
-                logger.info("tune: XGB scoring on %s", ctx["path"])
-                score_full = xgb_score_image_b(
-                    ctx["img_b"],
-                    bst,
-                    ps,
-                    tile_size,
-                    stride,
-                    feature_dir,
-                    ctx["image_id"],
-                    prefetched_tiles=ctx["prefetched_b"],
-                    context_radius=context_radius,
-                    xgb_feature_stats=xgb_feature_stats,
-                )
-                score_full = _apply_roads_penalty(
-                    score_full, ctx["roads_mask"], penalty
-                )
-                try:
-                    metrics_list = compute_metrics_batch_gpu(
-                        score_full,
-                        xgb_thresholds,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
-                        device=device,
+                for ctx in val_contexts:
+                    _maybe_stop("xgb_tile_scoring")
+                    logger.info("tune: XGB scoring on %s", ctx["path"])
+                    score_full = xgb_score_image_b(
+                        ctx["img_b"],
+                        bst,
+                        ps,
+                        tile_size,
+                        stride,
+                        feature_dir,
+                        ctx["image_id"],
+                        prefetched_tiles=ctx["prefetched_b"],
+                        context_radius=context_radius,
+                        xgb_feature_stats=xgb_feature_stats,
                     )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    metrics_list = compute_metrics_batch_cpu(
-                        score_full,
-                        xgb_thresholds,
-                        ctx["sh_buffer_mask"],
-                        ctx["gt_mask_eval"],
+                    score_full = _apply_roads_penalty(
+                        score_full, ctx["roads_mask"], penalty
                     )
-                weight = float(ctx["gt_weight"])
-                for m in metrics_list:
-                    stats = stats_by_thr[m["threshold"]]
-                    stats["iou"] += float(m["iou"]) * weight
-                    stats["f1"] += float(m["f1"]) * weight
-                    stats["precision"] += float(m["precision"]) * weight
-                    stats["recall"] += float(m["recall"]) * weight
-                    stats["w"] += weight
-                    stats["n"] += 1
+                    try:
+                        metrics_list = compute_metrics_batch_gpu(
+                            score_full,
+                            xgb_thresholds,
+                            ctx["sh_buffer_mask"],
+                            ctx["gt_mask_eval"],
+                            device=device,
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        metrics_list = compute_metrics_batch_cpu(
+                            score_full,
+                            xgb_thresholds,
+                            ctx["sh_buffer_mask"],
+                            ctx["gt_mask_eval"],
+                        )
+                    weight = float(ctx["gt_weight"])
+                    for m in metrics_list:
+                        stats = stats_by_thr[m["threshold"]]
+                        stats["iou"] += float(m["iou"]) * weight
+                        stats["f1"] += float(m["f1"]) * weight
+                        stats["precision"] += float(m["precision"]) * weight
+                        stats["recall"] += float(m["recall"]) * weight
+                        stats["w"] += weight
+                        stats["n"] += 1
 
-            for thr, stats in stats_by_thr.items():
-                if stats["w"] > 0:
-                    weighted_iou = float(stats["iou"] / stats["w"])
-                    weighted_f1 = float(stats["f1"] / stats["w"])
-                    weighted_precision = float(stats["precision"] / stats["w"])
-                    weighted_recall = float(stats["recall"] / stats["w"])
-                else:
-                    weighted_iou = 0.0
-                    weighted_f1 = 0.0
-                    weighted_precision = 0.0
-                    weighted_recall = 0.0
-                cand = {
-                    "k": -1,
-                    "threshold": thr,
-                    "source": "xgb",
-                    "iou": weighted_iou,
-                    "f1": weighted_f1,
-                    "precision": weighted_precision,
-                    "recall": weighted_recall,
-                    "params": params_used,
-                }
-                if best_xgb_config is None or weighted_iou > best_xgb_config["iou"]:
-                    best_xgb_config = cand
-                    best_bst = bst
-        if best_xgb_config is None or best_bst is None:
-            raise ValueError("XGB tuning returned no results")
+                for thr, stats in stats_by_thr.items():
+                    if stats["w"] > 0:
+                        weighted_iou = float(stats["iou"] / stats["w"])
+                        weighted_f1 = float(stats["f1"] / stats["w"])
+                        weighted_precision = float(stats["precision"] / stats["w"])
+                        weighted_recall = float(stats["recall"] / stats["w"])
+                    else:
+                        weighted_iou = 0.0
+                        weighted_f1 = 0.0
+                        weighted_precision = 0.0
+                        weighted_recall = 0.0
+                    cand = {
+                        "k": -1,
+                        "threshold": thr,
+                        "source": "xgb",
+                        "iou": weighted_iou,
+                        "f1": weighted_f1,
+                        "precision": weighted_precision,
+                        "recall": weighted_recall,
+                        "params": params_used,
+                    }
+                    if best_xgb_config is None or weighted_iou > best_xgb_config["iou"]:
+                        best_xgb_config = cand
+                        best_bst = bst
+            if best_xgb_config is None or best_bst is None:
+                raise ValueError("XGB tuning returned no results")
 
-        champion_source = (
-            "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
-        )
-        champion_iou = (
-            best_raw_config["iou"]
-            if champion_source == "raw"
-            else best_xgb_config["iou"]
-        )
+        if KNN_ENABLED and XGB_ENABLED:
+            champion_source = (
+                "raw" if best_raw_config["iou"] >= best_xgb_config["iou"] else "xgb"
+            )
+            champion_iou = (
+                best_raw_config["iou"]
+                if champion_source == "raw"
+                else best_xgb_config["iou"]
+            )
+        elif XGB_ENABLED:
+            champion_source = "xgb"
+            champion_iou = best_xgb_config["iou"]
+        else:
+            champion_source = "raw"
+            champion_iou = best_raw_config["iou"]
         if best_champion_iou is None or champion_iou > best_champion_iou:
             best_champion_iou = champion_iou
             best_bundle = {
@@ -531,11 +535,10 @@ def tune_on_validation_multi(
     best_bst = best_bundle["best_bst"]
     champion_source = best_bundle["champion_source"]
 
-    thr_center = (
-        best_raw_config["threshold"]
-        if champion_source == "raw"
-        else best_xgb_config["threshold"]
-    )
+    if champion_source == "raw":
+        thr_center = float(best_raw_config["threshold"])
+    else:
+        thr_center = float(best_xgb_config["threshold"])
     for ctx in val_contexts:
         _maybe_stop("champion_score_rebuild")
         if champion_source == "raw":
@@ -578,33 +581,50 @@ def tune_on_validation_multi(
         ctx["thr_center"] = thr_center
 
     # CRF tuning across val tiles
-    crf_candidates = [
-        (psf, pw, pxy, bw, bxy, brgb)
-        for psf in cfg.search.crf.prob_softness_values
-        for pw in cfg.search.crf.pos_w_values
-        for pxy in cfg.search.crf.pos_xy_std_values
-        for bw in cfg.search.crf.bilateral_w_values
-        for bxy in cfg.search.crf.bilateral_xy_std_values
-        for brgb in cfg.search.crf.bilateral_rgb_std_values
-    ]
-    _maybe_stop("crf_search")
-    best_crf_cfg = None
-    best_crf_iou = None
-    crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
-    num_workers = int(cfg.search.crf.num_workers or 1)
-    logger.info(
-        "tune: CRF grid search configs=%s, workers=%s",
-        len(crf_candidates),
-        num_workers,
-    )
-    _init_crf_parallel(val_contexts)
-    if num_workers > 1:
-        with ProcessPoolExecutor(max_workers=num_workers) as ex:
-            for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
+    best_crf_cfg = {"enabled": bool(CRF_ENABLED)}
+    if CRF_ENABLED:
+        crf_candidates = [
+            (psf, pw, pxy, bw, bxy, brgb)
+            for psf in cfg.search.crf.prob_softness_values
+            for pw in cfg.search.crf.pos_w_values
+            for pxy in cfg.search.crf.pos_xy_std_values
+            for bw in cfg.search.crf.bilateral_w_values
+            for bxy in cfg.search.crf.bilateral_xy_std_values
+            for brgb in cfg.search.crf.bilateral_rgb_std_values
+        ]
+        _maybe_stop("crf_search")
+        best_crf_iou = None
+        crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
+        num_workers = int(cfg.search.crf.num_workers or 1)
+        logger.info(
+            "tune: CRF grid search configs=%s, workers=%s",
+            len(crf_candidates),
+            num_workers,
+        )
+        _init_crf_parallel(val_contexts)
+        if num_workers > 1:
+            with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
+                    _maybe_stop("crf_search")
+                    if best_crf_iou is None or med_iou > best_crf_iou:
+                        best_crf_iou = med_iou
+                        best_crf_cfg = {
+                            "enabled": True,
+                            "prob_softness": cand[0],
+                            "pos_w": cand[1],
+                            "pos_xy_std": cand[2],
+                            "bilateral_w": cand[3],
+                            "bilateral_xy_std": cand[4],
+                            "bilateral_rgb_std": cand[5],
+                        }
+        else:
+            for cand in crf_candidates:
                 _maybe_stop("crf_search")
+                med_iou, _ = _eval_crf_config(cand)
                 if best_crf_iou is None or med_iou > best_crf_iou:
                     best_crf_iou = med_iou
                     best_crf_cfg = {
+                        "enabled": True,
                         "prob_softness": cand[0],
                         "pos_w": cand[1],
                         "pos_xy_std": cand[2],
@@ -612,22 +632,8 @@ def tune_on_validation_multi(
                         "bilateral_xy_std": cand[4],
                         "bilateral_rgb_std": cand[5],
                     }
-    else:
-        for cand in crf_candidates:
-            _maybe_stop("crf_search")
-            med_iou, _ = _eval_crf_config(cand)
-            if best_crf_iou is None or med_iou > best_crf_iou:
-                best_crf_iou = med_iou
-                best_crf_cfg = {
-                    "prob_softness": cand[0],
-                    "pos_w": cand[1],
-                    "pos_xy_std": cand[2],
-                    "bilateral_w": cand[3],
-                    "bilateral_xy_std": cand[4],
-                    "bilateral_rgb_std": cand[5],
-                }
-    if best_crf_cfg is None:
-        raise ValueError("CRF tuning returned no results")
+        if best_crf_iou is None:
+            raise ValueError("CRF tuning returned no results")
 
     # Shadow tuning across val tiles
     best_shadow_cfg = None
@@ -646,23 +652,26 @@ def tune_on_validation_multi(
             score_full = ctx["score_full"]
             thr_center = ctx["thr_center"]
 
-            mask_crf = refine_with_densecrf(
-                ctx["img_b"],
-                score_full,
-                thr_center,
-                ctx["sh_buffer_mask"],
-                prob_softness=best_crf_cfg["prob_softness"],
-                n_iters=5,
-                pos_w=best_crf_cfg["pos_w"],
-                pos_xy_std=best_crf_cfg["pos_xy_std"],
-                bilateral_w=best_crf_cfg["bilateral_w"],
-                bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
-                bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
-            )
+            if CRF_ENABLED:
+                mask_base = refine_with_densecrf(
+                    ctx["img_b"],
+                    score_full,
+                    thr_center,
+                    ctx["sh_buffer_mask"],
+                    prob_softness=best_crf_cfg["prob_softness"],
+                    n_iters=5,
+                    pos_w=best_crf_cfg["pos_w"],
+                    pos_xy_std=best_crf_cfg["pos_xy_std"],
+                    bilateral_w=best_crf_cfg["bilateral_w"],
+                    bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
+                    bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
+                )
+            else:
+                mask_base = (score_full >= thr_center) & ctx["sh_buffer_mask"]
             img_float = ctx["img_b"].astype(np.float32)
             w = np.array(weights, dtype=np.float32).reshape(1, 1, 3)
             wsum = (img_float * w).sum(axis=2)
-            flat_base = mask_crf.reshape(-1)
+            flat_base = mask_base.reshape(-1)
             flat_gt = ctx["gt_mask_eval"].reshape(-1).astype(bool)
             vals = wsum.reshape(-1)[flat_base]
             gt_vals = flat_gt[flat_base]
@@ -715,368 +724,40 @@ def tune_on_validation_multi(
         raise ValueError("shadow tuning returned no results")
 
     logger.info("tune: roads penalty selected=%s", roads_penalty)
+    if best_raw_config is None:
+        best_raw_config = {
+            "k": -1,
+            "threshold": float(best_xgb_config["threshold"]),
+            "source": "raw_disabled",
+            "iou": 0.0,
+            "f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+        }
+    if best_xgb_config is None:
+        best_xgb_config = {
+            "k": -1,
+            "threshold": float(best_raw_config["threshold"]),
+            "source": "xgb_disabled",
+            "iou": 0.0,
+            "f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "params": None,
+        }
     return {
         "bst": best_bst,
         "best_raw_config": best_raw_config,
         "best_xgb_config": best_xgb_config,
         "champion_source": champion_source,
-        "best_crf_config": {**best_crf_cfg, "k": best_raw_config["k"]},
+        "best_crf_config": {**best_crf_cfg, "k": best_raw_config.get("k", -1)},
         "shadow_cfg": best_shadow_cfg,
         "roads_penalty": float(roads_penalty),
         "xgb_feature_stats": xgb_feature_stats,
         "feature_layout": feature_layout,
-    }
-
-
-def infer_on_holdout(
-    holdout_path: str,
-    gt_vector_paths: list[str] | None,
-    model,
-    processor,
-    device,
-    pos_bank: np.ndarray,
-    neg_bank: np.ndarray | None,
-    tuned: dict,
-    ps: int,
-    tile_size: int,
-    stride: int,
-    feature_dir: str | None,
-    shape_dir: str,
-    context_radius: int,
-    plot_with_metrics: bool = True,
-):
-    """Run inference on a holdout tile using tuned settings.
-
-    Args:
-        holdout_path (str): Holdout tile path.
-        gt_vector_paths (list[str] | None): Vector GT paths.
-        model: DINO model.
-        processor: DINO processor.
-        device: Torch device.
-        pos_bank (np.ndarray): Positive bank.
-        neg_bank (np.ndarray | None): Negative bank.
-        tuned (dict): Tuned configuration bundle.
-        ps (int): Patch size.
-        tile_size (int): Tile size in pixels.
-        stride (int): Tile stride.
-        feature_dir (str | None): Feature cache directory.
-        shape_dir (str): Output shapefile directory.
-        context_radius (int): Feature context radius.
-        plot_with_metrics (bool): Whether to show metrics on plots.
-
-    Returns:
-        dict: Masks, metrics, and metadata for the tile.
-
-    Examples:
-        >>> callable(infer_on_holdout)
-        True
-    """
-    logger.info("inference: holdout tile %s", holdout_path)
-    (
-        img_b,
-        labels_sh,
-        _,
-        gt_mask_eval,
-        sh_buffer_mask,
-        buffer_m,
-        pixel_size_m,
-    ) = load_b_tile_context(holdout_path, gt_vector_paths)
-    gt_available = gt_mask_eval is not None
-    if gt_mask_eval is None:
-        logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
-        gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
-    gt_weight = float(gt_mask_eval.sum())
-    ds = int(cfg.model.backbone.resample_factor or 1)
-    roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
-    roads_penalty = float(tuned.get("roads_penalty", 1.0))
-    xgb_feature_stats = tuned.get("xgb_feature_stats")
-
-    image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
-    prefetched_b = prefetch_features_single_scale_image(
-        img_b,
-        model,
-        processor,
-        device,
-        ps,
-        tile_size,
-        stride,
-        None,
-        feature_dir,
-        image_id_b,
-    )
-
-    k = tuned["best_raw_config"]["k"]
-    knn_thr = tuned["best_raw_config"]["threshold"]
-    score_knn, _ = zero_shot_knn_single_scale_B_with_saliency(
-        img_b,
-        pos_bank,
-        neg_bank,
-        model,
-        processor,
-        device,
-        ps,
-        tile_size,
-        stride,
-        k=k,
-        aggregate_layers=None,
-        feature_dir=feature_dir,
-        image_id=image_id_b,
-        neg_alpha=cfg.model.banks.neg_alpha,
-        prefetched_tiles=prefetched_b,
-        use_fp16_matmul=USE_FP16_KNN,
-        context_radius=context_radius,
-    )
-    score_knn_raw = score_knn
-    score_knn = _apply_roads_penalty(score_knn, roads_mask, roads_penalty)
-    mask_knn = (score_knn >= knn_thr) & sh_buffer_mask
-    mask_knn = median_filter(mask_knn.astype(np.uint8), size=3) > 0
-    metrics_knn = compute_metrics(mask_knn, gt_mask_eval)
-
-    bst = tuned["bst"]
-    xgb_thr = tuned["best_xgb_config"]["threshold"]
-    score_xgb = xgb_score_image_b(
-        img_b,
-        bst,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        image_id_b,
-        prefetched_tiles=prefetched_b,
-        context_radius=context_radius,
-        xgb_feature_stats=xgb_feature_stats,
-    )
-    score_xgb = _apply_roads_penalty(score_xgb, roads_mask, roads_penalty)
-    mask_xgb = (score_xgb >= xgb_thr) & sh_buffer_mask
-    mask_xgb = median_filter(mask_xgb.astype(np.uint8), size=3) > 0
-    metrics_xgb = compute_metrics(mask_xgb, gt_mask_eval)
-
-    champion_source = tuned["champion_source"]
-    if champion_source == "raw":
-        champion_score = score_knn
-        champion_thr = float(knn_thr)
-    else:
-        champion_score = score_xgb
-        champion_thr = float(xgb_thr)
-
-    crf_cfg = tuned["best_crf_config"]
-    mask_crf_knn = refine_with_densecrf(
-        img_b,
-        score_knn,
-        knn_thr,
-        sh_buffer_mask,
-        prob_softness=crf_cfg["prob_softness"],
-        n_iters=5,
-        pos_w=crf_cfg["pos_w"],
-        pos_xy_std=crf_cfg["pos_xy_std"],
-        bilateral_w=crf_cfg["bilateral_w"],
-        bilateral_xy_std=crf_cfg["bilateral_xy_std"],
-        bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
-    )
-    mask_crf_xgb = refine_with_densecrf(
-        img_b,
-        score_xgb,
-        xgb_thr,
-        sh_buffer_mask,
-        prob_softness=crf_cfg["prob_softness"],
-        n_iters=5,
-        pos_w=crf_cfg["pos_w"],
-        pos_xy_std=crf_cfg["pos_xy_std"],
-        bilateral_w=crf_cfg["bilateral_w"],
-        bilateral_xy_std=crf_cfg["bilateral_xy_std"],
-        bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
-    )
-    if champion_source == "raw":
-        best_crf_mask = mask_crf_knn
-    else:
-        best_crf_mask = mask_crf_xgb
-
-    shadow_cfg = tuned["shadow_cfg"]
-    protect_score = shadow_cfg.get("protect_score")
-    shadow_mask = _apply_shadow_filter(
-        img_b,
-        best_crf_mask,
-        shadow_cfg["weights"],
-        shadow_cfg["threshold"],
-        champion_score,
-        protect_score,
-    )
-    shadow_mask_knn = _apply_shadow_filter(
-        img_b,
-        mask_crf_knn,
-        shadow_cfg["weights"],
-        shadow_cfg["threshold"],
-        score_knn,
-        protect_score,
-    )
-    shadow_mask_xgb = _apply_shadow_filter(
-        img_b,
-        mask_crf_xgb,
-        shadow_cfg["weights"],
-        shadow_cfg["threshold"],
-        score_xgb,
-        protect_score,
-    )
-    metrics_knn_crf = compute_metrics(mask_crf_knn, gt_mask_eval)
-    metrics_knn_shadow = compute_metrics(shadow_mask_knn, gt_mask_eval)
-    metrics_xgb_crf = compute_metrics(mask_crf_xgb, gt_mask_eval)
-    metrics_xgb_shadow = compute_metrics(shadow_mask_xgb, gt_mask_eval)
-    champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
-    metrics_champion_raw = compute_metrics(champ_raw_mask, gt_mask_eval)
-    metrics_champion_crf = compute_metrics(best_crf_mask, gt_mask_eval)
-    shadow_metrics = compute_metrics(shadow_mask, gt_mask_eval)
-    proposal_cfg = cfg.postprocess.novel_proposals
-    if proposal_cfg.source == "champion_score":
-        proposal_threshold = (
-            float(proposal_cfg.score_threshold)
-            if proposal_cfg.score_threshold is not None
-            else champion_thr
-        )
-        proposal_source_mask = champion_score >= proposal_threshold
-    else:
-        proposal_source_mask = shadow_mask
-    proposal_bundle = filter_novel_proposals(
-        shadow_mask,
-        labels_sh,
-        champion_score,
-        roads_mask,
-        pixel_size_m,
-        sh_buffer_mask=sh_buffer_mask,
-        proposal_source_mask=proposal_source_mask,
-    )
-    proposal_candidate_mask = proposal_bundle["candidate_mask"]
-    proposal_accepted_mask = proposal_bundle["accepted_mask"]
-    proposal_rejected_mask = proposal_bundle["rejected_mask"]
-
-    if cfg.postprocess.novel_proposals.enabled:
-        proposal_dir = os.path.join(shape_dir, "proposals")
-        os.makedirs(proposal_dir, exist_ok=True)
-        if proposal_accepted_mask.any():
-            export_mask_to_shapefile(
-                proposal_accepted_mask,
-                holdout_path,
-                os.path.join(proposal_dir, f"{image_id_b}_accepted.shp"),
-            )
-        if proposal_rejected_mask.any():
-            export_mask_to_shapefile(
-                proposal_rejected_mask,
-                holdout_path,
-                os.path.join(proposal_dir, f"{image_id_b}_rejected.shp"),
-            )
-
-    if champion_source == "xgb":
-        champion_prob = np.clip(champion_score.astype(np.float32), 1e-6, 1.0 - 1e-6)
-    else:
-        s = champion_score.astype(np.float32)
-        smin = float(np.min(s))
-        smax = float(np.max(s))
-        champion_prob = (s - smin) / (smax - smin + 1e-8)
-        champion_prob = np.clip(champion_prob, 1e-6, 1.0 - 1e-6)
-    disagreement_map = np.abs(score_xgb - score_knn).astype(np.float32)
-    entropy_map = (
-        -champion_prob * np.log(champion_prob)
-        - (1.0 - champion_prob) * np.log(1.0 - champion_prob)
-    ).astype(np.float32)
-
-    metrics_map = {
-        "knn_raw": metrics_knn,
-        "knn_crf": metrics_knn_crf,
-        "knn_shadow": metrics_knn_shadow,
-        "xgb_raw": metrics_xgb,
-        "xgb_crf": metrics_xgb_crf,
-        "xgb_shadow": metrics_xgb_shadow,
-        "champion_raw": metrics_champion_raw,
-        "champion_crf": metrics_champion_crf,
-        "champion_shadow": shadow_metrics,
-    }
-    metrics_map = {
-        key: {**metrics, "_weight": gt_weight} for key, metrics in metrics_map.items()
-    }
-    masks_map = {
-        "knn_raw": mask_knn,
-        "knn_crf": mask_crf_knn,
-        "knn_shadow": shadow_mask_knn,
-        "xgb_raw": mask_xgb,
-        "xgb_crf": mask_crf_xgb,
-        "xgb_shadow": shadow_mask_xgb,
-        "champion_raw": champ_raw_mask,
-        "champion_crf": best_crf_mask,
-        "champion_shadow": shadow_mask,
-    }
-    save_unified_plot(
-        img_b=img_b,
-        gt_mask=gt_mask_eval,
-        labels_sh=labels_sh,
-        masks=masks_map,
-        metrics=metrics_map,
-        plot_dir=cfg.io.paths.plot_dir,
-        image_id_b=image_id_b,
-        show_metrics=plot_with_metrics and gt_available,
-        gt_available=gt_available,
-        similarity_map=score_knn_raw,
-        score_maps={"knn": score_knn, "xgb": score_xgb},
-        proposal_masks={
-            "candidate": proposal_candidate_mask,
-            "accepted": proposal_accepted_mask,
-            "rejected": proposal_rejected_mask,
-        },
-    )
-    save_core_qualitative_plot(
-        img_b=img_b,
-        gt_mask=gt_mask_eval,
-        pred_mask=shadow_mask,
-        plot_dir=cfg.io.paths.plot_dir,
-        image_id_b=image_id_b,
-        gt_available=gt_available,
-        boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
-    )
-    save_score_threshold_plot(
-        score_map=champion_score,
-        threshold=champion_thr,
-        sh_buffer_mask=sh_buffer_mask,
-        plot_dir=cfg.io.paths.plot_dir,
-        image_id_b=image_id_b,
-    )
-    save_disagreement_entropy_plot(
-        disagreement_map=disagreement_map,
-        entropy_map=entropy_map,
-        candidate_mask=proposal_candidate_mask,
-        plot_dir=cfg.io.paths.plot_dir,
-        image_id_b=image_id_b,
-    )
-    save_proposal_overlay_plot(
-        img_b=img_b,
-        prediction_mask=shadow_mask,
-        candidate_mask=proposal_candidate_mask,
-        accepted_mask=proposal_accepted_mask,
-        rejected_mask=proposal_rejected_mask,
-        plot_dir=cfg.io.paths.plot_dir,
-        image_id_b=image_id_b,
-        accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
-        reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
-        candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
-    )
-
-    champ_raw_mask = mask_knn if champion_source == "raw" else mask_xgb
-    return {
-        "ref_path": holdout_path,
-        "image_id": image_id_b,
-        "gt_available": gt_available,
-        "buffer_m": buffer_m,
-        "pixel_size_m": pixel_size_m,
-        "metrics": metrics_map,
-        "masks": {
-            "knn_raw": mask_knn,
-            "knn_crf": mask_crf_knn,
-            "knn_shadow": shadow_mask_knn,
-            "xgb_raw": mask_xgb,
-            "xgb_crf": mask_crf_xgb,
-            "xgb_shadow": shadow_mask_xgb,
-            "champion_raw": champ_raw_mask,
-            "champion_crf": best_crf_mask,
-            "champion_shadow": shadow_mask,
-        },
-        "proposals": proposal_bundle,
+        "knn_enabled": bool(KNN_ENABLED),
+        "xgb_enabled": bool(XGB_ENABLED),
+        "crf_enabled": bool(CRF_ENABLED),
     }
 
 
@@ -1122,13 +803,39 @@ def main():
                 next_idx = len(existing) + 1
         run_dir = os.path.join(output_root, f"run_{next_idx:03d}")
     plot_dir = os.path.join(run_dir, "plots")
+    validation_plot_dir = os.path.join(plot_dir, "validation")
+    inference_plot_dir = os.path.join(plot_dir, "inference")
     shape_dir = os.path.join(run_dir, "shapes")
     os.makedirs(plot_dir, exist_ok=True)
+    os.makedirs(validation_plot_dir, exist_ok=True)
+    os.makedirs(inference_plot_dir, exist_ok=True)
     os.makedirs(shape_dir, exist_ok=True)
     cfg.io.paths.plot_dir = plot_dir
     cfg.io.paths.best_settings_path = os.path.join(run_dir, "best_settings.yml")
     cfg.io.paths.log_path = os.path.join(run_dir, "run.log")
     setup_logging(cfg.io.paths.log_path)
+    logger.info(
+        "model toggles: knn_enabled=%s xgb_enabled=%s crf_enabled=%s",
+        KNN_ENABLED,
+        XGB_ENABLED,
+        CRF_ENABLED,
+    )
+    logger.info(
+        (
+            "proposal heuristics: preset=%s min_area_px=%s min_length_m=%.2f "
+            "max_width_m=%.2f min_skeleton_ratio=%.2f min_pca_ratio=%.2f "
+            "max_circularity=%.2f min_mean_score=%.2f max_road_overlap=%.2f"
+        ),
+        cfg.postprocess.novel_proposals.heuristic_preset,
+        cfg.postprocess.novel_proposals.min_area_px,
+        float(cfg.postprocess.novel_proposals.min_length_m),
+        float(cfg.postprocess.novel_proposals.max_width_m),
+        float(cfg.postprocess.novel_proposals.min_skeleton_ratio),
+        float(cfg.postprocess.novel_proposals.min_pca_ratio),
+        float(cfg.postprocess.novel_proposals.max_circularity),
+        float(cfg.postprocess.novel_proposals.min_mean_score),
+        float(cfg.postprocess.novel_proposals.max_road_overlap),
+    )
     processed_log_path = os.path.join(run_dir, "processed_tiles.jsonl")
     processed_tiles: set[str] = set()
     rolling_best_settings_path = os.path.join(run_dir, "rolling_best_setting.yml")
@@ -1485,6 +1192,7 @@ def main():
                 should_stop=_is_budget_exceeded_now,
             )
             fold_val_results: list[dict] = []
+            fold_plot_dir = os.path.join(validation_plot_dir, f"fold_{fold_idx:02d}")
             for val_path in val_paths:
                 if _is_budget_exceeded_now():
                     raise TimeBudgetExceededError("fold_validation_inference")
@@ -1502,6 +1210,7 @@ def main():
                     stride,
                     feature_dir,
                     shape_dir,
+                    fold_plot_dir,
                     context_radius,
                     plot_with_metrics=True,
                 )
@@ -1678,28 +1387,30 @@ def main():
             feature_dir,
             context_radius,
         )
-        best_xgb_params = selected_tuned["best_xgb_config"].get("params")
-        feature_names = (
-            list(feature_layout.get("feature_names", []))
-            if feature_layout is not None
-            else None
-        )
-        if feature_names is not None and len(feature_names) != X.shape[1]:
-            logger.warning(
-                "final training feature layout mismatch: names=%s X=%s; disabling names",
-                len(feature_names),
-                X.shape[1],
+        final_bst = tuned.get("bst")
+        if XGB_ENABLED:
+            best_xgb_params = selected_tuned["best_xgb_config"].get("params")
+            feature_names = (
+                list(feature_layout.get("feature_names", []))
+                if feature_layout is not None
+                else None
             )
-            feature_names = None
-        final_bst = train_xgb_classifier(
-            X,
-            y,
-            use_gpu=cfg.search.xgb.use_gpu,
-            num_boost_round=cfg.search.xgb.num_boost_round,
-            verbose_eval=cfg.search.xgb.verbose_eval,
-            param_overrides=best_xgb_params,
-            feature_names=feature_names,
-        )
+            if feature_names is not None and len(feature_names) != X.shape[1]:
+                logger.warning(
+                    "final training feature layout mismatch: names=%s X=%s; disabling names",
+                    len(feature_names),
+                    X.shape[1],
+                )
+                feature_names = None
+            final_bst = train_xgb_classifier(
+                X,
+                y,
+                use_gpu=cfg.search.xgb.use_gpu,
+                num_boost_round=cfg.search.xgb.num_boost_round,
+                verbose_eval=cfg.search.xgb.verbose_eval,
+                param_overrides=best_xgb_params,
+                feature_names=feature_names,
+            )
         tuned = {
             **selected_tuned,
             "bst": final_bst,
@@ -1749,7 +1460,7 @@ def main():
         }
 
     inference_best_settings_path = os.path.join(run_dir, "inference_best_setting.yml")
-    bst = tuned["bst"]
+    bst = tuned.get("bst")
     xgb_model_info: dict[str, object] = {}
     dino_importance_plot = save_dino_channel_importance_plot(
         bst,
@@ -1783,6 +1494,7 @@ def main():
             "modes": aug_modes,
         },
         "xgb_search": {
+            "enabled": cfg.search.xgb.enabled,
             "use_gpu": cfg.search.xgb.use_gpu,
             "num_boost_round": cfg.search.xgb.num_boost_round,
             "early_stop": cfg.search.xgb.early_stop,
@@ -1790,12 +1502,17 @@ def main():
             "param_grid_size": len(cfg.search.xgb.param_grid),
         },
         "knn_search": {
+            "enabled": cfg.search.knn.enabled,
             "k_values": cfg.search.knn.k_values,
             "threshold_range": {
                 "start": cfg.search.knn.thresholds.start,
                 "stop": cfg.search.knn.thresholds.stop,
                 "count": cfg.search.knn.thresholds.count,
             },
+        },
+        "crf_search": {
+            "enabled": cfg.search.crf.enabled,
+            "max_configs": cfg.search.crf.max_configs,
         },
         "hybrid_features": {
             "enabled": cfg.model.hybrid_features.enabled,
@@ -1836,8 +1553,14 @@ def main():
             "max_neg_bank": cfg.model.banks.max_neg_bank,
             "roads_penalty": tuned.get("roads_penalty", 1.0),
             "roads_mask_path": cfg.io.paths.roads_mask_path,
+            "model_toggles": {
+                "knn_enabled": cfg.search.knn.enabled,
+                "xgb_enabled": cfg.search.xgb.enabled,
+                "crf_enabled": cfg.search.crf.enabled,
+            },
             "novel_proposals": {
                 "enabled": cfg.postprocess.novel_proposals.enabled,
+                "heuristic_preset": cfg.postprocess.novel_proposals.heuristic_preset,
                 "search_scope": cfg.postprocess.novel_proposals.search_scope,
                 "source": cfg.postprocess.novel_proposals.source,
                 "score_threshold": cfg.postprocess.novel_proposals.score_threshold,
@@ -1905,6 +1628,7 @@ def main():
             stride,
             feature_dir,
             shape_dir,
+            inference_plot_dir,
             context_radius,
             plot_with_metrics=False,
         )
@@ -1913,16 +1637,19 @@ def main():
         holdout_tiles_processed += 1
         ref_path = result["ref_path"]
         masks = result["masks"]
-        for stream in ("knn", "xgb", "champion"):
-            for variant in ("raw", "crf", "shadow"):
-                mask_key = f"{stream}_{variant}"
-                _append_union(
-                    stream,
-                    variant,
-                    masks[mask_key],
-                    ref_path,
-                    holdout_tiles_processed,
-                )
+        for mask_key, mask_val in masks.items():
+            if "_" not in mask_key:
+                continue
+            stream, variant = mask_key.split("_", 1)
+            if (stream, variant) not in union_states:
+                continue
+            _append_union(
+                stream,
+                variant,
+                mask_val,
+                ref_path,
+                holdout_tiles_processed,
+            )
         record = {
             "tile_path": b_path,
             "image_id": result["image_id"],
