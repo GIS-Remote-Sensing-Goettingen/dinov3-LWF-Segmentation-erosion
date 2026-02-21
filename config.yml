@@ -140,7 +140,7 @@ search:
     threshold_cpu_batch_size: 32
 
   crf:
-    enabled: false
+    enabled: true
     prob_softness_values: [0.03]
     pos_w_values: [4.0]
     pos_xy_std_values: [3.0]
@@ -155,7 +155,7 @@ search:
     # Set true only when CUDA-enabled XGBoost is installed.
     use_gpu: false
     val_fraction: 0.3
-    num_boost_round: 100
+    num_boost_round: 40
     early_stop: 40
     verbose_eval: 50
     # null -> evaluate XGB thresholds from search.knn.thresholds.
