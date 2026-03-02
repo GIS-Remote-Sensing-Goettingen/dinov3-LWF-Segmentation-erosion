@@ -82,7 +82,7 @@ model:
     max_neg_bank: 1000000
 
   augmentation:
-    enabled: false
+    enabled: true
     include_identity: true
     horizontal_flip: true
     vertical_flip: true
@@ -92,11 +92,11 @@ model:
   # Hybrid feature fusion: DINO embeddings + low-cost image patch descriptors.
   # kNN and XGB intentionally use different normalization geometry.
   hybrid_features:
-    enabled: false
+    enabled: true
     # kNN branch: block-weighted concat + final L2 normalization.
     knn_l2_normalize: true
     # XGB branch: optional z-score standardization (fit on train folds only).
-    xgb_zscore: false
+    xgb_zscore: true
     zscore_eps: 1.0e-6
     blocks:
       dino:
@@ -141,8 +141,8 @@ training:
 
 search:
   knn:
-    enabled: false
-    k_values: [15, 25, 30]
+    enabled: true
+    k_values: [15, 25, 30,175,225]
     thresholds:
       start: 0.01
       stop: 0.5
@@ -198,13 +198,13 @@ postprocess:
     protect_scores: [0.3, 0.4, 0.5, 0.6]
 
   roads:
-    penalty_values: [0.6]
+    penalty_values: [0.6 ,0.7, 0.8, 0.9]
 
   # Propose new elongated LWF objects outside the incomplete label raster.
   novel_proposals:
     enabled: true
     # strict | balanced | lax | very_lax
-    heuristic_preset: lax
+    heuristic_preset: balanced
     # whole_tile allows suggestions outside SH raster bounds.
     search_scope: whole_tile
     # champion_score | champion_mask
