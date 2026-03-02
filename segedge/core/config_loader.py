@@ -47,6 +47,8 @@ class IOPathsConfig:
     best_settings_path: str
     log_path: str
     roads_mask_path: str | None = None
+    inference_dir: str | None = None
+    inference_glob: str = "*.tif"
 
 
 @dataclass
@@ -506,6 +508,12 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
         val_tiles=_as_list_str(io_paths["val_tiles"], "io.paths.val_tiles"),
         holdout_tiles=_as_list_str(io_paths["holdout_tiles"], "io.paths.holdout_tiles"),
+        inference_dir=(
+            str(io_paths["inference_dir"])
+            if io_paths.get("inference_dir") is not None
+            else None
+        ),
+        inference_glob=str(io_paths.get("inference_glob", "*.tif")),
         feature_dir=str(io_paths["feature_dir"]),
         bank_cache_dir=str(io_paths["bank_cache_dir"]),
         output_dir=str(io_paths["output_dir"]),

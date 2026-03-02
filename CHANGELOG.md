@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add manual-mode inference directory support and switch config to directory-driven inference tiles.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Avoid maintaining long manual `holdout_tiles` lists when inference should cover a full folder.
+- problems fixed: Manual mode now resolves inference tiles from `io.paths.inference_dir` + `io.paths.inference_glob` (fallback to `io.paths.holdout_tiles`), and `config.yml` now points inference to `/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1`.
+
 - Description: Switch runtime config to manual tile mode using the same tile filenames as `main`.
 - file touched: `config.yml`, `CHANGELOG.md`
 - reason: Restore explicit train/validate/holdout tile selection for manual runs.

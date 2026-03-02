@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -1050,7 +1051,22 @@ def main():
         gt_tiles = []
         source_tiles = list(cfg.io.paths.source_tiles or [cfg.io.paths.source_tile])
         val_tiles = list(cfg.io.paths.val_tiles)
-        holdout_tiles = list(cfg.io.paths.holdout_tiles)
+        inference_dir = cfg.io.paths.inference_dir
+        inference_glob = cfg.io.paths.inference_glob
+        if inference_dir:
+            if not os.path.isdir(inference_dir):
+                raise ValueError(f"io.paths.inference_dir not found: {inference_dir}")
+            holdout_tiles = sorted(
+                glob.glob(os.path.join(inference_dir, inference_glob))
+            )
+            logger.info(
+                "manual inference dir: %s (glob=%s) -> %s tiles",
+                inference_dir,
+                inference_glob,
+                len(holdout_tiles),
+            )
+        else:
+            holdout_tiles = list(cfg.io.paths.holdout_tiles)
         if not source_tiles:
             raise ValueError(
                 "io.paths.source_tiles/source_tile must be set when io.auto_split.enabled=false"
@@ -1061,7 +1077,8 @@ def main():
             )
         if not holdout_tiles:
             logger.warning(
-                "no holdout tiles configured in manual mode; skipping holdout inference"
+                "no inference tiles resolved in manual mode; "
+                "set io.paths.inference_dir or io.paths.holdout_tiles"
             )
         logger.info(
             "manual tiles: source=%s val=%s holdout=%s",
@@ -1266,6 +1283,8 @@ def main():
                 "source_tiles_count": len(source_tiles),
                 "val_tiles_count": len(val_tiles),
                 "holdout_tiles_count": len(holdout_tiles),
+                "inference_dir": inference_dir,
+                "inference_glob": inference_glob,
                 "weighted_phase_metrics": weighted_phase_metrics,
                 "loo": {"enabled": False},
             },

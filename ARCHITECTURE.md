@@ -28,8 +28,9 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    (`training.loo.val_tiles_per_fold`) and skip low-signal folds by GT-positive
    threshold (`training.loo.low_gt_policy`).
    `io.auto_split.enabled=false`: explicit manual tile lists are used from
-   `io.paths.source_tiles` (fallback `io.paths.source_tile`), `io.paths.val_tiles`,
-   and `io.paths.holdout_tiles`.
+   `io.paths.source_tiles` (fallback `io.paths.source_tile`) and
+   `io.paths.val_tiles`; inference tiles come from `io.paths.inference_dir`
+   (glob `io.paths.inference_glob`) or fallback `io.paths.holdout_tiles`.
 3. Training artifacts are built from source tiles:
    LOO mode builds artifacts per fold; manual mode builds them once from configured
    source tiles. kNN banks and XGB data can fuse DINO patch embeddings with optional

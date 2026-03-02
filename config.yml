@@ -26,9 +26,11 @@ io:
       - data/tiles/dop20_596000_5974000_1km_20cm.tif
       - data/tiles/dop20_596000_5977000_1km_20cm.tif
       - data/tiles/dop20_596000_5983000_1km_20cm.tif
-    holdout_tiles:
-      - data/tiles/dop20_596000_5975000_1km_20cm.tif
-      - data/tiles/dop20_596000_5976000_1km_20cm.tif
+    # Manual inference source: scan this directory for tiles.
+    inference_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
+    inference_glob: "*.tif"
+    # Optional fallback when inference_dir is null.
+    holdout_tiles: []
 
     # Outputs and caches.
     feature_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/features
