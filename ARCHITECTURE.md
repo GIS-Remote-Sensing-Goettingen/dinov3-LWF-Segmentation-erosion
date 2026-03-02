@@ -19,16 +19,21 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 
 ## Workflow
 1. Configure paths and hyperparameters in `config.yml`.
-2. If `io.auto_split.enabled=true`, tiles are discovered from `io.auto_split.tiles_dir`.
+2. Tile selection supports two modes:
+   `io.auto_split.enabled=true`: tiles are discovered from `io.auto_split.tiles_dir`.
    GT-overlap tiles are first identified by vector intersection, then filtered to keep
    only tiles with effective GT positives after optional SH-buffer clipping. These tiles
    are used for leave-one-out (LOO) folds (`training.loo`), and remaining tiles are
-   treated as inference-only holdout tiles.
-   Fold validation can use multi-tile windows (`training.loo.val_tiles_per_fold`) and
-   skip low-signal folds by GT-positive threshold (`training.loo.low_gt_policy`).
-3. Training artifacts are built per fold from source tiles:
-   kNN banks and XGB data can fuse DINO patch embeddings with optional image patch cues
-   (`model.hybrid_features`), with train-fold-only z-score stats for XGB.
+   treated as inference-only holdout tiles. Fold validation can use multi-tile windows
+   (`training.loo.val_tiles_per_fold`) and skip low-signal folds by GT-positive
+   threshold (`training.loo.low_gt_policy`).
+   `io.auto_split.enabled=false`: explicit manual tile lists are used from
+   `io.paths.source_tiles` (fallback `io.paths.source_tile`), `io.paths.val_tiles`,
+   and `io.paths.holdout_tiles`.
+3. Training artifacts are built from source tiles:
+   LOO mode builds artifacts per fold; manual mode builds them once from configured
+   source tiles. kNN banks and XGB data can fuse DINO patch embeddings with optional
+   image patch cues (`model.hybrid_features`), with train-fold-only z-score stats for XGB.
 4. Run `python main.py` for the full pipeline.
 5. During execution, `rolling_best_setting.yml` is updated incrementally so best-known settings survive interruptions.
 6. Optional runtime time-budget cutover (`runtime.time_budget`) can stop training

@@ -43,7 +43,9 @@ This document gives a complete, self-contained description of the SegEdge zero-s
 - Tiling: default `TILE_SIZE=1024`, `STRIDE=512`; tiles cropped to multiples of patch size (16).
 - Patch labeling for A: `labels_to_patch_masks` marks a patch positive if FG fraction ≥ `POS_FRAC_THRESH` (default 0.1); negative if zero FG.
 - CRS: Vector CRS is reprojected to raster CRS when needed; if vector CRS missing, assumes EPSG:4326 with a warning.
-- Auto split: `io.auto_split.enabled=true` scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then separates GT-positive tiles (for LOO folds) from inference-only tiles (no GT overlap).
+- Tile mode switch:
+  - `io.auto_split.enabled=true`: scans tiles, filters by `SOURCE_LABEL_RASTER` overlap, then separates GT-positive tiles (for LOO folds) from inference-only tiles (no GT overlap).
+  - `io.auto_split.enabled=false`: uses explicit manual lists from `io.paths.source_tiles` (or `io.paths.source_tile`), `io.paths.val_tiles`, and `io.paths.holdout_tiles`.
 - GT presence scan uses cached vector intersection (no per-tile rasterization) and can run in parallel.
 - All downstream masks can be clipped to the SH buffer to enforce spatial priors.
 - Typical buffer: 8 m → at 0.2 m/pixel, buffer_pixels ≈ 40 (configurable).

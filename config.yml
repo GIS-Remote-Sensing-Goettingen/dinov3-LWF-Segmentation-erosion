@@ -3,7 +3,7 @@
 
 io:
   paths:
-    # Single-tile fallbacks (kept for compatibility; LOO uses auto_split tiles).
+    # Single-tile fallback used when source_tiles is empty.
     source_tile: data/tiles/dop20_596000_5974000_1km_20cm.tif
     target_tile: data/dop20_592000_5982000_1km_20cm.tif
 
@@ -15,10 +15,20 @@ io:
       - data/lables/lables_3.shp
       - data/lables/labels_final.shp
 
-    # Manual tile lists are deprecated when using directory-driven LOO.
-    source_tiles: []
-    val_tiles: []
-    holdout_tiles: []
+    # Manual mode tile lists (used when io.auto_split.enabled=false).
+    source_tiles:
+      - data/tiles/dop20_596000_5974000_1km_20cm.tif
+      - data/tiles/dop20_596000_5975000_1km_20cm.tif
+      - data/tiles/dop20_596000_5976000_1km_20cm.tif
+      - data/tiles/dop20_596000_5977000_1km_20cm.tif
+      - data/tiles/dop20_596000_5983000_1km_20cm.tif
+    val_tiles:
+      - data/tiles/dop20_596000_5974000_1km_20cm.tif
+      - data/tiles/dop20_596000_5977000_1km_20cm.tif
+      - data/tiles/dop20_596000_5983000_1km_20cm.tif
+    holdout_tiles:
+      - data/tiles/dop20_596000_5975000_1km_20cm.tif
+      - data/tiles/dop20_596000_5976000_1km_20cm.tif
 
     # Outputs and caches.
     feature_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/features
@@ -32,7 +42,8 @@ io:
     roads_mask_path: data/roads/roads_mask.shp
 
   auto_split:
-    enabled: true
+    # true: directory-driven LOO; false: manual source/val/holdout lists.
+    enabled: false
     # Input directory scanned for tiles.
     tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
     tile_glob: "*.tif"

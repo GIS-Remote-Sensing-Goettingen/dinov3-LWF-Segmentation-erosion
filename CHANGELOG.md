@@ -2,6 +2,16 @@
 
 
 ## [Unreleased]
+- Description: Switch runtime config to manual tile mode using the same tile filenames as `main`.
+- file touched: `config.yml`, `CHANGELOG.md`
+- reason: Restore explicit train/validate/holdout tile selection for manual runs.
+- problems fixed: Sets `io.auto_split.enabled=false` and populates `io.paths.source_tiles`, `io.paths.val_tiles`, and `io.paths.holdout_tiles` with the `main` branch tile lists.
+
+- Description: Restore optional manual tile selection flow while keeping directory-driven LOO as default.
+- file touched: `config.yml`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Allow selecting explicit source/validation/holdout tiles again (main-style) without removing current LOO workflow.
+- problems fixed: `io.auto_split.enabled=false` now runs manual source-tile training + validation tuning + holdout inference using `io.paths.source_tiles`/`source_tile`, `io.paths.val_tiles`, and `io.paths.holdout_tiles`; exported inference settings now include `extra.mode` (`manual` or `loo`).
+
 - Description: Switch inference visual outputs to single active model panels (XGB or kNN), split plots by stage, and upgrade novel proposal acceptance/diagnostics.
 - file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `segedge/core/plotting.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
 - reason: Reduce confusion from multi-stream inference plots, allow disabling kNN/CRF cleanly, and make proposal decisions auditable.

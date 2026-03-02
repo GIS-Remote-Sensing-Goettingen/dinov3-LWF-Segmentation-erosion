@@ -131,6 +131,32 @@ def _aggregate_fold_metrics(results: list[dict]) -> dict[str, dict[str, float]]:
     return out
 
 
+def _novel_proposals_payload() -> dict[str, object]:
+    """Return the active novel-proposal configuration as a serializable dict.
+
+    Examples:
+        >>> callable(_novel_proposals_payload)
+        True
+    """
+    proposal_cfg = cfg.postprocess.novel_proposals
+    return {
+        "enabled": proposal_cfg.enabled,
+        "heuristic_preset": proposal_cfg.heuristic_preset,
+        "search_scope": proposal_cfg.search_scope,
+        "source": proposal_cfg.source,
+        "score_threshold": proposal_cfg.score_threshold,
+        "min_area_px": proposal_cfg.min_area_px,
+        "min_length_m": proposal_cfg.min_length_m,
+        "max_width_m": proposal_cfg.max_width_m,
+        "min_skeleton_ratio": proposal_cfg.min_skeleton_ratio,
+        "min_pca_ratio": proposal_cfg.min_pca_ratio,
+        "max_circularity": proposal_cfg.max_circularity,
+        "min_mean_score": proposal_cfg.min_mean_score,
+        "max_road_overlap": proposal_cfg.max_road_overlap,
+        "connectivity": proposal_cfg.connectivity,
+    }
+
+
 def tune_on_validation_multi(
     val_paths: list[str],
     gt_vector_paths: list[str],
@@ -983,48 +1009,66 @@ def main():
     source_label_raster = cfg.io.paths.source_label_raster
     gt_vector_paths = cfg.io.paths.eval_gt_vectors
     auto_split_tiles = cfg.io.auto_split.enabled
-
-    # ------------------------------------------------------------
-    # Resolve GT-positive tiles (LOO set) and inference-only tiles
-    # ------------------------------------------------------------
-    if not auto_split_tiles:
-        raise ValueError(
-            "io.auto_split.enabled must be true: directory-driven LOO training is required"
-        )
-    tiles_dir = cfg.io.auto_split.tiles_dir
-    tile_glob = cfg.io.auto_split.tile_glob
-    downsample_factor = cfg.io.auto_split.gt_presence_downsample
-    num_workers = cfg.io.auto_split.gt_presence_workers
-    gt_tiles, holdout_tiles = resolve_tiles_from_gt_presence(
-        tiles_dir,
-        tile_glob,
-        gt_vector_paths,
-        downsample_factor=downsample_factor,
-        num_workers=num_workers,
-    )
-    val_tiles = list(gt_tiles)
-    logger.info(
-        "auto split tiles: gt_tiles=%s inference_tiles=%s",
-        len(val_tiles),
-        len(holdout_tiles),
-    )
-
     context_radius = int(cfg.model.banks.feat_context_radius or 0)
-    min_train_tiles = int(cfg.training.loo.min_train_tiles or 1)
-    val_tiles_per_fold = int(cfg.training.loo.val_tiles_per_fold or 1)
-    min_gt_positive_pixels = int(cfg.training.loo.min_gt_positive_pixels or 0)
-    low_gt_policy = str(cfg.training.loo.low_gt_policy)
 
-    # Resolve required tile sets
     # ------------------------------------------------------------
-    if not val_tiles:
-        raise ValueError("no GT-positive tiles resolved for LOO training")
-    if len(val_tiles) <= val_tiles_per_fold:
-        raise ValueError(
-            "training.loo.val_tiles_per_fold must be < number of GT-positive tiles"
+    # Resolve training/validation/holdout tiles
+    # ------------------------------------------------------------
+    if auto_split_tiles:
+        tiles_dir = cfg.io.auto_split.tiles_dir
+        tile_glob = cfg.io.auto_split.tile_glob
+        downsample_factor = cfg.io.auto_split.gt_presence_downsample
+        num_workers = cfg.io.auto_split.gt_presence_workers
+        gt_tiles, holdout_tiles = resolve_tiles_from_gt_presence(
+            tiles_dir,
+            tile_glob,
+            gt_vector_paths,
+            downsample_factor=downsample_factor,
+            num_workers=num_workers,
         )
-    if not holdout_tiles:
-        logger.warning("no inference-only tiles resolved; skipping holdout inference")
+        val_tiles = list(gt_tiles)
+        logger.info(
+            "auto split tiles: gt_tiles=%s inference_tiles=%s",
+            len(val_tiles),
+            len(holdout_tiles),
+        )
+        if not val_tiles:
+            raise ValueError("no GT-positive tiles resolved for LOO training")
+        min_train_tiles = int(cfg.training.loo.min_train_tiles or 1)
+        val_tiles_per_fold = int(cfg.training.loo.val_tiles_per_fold or 1)
+        min_gt_positive_pixels = int(cfg.training.loo.min_gt_positive_pixels or 0)
+        low_gt_policy = str(cfg.training.loo.low_gt_policy)
+        if len(val_tiles) <= val_tiles_per_fold:
+            raise ValueError(
+                "training.loo.val_tiles_per_fold must be < number of GT-positive tiles"
+            )
+        if not holdout_tiles:
+            logger.warning(
+                "no inference-only tiles resolved; skipping holdout inference"
+            )
+    else:
+        gt_tiles = []
+        source_tiles = list(cfg.io.paths.source_tiles or [cfg.io.paths.source_tile])
+        val_tiles = list(cfg.io.paths.val_tiles)
+        holdout_tiles = list(cfg.io.paths.holdout_tiles)
+        if not source_tiles:
+            raise ValueError(
+                "io.paths.source_tiles/source_tile must be set when io.auto_split.enabled=false"
+            )
+        if not val_tiles:
+            raise ValueError(
+                "io.paths.val_tiles must be set when io.auto_split.enabled=false"
+            )
+        if not holdout_tiles:
+            logger.warning(
+                "no holdout tiles configured in manual mode; skipping holdout inference"
+            )
+        logger.info(
+            "manual tiles: source=%s val=%s holdout=%s",
+            len(source_tiles),
+            len(val_tiles),
+            len(holdout_tiles),
+        )
 
     # ------------------------------------------------------------
     # Feature caching
@@ -1034,6 +1078,7 @@ def main():
         raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
     if (
         feature_cache_mode == "memory"
+        and auto_split_tiles
         and cfg.training.loo.enabled
         and cfg.model.augmentation.enabled
     ):
@@ -1058,6 +1103,255 @@ def main():
     best_fold_runtime_artifacts: dict | None = None
     best_fold_runtime_iou = -1.0
     tile_gt_positive_cache: dict[str, int] = {}
+
+    if (
+        budget_enabled
+        and budget_scope == "training_only"
+        and budget_deadline_ts is None
+    ):
+        budget_clock_start_ts = time.time()
+        budget_deadline_ts = compute_budget_deadline(
+            budget_clock_start_ts, budget_hours
+        )
+
+    if not auto_split_tiles:
+        _log_phase("START", "manual_training_artifacts")
+        (
+            pos_bank,
+            neg_bank,
+            x,
+            y,
+            image_id_a_list,
+            aug_modes,
+            xgb_feature_stats,
+            feature_layout,
+        ) = build_training_artifacts_for_tiles(
+            source_tiles,
+            source_label_raster,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_cache_mode,
+            feature_dir,
+            context_radius,
+        )
+        _log_phase("END", "manual_training_artifacts")
+
+        _log_phase("START", "validation_tuning")
+        tuned = tune_on_validation_multi(
+            val_tiles,
+            gt_vector_paths,
+            model,
+            processor,
+            device,
+            pos_bank,
+            neg_bank,
+            x,
+            y,
+            xgb_feature_stats,
+            feature_layout,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            context_radius,
+        )
+        _log_phase("END", "validation_tuning")
+        tuned = {
+            **tuned,
+            "xgb_feature_stats": xgb_feature_stats,
+            "feature_layout": feature_layout,
+        }
+
+        _log_phase("START", "validation_inference")
+        for val_path in val_tiles:
+            val_result = infer_on_holdout(
+                val_path,
+                gt_vector_paths,
+                model,
+                processor,
+                device,
+                pos_bank,
+                neg_bank,
+                tuned,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                shape_dir,
+                validation_plot_dir,
+                context_radius,
+                plot_with_metrics=True,
+            )
+            if val_result["gt_available"]:
+                _update_phase_metrics(val_phase_metrics, val_result["metrics"])
+            if val_buffer_m is None:
+                val_buffer_m = val_result["buffer_m"]
+                val_pixel_size_m = val_result["pixel_size_m"]
+        _log_phase("END", "validation_inference")
+
+        weighted_phase_metrics: dict[str, dict[str, float]] = {}
+        metric_keys = ["iou", "f1", "precision", "recall"]
+        for phase, metrics_list in val_phase_metrics.items():
+            weights = [float(m.get("_weight", 0.0)) for m in metrics_list]
+            weighted_phase_metrics[phase] = {
+                key: _weighted_mean([m.get(key, 0.0) for m in metrics_list], weights)
+                for key in metric_keys
+            }
+
+        manual_best_fold = {
+            "fold_index": 1,
+            "val_tile": ",".join(val_tiles),
+            "val_champion_shadow_iou": float(
+                weighted_phase_metrics.get("champion_shadow", {}).get("iou", 0.0)
+            ),
+        }
+        write_rolling_best_config(
+            rolling_best_settings_path,
+            stage="manual_validation_tuning",
+            tuned=tuned,
+            fold_done=1,
+            fold_total=1,
+            holdout_done=len(processed_tiles),
+            holdout_total=len(holdout_tiles),
+            best_fold=manual_best_fold,
+            time_budget=_current_time_budget_status(),
+        )
+
+        inference_best_settings_path = os.path.join(
+            run_dir, "inference_best_setting.yml"
+        )
+        xgb_feature_stats_payload = serialize_xgb_feature_stats(
+            tuned.get("xgb_feature_stats")
+        )
+        feature_layout_payload = tuned.get("feature_layout")
+        export_best_settings(
+            tuned["best_raw_config"],
+            tuned["best_crf_config"],
+            cfg.model.backbone.name,
+            source_tiles,
+            f"inference_tiles={len(holdout_tiles)}",
+            float(val_buffer_m) if val_buffer_m is not None else 0.0,
+            float(val_pixel_size_m) if val_pixel_size_m is not None else 0.0,
+            shadow_cfg=tuned["shadow_cfg"],
+            best_xgb_config=tuned["best_xgb_config"],
+            champion_source=tuned["champion_source"],
+            extra_settings={
+                "mode": "manual",
+                "tile_size": tile_size,
+                "stride": stride,
+                "patch_size": ps,
+                "feat_context_radius": context_radius,
+                "neg_alpha": cfg.model.banks.neg_alpha,
+                "pos_frac_thresh": cfg.model.banks.pos_frac_thresh,
+                "max_pos_bank": cfg.model.banks.max_pos_bank,
+                "max_neg_bank": cfg.model.banks.max_neg_bank,
+                "roads_penalty": tuned.get("roads_penalty", 1.0),
+                "roads_mask_path": cfg.io.paths.roads_mask_path,
+                "model_toggles": {
+                    "knn_enabled": cfg.search.knn.enabled,
+                    "xgb_enabled": cfg.search.xgb.enabled,
+                    "crf_enabled": cfg.search.crf.enabled,
+                },
+                "novel_proposals": _novel_proposals_payload(),
+                "feature_spec_hash": hybrid_feature_spec_hash(),
+                "xgb_feature_stats": xgb_feature_stats_payload,
+                "feature_layout": feature_layout_payload,
+                "time_budget": _current_time_budget_status(),
+                "cutover_triggered": cutover_triggered,
+                "cutover_stage": cutover_stage,
+                "source_tiles_count": len(source_tiles),
+                "val_tiles_count": len(val_tiles),
+                "holdout_tiles_count": len(holdout_tiles),
+                "weighted_phase_metrics": weighted_phase_metrics,
+                "loo": {"enabled": False},
+            },
+            best_settings_path=inference_best_settings_path,
+        )
+        logger.info("wrote inference best settings: %s", inference_best_settings_path)
+
+        _log_phase("START", "holdout_inference")
+        holdout_tiles_processed = len(processed_tiles)
+        for b_path in holdout_tiles:
+            if b_path in processed_tiles:
+                logger.info("holdout skip (already processed): %s", b_path)
+                continue
+            result = infer_on_holdout(
+                b_path,
+                gt_vector_paths,
+                model,
+                processor,
+                device,
+                pos_bank,
+                neg_bank,
+                tuned,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                shape_dir,
+                inference_plot_dir,
+                context_radius,
+                plot_with_metrics=False,
+            )
+            if result["gt_available"]:
+                _update_phase_metrics(holdout_phase_metrics, result["metrics"])
+            holdout_tiles_processed += 1
+            ref_path = result["ref_path"]
+            masks = result["masks"]
+            for mask_key, mask_val in masks.items():
+                if "_" not in mask_key:
+                    continue
+                stream, variant = mask_key.split("_", 1)
+                if (stream, variant) not in union_states:
+                    continue
+                _append_union(
+                    stream,
+                    variant,
+                    mask_val,
+                    ref_path,
+                    holdout_tiles_processed,
+                )
+            record = {
+                "tile_path": b_path,
+                "image_id": result["image_id"],
+                "status": "done",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            with open(processed_log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            write_rolling_best_config(
+                rolling_best_settings_path,
+                stage="holdout_inference",
+                tuned=tuned,
+                fold_done=1,
+                fold_total=1,
+                holdout_done=holdout_tiles_processed,
+                holdout_total=len(holdout_tiles),
+                best_fold=manual_best_fold,
+                time_budget=_current_time_budget_status(),
+            )
+        _log_phase("END", "holdout_inference")
+
+        _summarize_phase_metrics(val_phase_metrics, "validation")
+        _summarize_phase_metrics(holdout_phase_metrics, "holdout")
+
+        if feature_cache_mode == "disk":
+            if feature_dir is None:
+                raise ValueError("feature_dir must be set for disk cache mode")
+            _log_phase("START", "feature_consolidation")
+            for image_id_a in image_id_a_list:
+                consolidate_features_for_image(feature_dir, image_id_a)
+            for b_path in val_tiles + holdout_tiles:
+                image_id_b = os.path.splitext(os.path.basename(b_path))[0]
+                consolidate_features_for_image(feature_dir, image_id_b)
+            _log_phase("END", "feature_consolidation")
+
+        time_end("main (total)", t0_main)
+        return
 
     # ------------------------------------------------------------
     # LOO tuning/search: train on N-1 GT tiles, validate on the left-out tile
@@ -1543,6 +1837,7 @@ def main():
         xgb_model_info=xgb_model_info,
         model_info=model_info,
         extra_settings={
+            "mode": "loo",
             "tile_size": tile_size,
             "stride": stride,
             "patch_size": ps,
@@ -1558,22 +1853,7 @@ def main():
                 "xgb_enabled": cfg.search.xgb.enabled,
                 "crf_enabled": cfg.search.crf.enabled,
             },
-            "novel_proposals": {
-                "enabled": cfg.postprocess.novel_proposals.enabled,
-                "heuristic_preset": cfg.postprocess.novel_proposals.heuristic_preset,
-                "search_scope": cfg.postprocess.novel_proposals.search_scope,
-                "source": cfg.postprocess.novel_proposals.source,
-                "score_threshold": cfg.postprocess.novel_proposals.score_threshold,
-                "min_area_px": cfg.postprocess.novel_proposals.min_area_px,
-                "min_length_m": cfg.postprocess.novel_proposals.min_length_m,
-                "max_width_m": cfg.postprocess.novel_proposals.max_width_m,
-                "min_skeleton_ratio": cfg.postprocess.novel_proposals.min_skeleton_ratio,
-                "min_pca_ratio": cfg.postprocess.novel_proposals.min_pca_ratio,
-                "max_circularity": cfg.postprocess.novel_proposals.max_circularity,
-                "min_mean_score": cfg.postprocess.novel_proposals.min_mean_score,
-                "max_road_overlap": cfg.postprocess.novel_proposals.max_road_overlap,
-                "connectivity": cfg.postprocess.novel_proposals.connectivity,
-            },
+            "novel_proposals": _novel_proposals_payload(),
             "feature_spec_hash": hybrid_feature_spec_hash(),
             "xgb_feature_stats": xgb_feature_stats_payload,
             "feature_layout": feature_layout_payload,
