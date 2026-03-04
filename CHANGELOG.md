@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Add persisted model bundles plus inference-only runtime mode (`io.training=false`) to run massive-scale inference without retraining.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/artifacts.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `tests/test_model_bundle.py`, `tests/test_config_loader_inference_mode.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Enable train-once/infer-many operation by reloading tuned XGB/kNN/CRF settings and feature banks.
+- problems fixed: Saves `manifest.yml` + banks + optional XGB model after training, validates bundle/runtime compatibility at load time, supports inference-only tile resolution through `io.inference`, and records bundle metadata in rolling and best-settings outputs.
+
 - Description: Prevent kNN GPU OOM during large-bank scoring by chunking top-k similarity matmuls.
 - file touched: `segedge/core/knn.py`, `CHANGELOG.md`
 - reason: Full `[tile_patches x bank_size]` GPU similarity matrices can exceed memory with multi-million negative banks.

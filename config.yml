@@ -2,6 +2,20 @@
 # Organized for readability by pipeline stage.
 
 io:
+  # true: train+tune then infer; false: load bundle and run inference only.
+  training: true
+
+  inference:
+    # In inference-only mode, load a previously saved model bundle from here.
+    model_bundle_dir: null
+    # Optional inference tile directory for both modes.
+    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
+    tile_glob: "*.tif"
+    # Optional explicit tile list fallback when tiles_dir is null.
+    tiles: []
+    # Save trained bundle at end of training.
+    save_bundle: true
+
   paths:
     # Single-tile fallback used when source_tiles is empty.
     source_tile: data/tiles/dop20_596000_5974000_1km_20cm.tif
@@ -26,10 +40,10 @@ io:
       - data/tiles/dop20_596000_5974000_1km_20cm.tif
       - data/tiles/dop20_596000_5977000_1km_20cm.tif
       - data/tiles/dop20_596000_5983000_1km_20cm.tif
-    # Manual inference source: scan this directory for tiles.
+    # Legacy manual inference source (fallback when io.inference.* is unset).
     inference_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
     inference_glob: "*.tif"
-    # Optional fallback when inference_dir is null.
+    # Legacy fallback when inference_dir is null.
     holdout_tiles: []
 
     # Outputs and caches.

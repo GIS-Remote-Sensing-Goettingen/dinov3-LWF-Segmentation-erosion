@@ -866,6 +866,7 @@ def write_rolling_best_config(
     holdout_total: int,
     best_fold: dict | None = None,
     time_budget: dict | None = None,
+    model_bundle: dict | None = None,
 ) -> None:
     """Write rolling best config checkpoint for interruption-safe resume context.
 
@@ -879,6 +880,7 @@ def write_rolling_best_config(
         holdout_total (int): Total holdout tiles.
         best_fold (dict | None): Optional best-fold metadata.
         time_budget (dict | None): Optional time-budget status payload.
+        model_bundle (dict | None): Optional persisted model-bundle metadata.
 
     Examples:
         >>> callable(write_rolling_best_config)
@@ -910,6 +912,8 @@ def write_rolling_best_config(
         }
     if time_budget is not None:
         payload["time_budget"] = time_budget
+    if model_bundle is not None:
+        payload["model_bundle"] = model_bundle
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         yaml.safe_dump(payload, fh, sort_keys=False, default_flow_style=False)

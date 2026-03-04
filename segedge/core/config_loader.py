@@ -68,8 +68,21 @@ class IOAutoSplitConfig:
 class IOConfig:
     """I/O config group."""
 
+    training: bool
+    inference: "IOInferenceConfig"
     paths: IOPathsConfig
     auto_split: IOAutoSplitConfig
+
+
+@dataclass
+class IOInferenceConfig:
+    """Inference-only execution and model-bundle settings."""
+
+    model_bundle_dir: str | None
+    tiles_dir: str | None
+    tile_glob: str
+    tiles: list[str]
+    save_bundle: bool
 
 
 @dataclass
@@ -458,6 +471,7 @@ def load_config(path: str | Path | None = None) -> Config:
     io = _require_mapping(root["io"], "io")
     io_paths = _require_mapping(io["paths"], "io.paths")
     io_auto_split = _require_mapping(io["auto_split"], "io.auto_split")
+    io_inference = _require_mapping(io.get("inference", {}), "io.inference")
 
     model = _require_mapping(root["model"], "model")
     model_backbone = _require_mapping(model["backbone"], "model.backbone")
@@ -543,6 +557,21 @@ def load_config(path: str | Path | None = None) -> Config:
             if io_auto_split.get("gt_presence_workers") is not None
             else None
         ),
+    )
+    io_inference_cfg = IOInferenceConfig(
+        model_bundle_dir=(
+            str(io_inference["model_bundle_dir"])
+            if io_inference.get("model_bundle_dir") is not None
+            else None
+        ),
+        tiles_dir=(
+            str(io_inference["tiles_dir"])
+            if io_inference.get("tiles_dir") is not None
+            else None
+        ),
+        tile_glob=str(io_inference.get("tile_glob", "*.tif")),
+        tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
+        save_bundle=bool(io_inference.get("save_bundle", True)),
     )
 
     model_cfg = ModelConfig(
@@ -849,9 +878,31 @@ def load_config(path: str | Path | None = None) -> Config:
         0.0 <= search_cfg.xgb.fixed_threshold <= 1.0
     ):
         raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
+    if not bool(io.get("training", True)):
+        if io_inference_cfg.model_bundle_dir is None:
+            raise ValueError(
+                "'io.inference.model_bundle_dir' must be set when io.training=false"
+            )
+        has_inference_tiles = bool(
+            io_inference_cfg.tiles_dir
+            or io_inference_cfg.tiles
+            or io_paths_cfg.inference_dir
+            or io_paths_cfg.holdout_tiles
+        )
+        if not has_inference_tiles:
+            raise ValueError(
+                "set inference tiles via io.inference.tiles_dir/io.inference.tiles "
+                "or legacy io.paths.inference_dir/io.paths.holdout_tiles "
+                "when io.training=false"
+            )
 
     return Config(
-        io=IOConfig(paths=io_paths_cfg, auto_split=io_auto_split_cfg),
+        io=IOConfig(
+            training=bool(io.get("training", True)),
+            inference=io_inference_cfg,
+            paths=io_paths_cfg,
+            auto_split=io_auto_split_cfg,
+        ),
         model=model_cfg,
         training=training_cfg,
         search=search_cfg,

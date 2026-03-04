@@ -9,6 +9,7 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 - `segedge/core/`: Core modules (features, banks, kNN, XGB, CRF, I/O, metrics).
 - `segedge/pipeline/`: Orchestration entrypoints and shared helpers.
 - `segedge/pipeline/runtime_utils.py`: Runtime-heavy helpers split out of `run.py` (roads masks, proposal filtering, rolling checkpoint utilities, tile context loading).
+- `segedge/pipeline/artifacts.py`: Train-time model-bundle persistence and inference-time bundle loading/compat checks.
 - `main.py`: CLI wrapper for the full pipeline.
 - `tests/`: Smoke and end-to-end tests.
 - `scripts/`: Repo health checks (doctest ratio, file length).
@@ -19,6 +20,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
 
 ## Workflow
 1. Configure paths and hyperparameters in `config.yml`.
+   `io.training=true` runs train+tune+inference.
+   `io.training=false` skips training, loads `io.inference.model_bundle_dir`, and runs inference only.
 2. Tile selection supports two modes:
    `io.auto_split.enabled=true`: tiles are discovered from `io.auto_split.tiles_dir`.
    GT-overlap tiles are first identified by vector intersection, then filtered to keep
@@ -35,7 +38,9 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    LOO mode builds artifacts per fold; manual mode builds them once from configured
    source tiles. kNN banks and XGB data can fuse DINO patch embeddings with optional
    image patch cues (`model.hybrid_features`), with train-fold-only z-score stats for XGB.
-4. Run `python main.py` for the full pipeline.
+4. Run `python main.py` for the selected mode.
+   In training mode, a reusable bundle is saved (default `run_xxx/model_bundle` or `io.inference.model_bundle_dir` when set) containing:
+   `manifest.yml`, `pos_bank.npy`, optional `neg_bank.npy`, optional `xgb_model.json`.
 5. During execution, `rolling_best_setting.yml` is updated incrementally so best-known settings survive interruptions.
 6. Optional runtime time-budget cutover (`runtime.time_budget`) can stop training
    phases after the configured wall-clock budget and switch directly to holdout
