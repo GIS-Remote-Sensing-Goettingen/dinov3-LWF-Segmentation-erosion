@@ -31,6 +31,51 @@ from .timing_utils import DEBUG_TIMING, time_end, time_start
 logger = logging.getLogger(__name__)
 
 
+def _chunked_topk_similarities(
+    query_feats: torch.Tensor,
+    bank_feats: torch.Tensor,
+    k_eff: int,
+    *,
+    query_chunk_size: int = 1024,
+    bank_chunk_size: int = 8192,
+) -> torch.Tensor:
+    """Compute per-query top-k similarities without materializing a full matrix.
+
+    Examples:
+        >>> q = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        >>> b = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]])
+        >>> out = _chunked_topk_similarities(q, b, 1, query_chunk_size=1, bank_chunk_size=2)
+        >>> tuple(out.shape)
+        (2, 1)
+    """
+    if k_eff <= 0:
+        raise ValueError("k_eff must be > 0")
+    if bank_feats.shape[0] == 0:
+        raise ValueError("bank_feats must contain at least one row")
+    query_chunk_size = max(1, int(query_chunk_size))
+    bank_chunk_size = max(1, int(bank_chunk_size))
+    topk_rows: list[torch.Tensor] = []
+    for q_start in range(0, query_feats.shape[0], query_chunk_size):
+        q_end = min(query_feats.shape[0], q_start + query_chunk_size)
+        q_chunk = query_feats[q_start:q_end]
+        q_topk: torch.Tensor | None = None
+        for b_start in range(0, bank_feats.shape[0], bank_chunk_size):
+            b_end = min(bank_feats.shape[0], b_start + bank_chunk_size)
+            b_chunk = bank_feats[b_start:b_end]
+            sims_chunk = q_chunk @ b_chunk.t()
+            k_chunk = min(k_eff, sims_chunk.shape[1])
+            chunk_topk = torch.topk(sims_chunk, k=k_chunk, dim=1).values
+            if q_topk is None:
+                q_topk = chunk_topk
+            else:
+                merged = torch.cat((q_topk, chunk_topk), dim=1)
+                q_topk = torch.topk(merged, k=min(k_eff, merged.shape[1]), dim=1).values
+        if q_topk is None:
+            raise ValueError("failed to compute top-k similarities")
+        topk_rows.append(q_topk)
+    return torch.cat(topk_rows, dim=0)
+
+
 def zero_shot_knn_single_scale_B_with_saliency(
     img_b: np.ndarray,
     pos_bank: np.ndarray,
@@ -113,6 +158,15 @@ def zero_shot_knn_single_scale_B_with_saliency(
         logger.info("zero_shot: negative bank disabled (neg_bank is None)")
 
     matmul_time = resize_time = 0.0
+    query_chunk_size = int(
+        getattr(cfg.search.knn, "sim_query_chunk_size", 1024) or 1024
+    )
+    bank_chunk_size = int(getattr(cfg.search.knn, "sim_bank_chunk_size", 8192) or 8192)
+    logger.info(
+        "zero_shot: similarity chunking query_chunk=%s bank_chunk=%s",
+        query_chunk_size,
+        bank_chunk_size,
+    )
     if prefetched_tiles is not None:
         tile_items = sorted(prefetched_tiles.items())
         logger.debug(
@@ -211,12 +265,22 @@ def zero_shot_knn_single_scale_B_with_saliency(
                 pos_bank_local = pos_bank_t
                 neg_bank_local = neg_bank_t
             t_matmul0 = time.perf_counter() if DEBUG_TIMING else None
-            sims_pos_full = x_feats_t @ pos_bank_local.t()
-            sims_pos_topk, _ = torch.topk(sims_pos_full, k=k_pos_eff, dim=1)
+            sims_pos_topk = _chunked_topk_similarities(
+                x_feats_t,
+                pos_bank_local,
+                k_pos_eff,
+                query_chunk_size=query_chunk_size,
+                bank_chunk_size=bank_chunk_size,
+            )
             score_pos = sims_pos_topk.mean(dim=1)
             if use_neg:
-                sims_neg_full = x_feats_t @ neg_bank_local.t()
-                sims_neg_topk, _ = torch.topk(sims_neg_full, k=k_neg_eff, dim=1)
+                sims_neg_topk = _chunked_topk_similarities(
+                    x_feats_t,
+                    neg_bank_local,
+                    k_neg_eff,
+                    query_chunk_size=query_chunk_size,
+                    bank_chunk_size=bank_chunk_size,
+                )
                 score_neg = sims_neg_topk.mean(dim=1)
                 score_batch = score_pos - neg_alpha * score_neg
             else:

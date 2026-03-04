@@ -79,7 +79,7 @@ model:
     bank_erosion_radius: 0
     # Cap positives to keep XGB search tractable on CPU.
     max_pos_bank: 100000
-    max_neg_bank: 1000000
+    max_neg_bank: 500000
 
   augmentation:
     enabled: false
@@ -92,7 +92,7 @@ model:
   # Hybrid feature fusion: DINO embeddings + low-cost image patch descriptors.
   # kNN and XGB intentionally use different normalization geometry.
   hybrid_features:
-    enabled: true
+  enabled: true
     # kNN branch: block-weighted concat + final L2 normalization.
     knn_l2_normalize: true
     # XGB branch: optional z-score standardization (fit on train folds only).

@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Prevent kNN GPU OOM during large-bank scoring by chunking top-k similarity matmuls.
+- file touched: `segedge/core/knn.py`, `CHANGELOG.md`
+- reason: Full `[tile_patches x bank_size]` GPU similarity matrices can exceed memory with multi-million negative banks.
+- problems fixed: Replaces full-matrix kNN similarity matmul with chunked top-k aggregation for both positive and negative banks, avoiding 100+ GiB temporary allocations.
+
 - Description: Add manual-mode inference directory support and switch config to directory-driven inference tiles.
 - file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
 - reason: Avoid maintaining long manual `holdout_tiles` lists when inference should cover a full folder.
