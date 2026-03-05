@@ -155,7 +155,7 @@ training:
 
 search:
   knn:
-    enabled: true
+    enabled: false
     k_values: [15, 25, 30,175,225]
     thresholds:
       start: 0.01
