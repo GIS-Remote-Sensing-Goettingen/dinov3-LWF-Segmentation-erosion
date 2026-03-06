@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Switch persisted inference bundle to XGB-only artifacts, drop bank `.npy` files, and restore legacy `best_setting.yml` alongside `inference_best_setting.yml`.
+- file touched: `segedge/pipeline/artifacts.py`, `segedge/pipeline/run.py`, `tests/test_model_bundle.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: kNN bank arrays are too large for practical persistence, while current inference reuse only needs XGB.
+- problems fixed: Bundle save/load now requires only `xgb_model.json` + manifest metadata, avoids writing huge `pos_bank.npy`/`neg_bank.npy`, forces XGB-only behavior for `io.training=false` loads, and writes both best-settings filenames for compatibility.
+
 - Description: Add persisted model bundles plus inference-only runtime mode (`io.training=false`) to run massive-scale inference without retraining.
 - file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/artifacts.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `tests/test_model_bundle.py`, `tests/test_config_loader_inference_mode.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
 - reason: Enable train-once/infer-many operation by reloading tuned XGB/kNN/CRF settings and feature banks.

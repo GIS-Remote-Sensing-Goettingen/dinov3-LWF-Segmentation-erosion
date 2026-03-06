@@ -51,8 +51,8 @@ def save_model_bundle(
     Args:
         bundle_dir (str): Output directory for the bundle.
         tuned (dict): Tuned configuration payload.
-        pos_bank (np.ndarray): Positive kNN bank.
-        neg_bank (np.ndarray | None): Negative kNN bank.
+        pos_bank (np.ndarray): Unused; kept for call compatibility.
+        neg_bank (np.ndarray | None): Unused; kept for call compatibility.
         model_name (str): Backbone name.
         patch_size (int): Patch size used by the model.
         resample_factor (int): Resample factor.
@@ -69,15 +69,8 @@ def save_model_bundle(
     """
     os.makedirs(bundle_dir, exist_ok=True)
 
-    pos_bank_file = "pos_bank.npy"
-    neg_bank_file = "neg_bank.npy" if neg_bank is not None else None
     xgb_model_file = "xgb_model.json" if tuned.get("bst") is not None else None
     manifest_file = "manifest.yml"
-
-    pos_bank_path = os.path.join(bundle_dir, pos_bank_file)
-    np.save(pos_bank_path, pos_bank.astype(np.float32))
-    if neg_bank is not None:
-        np.save(os.path.join(bundle_dir, neg_bank_file), neg_bank.astype(np.float32))
 
     if tuned.get("bst") is not None:
         tuned["bst"].save_model(os.path.join(bundle_dir, xgb_model_file))
@@ -85,6 +78,7 @@ def save_model_bundle(
     created_utc = datetime.now(timezone.utc).isoformat()
     manifest = {
         "bundle_version": _BUNDLE_VERSION,
+        "bundle_mode": "xgb_only",
         "created_utc": created_utc,
         "model": {
             "name": model_name,
@@ -114,8 +108,6 @@ def save_model_bundle(
         },
         "artifacts": {
             "manifest": manifest_file,
-            "pos_bank": pos_bank_file,
-            "neg_bank": neg_bank_file,
             "xgb_model": xgb_model_file,
         },
     }
@@ -159,35 +151,15 @@ def load_model_bundle(bundle_dir: str) -> dict[str, Any]:
     model_toggles = manifest.get("model_toggles", {})
     tuned_payload = manifest.get("tuned", {})
 
-    pos_bank_file = artifacts.get("pos_bank", "pos_bank.npy")
-    pos_bank_path = os.path.join(bundle_dir, pos_bank_file)
-    if not os.path.exists(pos_bank_path):
-        raise ValueError(f"model bundle missing pos_bank artifact: {pos_bank_path}")
-    pos_bank = np.load(pos_bank_path).astype(np.float32, copy=False)
-
-    neg_bank = None
-    neg_bank_file = artifacts.get("neg_bank")
-    if neg_bank_file:
-        neg_bank_path = os.path.join(bundle_dir, neg_bank_file)
-        if not os.path.exists(neg_bank_path):
-            raise ValueError(f"model bundle missing neg_bank artifact: {neg_bank_path}")
-        neg_bank = np.load(neg_bank_path).astype(np.float32, copy=False)
-
-    bst = None
-    xgb_enabled = bool(model_toggles.get("xgb_enabled", True))
+    xgb_enabled = True
     xgb_model_file = artifacts.get("xgb_model")
-    if xgb_enabled:
-        if not xgb_model_file:
-            raise ValueError(
-                "model bundle declares xgb_enabled=true but xgb_model artifact is missing"
-            )
-        xgb_model_path = os.path.join(bundle_dir, xgb_model_file)
-        if not os.path.exists(xgb_model_path):
-            raise ValueError(
-                f"model bundle missing xgb_model artifact: {xgb_model_path}"
-            )
-        bst = xgb.Booster()
-        bst.load_model(xgb_model_path)
+    if not xgb_model_file:
+        raise ValueError("model bundle missing required xgb_model artifact entry")
+    xgb_model_path = os.path.join(bundle_dir, xgb_model_file)
+    if not os.path.exists(xgb_model_path):
+        raise ValueError(f"model bundle missing xgb_model artifact: {xgb_model_path}")
+    bst = xgb.Booster()
+    bst.load_model(xgb_model_path)
 
     tuned = {
         "bst": bst,
@@ -195,19 +167,19 @@ def load_model_bundle(bundle_dir: str) -> dict[str, Any]:
         "best_xgb_config": tuned_payload.get("best_xgb_config"),
         "best_crf_config": tuned_payload.get("best_crf_config"),
         "shadow_cfg": tuned_payload.get("shadow_cfg"),
-        "champion_source": tuned_payload.get("champion_source"),
+        "champion_source": "xgb",
         "roads_penalty": tuned_payload.get("roads_penalty", 1.0),
         "xgb_feature_stats": tuned_payload.get("xgb_feature_stats"),
         "feature_layout": tuned_payload.get("feature_layout"),
-        "knn_enabled": bool(model_toggles.get("knn_enabled", True)),
+        "knn_enabled": False,
         "xgb_enabled": xgb_enabled,
         "crf_enabled": bool(model_toggles.get("crf_enabled", True)),
     }
     return {
         "manifest": manifest,
         "tuned": tuned,
-        "pos_bank": pos_bank,
-        "neg_bank": neg_bank,
+        "pos_bank": np.empty((0, 0), dtype=np.float32),
+        "neg_bank": None,
     }
 
 

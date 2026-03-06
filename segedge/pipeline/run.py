@@ -135,6 +135,63 @@ def _novel_proposals_payload() -> dict[str, object]:
     }
 
 
+def _export_best_settings_dual(
+    best_raw_config,
+    best_crf_config,
+    model_name,
+    img_path,
+    img2_path,
+    buffer_m,
+    pixel_size_m,
+    shadow_cfg=None,
+    best_xgb_config: dict | None = None,
+    champion_source: str | None = None,
+    xgb_model_info: dict | None = None,
+    model_info: dict | None = None,
+    extra_settings: dict | None = None,
+    inference_best_settings_path: str | None = None,
+) -> tuple[str, str]:
+    """Write both current and legacy best-settings YAML files."""
+    if inference_best_settings_path is None:
+        raise ValueError("inference_best_settings_path must be provided")
+    export_best_settings(
+        best_raw_config,
+        best_crf_config,
+        model_name,
+        img_path,
+        img2_path,
+        buffer_m,
+        pixel_size_m,
+        shadow_cfg=shadow_cfg,
+        best_xgb_config=best_xgb_config,
+        champion_source=champion_source,
+        xgb_model_info=xgb_model_info,
+        model_info=model_info,
+        extra_settings=extra_settings,
+        best_settings_path=inference_best_settings_path,
+    )
+    legacy_best_settings_path = os.path.join(
+        os.path.dirname(inference_best_settings_path), "best_setting.yml"
+    )
+    export_best_settings(
+        best_raw_config,
+        best_crf_config,
+        model_name,
+        img_path,
+        img2_path,
+        buffer_m,
+        pixel_size_m,
+        shadow_cfg=shadow_cfg,
+        best_xgb_config=best_xgb_config,
+        champion_source=champion_source,
+        xgb_model_info=xgb_model_info,
+        model_info=model_info,
+        extra_settings=extra_settings,
+        best_settings_path=legacy_best_settings_path,
+    )
+    return inference_best_settings_path, legacy_best_settings_path
+
+
 def main():
     """Run the full segmentation pipeline for configured tiles.
 
@@ -542,7 +599,7 @@ def main():
             tuned.get("xgb_feature_stats")
         )
         feature_layout_payload = tuned.get("feature_layout")
-        export_best_settings(
+        _, legacy_best_settings_path = _export_best_settings_dual(
             tuned["best_raw_config"],
             tuned["best_crf_config"],
             cfg.model.backbone.name,
@@ -576,9 +633,13 @@ def main():
                 "inference_glob": inference_glob,
                 "model_bundle": model_bundle_info,
             },
-            best_settings_path=inference_best_settings_path,
+            inference_best_settings_path=inference_best_settings_path,
         )
-        logger.info("wrote inference best settings: %s", inference_best_settings_path)
+        logger.info(
+            "wrote best settings: %s and %s",
+            inference_best_settings_path,
+            legacy_best_settings_path,
+        )
 
         _log_phase("START", "holdout_inference")
         run_holdout_inference(
@@ -695,7 +756,7 @@ def main():
             "xgb_feature_stats": xgb_feature_stats,
             "feature_layout": feature_layout,
         }
-        if bundle_save_enabled:
+        if bundle_save_enabled and tuned.get("bst") is not None:
             model_bundle_info = save_model_bundle(
                 bundle_output_dir,
                 tuned,
@@ -709,6 +770,10 @@ def main():
                 context_radius=context_radius,
             )
             logger.info("saved model bundle: %s", model_bundle_info["path"])
+        elif bundle_save_enabled:
+            logger.warning(
+                "bundle save requested but no XGB model is available; skipping save"
+            )
 
         _log_phase("START", "validation_inference")
         for val_path in val_tiles:
@@ -773,7 +838,7 @@ def main():
             tuned.get("xgb_feature_stats")
         )
         feature_layout_payload = tuned.get("feature_layout")
-        export_best_settings(
+        _, legacy_best_settings_path = _export_best_settings_dual(
             tuned["best_raw_config"],
             tuned["best_crf_config"],
             cfg.model.backbone.name,
@@ -817,9 +882,13 @@ def main():
                 "model_bundle": model_bundle_info,
                 "loo": {"enabled": False},
             },
-            best_settings_path=inference_best_settings_path,
+            inference_best_settings_path=inference_best_settings_path,
         )
-        logger.info("wrote inference best settings: %s", inference_best_settings_path)
+        logger.info(
+            "wrote best settings: %s and %s",
+            inference_best_settings_path,
+            legacy_best_settings_path,
+        )
 
         _log_phase("START", "holdout_inference")
         run_holdout_inference(
@@ -1238,7 +1307,7 @@ def main():
             "feature_layout": feature_layout,
         }
         _log_phase("END", "final_all_gt_training")
-    if bundle_save_enabled:
+    if bundle_save_enabled and tuned.get("bst") is not None:
         model_bundle_info = save_model_bundle(
             bundle_output_dir,
             tuned,
@@ -1252,6 +1321,10 @@ def main():
             context_radius=context_radius,
         )
         logger.info("saved model bundle: %s", model_bundle_info["path"])
+    elif bundle_save_enabled:
+        logger.warning(
+            "bundle save requested but no XGB model is available; skipping save"
+        )
     write_rolling_best_config(
         rolling_best_settings_path,
         stage=final_stage_name,
@@ -1364,7 +1437,7 @@ def main():
             "cutover_stage": cutover_stage,
         },
     }
-    export_best_settings(
+    _, legacy_best_settings_path = _export_best_settings_dual(
         tuned["best_raw_config"],
         tuned["best_crf_config"],
         cfg.model.backbone.name,
@@ -1420,9 +1493,13 @@ def main():
                 "folds": loo_fold_export,
             },
         },
-        best_settings_path=inference_best_settings_path,
+        inference_best_settings_path=inference_best_settings_path,
     )
-    logger.info("wrote inference best settings: %s", inference_best_settings_path)
+    logger.info(
+        "wrote best settings: %s and %s",
+        inference_best_settings_path,
+        legacy_best_settings_path,
+    )
 
     if halt_before_inference:
         _summarize_phase_metrics(val_phase_metrics, "loo_validation")

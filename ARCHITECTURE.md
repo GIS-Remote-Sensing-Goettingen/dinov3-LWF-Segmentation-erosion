@@ -40,7 +40,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    image patch cues (`model.hybrid_features`), with train-fold-only z-score stats for XGB.
 4. Run `python main.py` for the selected mode.
    In training mode, a reusable bundle is saved (default `run_xxx/model_bundle` or `io.inference.model_bundle_dir` when set) containing:
-   `manifest.yml`, `pos_bank.npy`, optional `neg_bank.npy`, optional `xgb_model.json`.
+   `manifest.yml` and `xgb_model.json` (XGB-only persisted artifact mode; no bank `.npy` files).
+   Best settings are written to both `inference_best_setting.yml` and legacy `best_setting.yml`.
 5. During execution, `rolling_best_setting.yml` is updated incrementally so best-known settings survive interruptions.
 6. Optional runtime time-budget cutover (`runtime.time_budget`) can stop training
    phases after the configured wall-clock budget and switch directly to holdout
