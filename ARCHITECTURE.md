@@ -34,6 +34,8 @@ Document the SegEdge zero-shot segmentation pipeline structure and entrypoints.
    `io.paths.source_tiles` (fallback `io.paths.source_tile`) and
    `io.paths.val_tiles`; inference tiles come from `io.paths.inference_dir`
    (glob `io.paths.inference_glob`) or fallback `io.paths.holdout_tiles`.
+   Folder/list-based inference tiles are filtered to those intersecting
+   `io.paths.source_label_raster`; if none remain, holdout inference is skipped.
 3. Training artifacts are built from source tiles:
    LOO mode builds artifacts per fold; manual mode builds them once from configured
    source tiles. kNN banks and XGB data can fuse DINO patch embeddings with optional

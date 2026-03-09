@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from typing import Callable
 
 import numpy as np
 import yaml
@@ -133,6 +134,31 @@ def _novel_proposals_payload() -> dict[str, object]:
         "max_road_overlap": proposal_cfg.max_road_overlap,
         "connectivity": proposal_cfg.connectivity,
     }
+
+
+def _maybe_run_holdout_inference(
+    holdout_tiles: list[str],
+    runner: Callable[[], None],
+) -> bool:
+    """Run holdout inference only when tiles are available.
+
+    Examples:
+        >>> calls = []
+        >>> _maybe_run_holdout_inference([], lambda: calls.append("ran"))
+        False
+        >>> calls
+        []
+    """
+    if not holdout_tiles:
+        logger.warning(
+            "no inference tiles available after SOURCE_LABEL_RASTER filtering; "
+            "skipping holdout inference"
+        )
+        return False
+    _log_phase("START", "holdout_inference")
+    runner()
+    _log_phase("END", "holdout_inference")
+    return True
 
 
 def _export_best_settings_dual(
@@ -437,11 +463,6 @@ def main():
             logger=logger,
         )
         auto_split_tiles = False
-        if not holdout_tiles:
-            raise ValueError(
-                "no inference tiles resolved; set io.inference.tiles_dir, "
-                "io.inference.tiles, or io.paths.holdout_tiles"
-            )
         logger.info(
             "inference-only mode: holdout=%s bundle_dir=%s",
             len(holdout_tiles),
@@ -475,10 +496,6 @@ def main():
             raise ValueError(
                 "training.loo.val_tiles_per_fold must be < number of GT-positive tiles"
             )
-        if not holdout_tiles:
-            logger.warning(
-                "no inference-only tiles resolved; skipping holdout inference"
-            )
     else:
         gt_tiles = []
         source_tiles = list(cfg.io.paths.source_tiles or [cfg.io.paths.source_tile])
@@ -499,12 +516,6 @@ def main():
         if not val_tiles:
             raise ValueError(
                 "io.paths.val_tiles must be set when io.auto_split.enabled=false"
-            )
-        if not holdout_tiles:
-            logger.warning(
-                "no inference tiles resolved in manual mode; "
-                "set io.inference.tiles_dir/io.inference.tiles "
-                "or io.paths.inference_dir/io.paths.holdout_tiles"
             )
         logger.info(
             "manual tiles: source=%s val=%s holdout=%s",
@@ -641,46 +652,47 @@ def main():
             legacy_best_settings_path,
         )
 
-        _log_phase("START", "holdout_inference")
-        run_holdout_inference(
-            holdout_tiles=holdout_tiles,
-            processed_tiles=processed_tiles,
-            gt_vector_paths=gt_vector_paths,
-            model=model,
-            processor=processor,
-            device=device,
-            pos_bank=pos_bank,
-            neg_bank=neg_bank,
-            tuned=tuned,
-            ps=ps,
-            tile_size=tile_size,
-            stride=stride,
-            feature_dir=feature_dir,
-            shape_dir=shape_dir,
-            plot_dir=inference_plot_dir,
-            context_radius=context_radius,
-            holdout_phase_metrics=holdout_phase_metrics,
-            append_union=lambda stream, variant, mask, ref_path, step: (
-                _append_union(stream, variant, mask, ref_path, step)
-                if (stream, variant) in union_states
-                else None
-            ),
-            processed_log_path=processed_log_path,
-            write_checkpoint=lambda holdout_done: write_rolling_best_config(
-                rolling_best_settings_path,
-                stage="holdout_inference",
+        _maybe_run_holdout_inference(
+            holdout_tiles,
+            lambda: run_holdout_inference(
+                holdout_tiles=holdout_tiles,
+                processed_tiles=processed_tiles,
+                gt_vector_paths=gt_vector_paths,
+                model=model,
+                processor=processor,
+                device=device,
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
                 tuned=tuned,
-                fold_done=0,
-                fold_total=0,
-                holdout_done=holdout_done,
-                holdout_total=len(holdout_tiles),
-                best_fold=None,
-                time_budget=_current_time_budget_status(),
-                model_bundle=model_bundle_info,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                feature_dir=feature_dir,
+                shape_dir=shape_dir,
+                plot_dir=inference_plot_dir,
+                context_radius=context_radius,
+                holdout_phase_metrics=holdout_phase_metrics,
+                append_union=lambda stream, variant, mask, ref_path, step: (
+                    _append_union(stream, variant, mask, ref_path, step)
+                    if (stream, variant) in union_states
+                    else None
+                ),
+                processed_log_path=processed_log_path,
+                write_checkpoint=lambda holdout_done: write_rolling_best_config(
+                    rolling_best_settings_path,
+                    stage="holdout_inference",
+                    tuned=tuned,
+                    fold_done=0,
+                    fold_total=0,
+                    holdout_done=holdout_done,
+                    holdout_total=len(holdout_tiles),
+                    best_fold=None,
+                    time_budget=_current_time_budget_status(),
+                    model_bundle=model_bundle_info,
+                ),
+                logger=logger,
             ),
-            logger=logger,
         )
-        _log_phase("END", "holdout_inference")
 
         _summarize_phase_metrics(holdout_phase_metrics, "holdout")
         if feature_cache_mode == "disk":
@@ -890,46 +902,47 @@ def main():
             legacy_best_settings_path,
         )
 
-        _log_phase("START", "holdout_inference")
-        run_holdout_inference(
-            holdout_tiles=holdout_tiles,
-            processed_tiles=processed_tiles,
-            gt_vector_paths=gt_vector_paths,
-            model=model,
-            processor=processor,
-            device=device,
-            pos_bank=pos_bank,
-            neg_bank=neg_bank,
-            tuned=tuned,
-            ps=ps,
-            tile_size=tile_size,
-            stride=stride,
-            feature_dir=feature_dir,
-            shape_dir=shape_dir,
-            plot_dir=inference_plot_dir,
-            context_radius=context_radius,
-            holdout_phase_metrics=holdout_phase_metrics,
-            append_union=lambda stream, variant, mask, ref_path, step: (
-                _append_union(stream, variant, mask, ref_path, step)
-                if (stream, variant) in union_states
-                else None
-            ),
-            processed_log_path=processed_log_path,
-            write_checkpoint=lambda holdout_done: write_rolling_best_config(
-                rolling_best_settings_path,
-                stage="holdout_inference",
+        _maybe_run_holdout_inference(
+            holdout_tiles,
+            lambda: run_holdout_inference(
+                holdout_tiles=holdout_tiles,
+                processed_tiles=processed_tiles,
+                gt_vector_paths=gt_vector_paths,
+                model=model,
+                processor=processor,
+                device=device,
+                pos_bank=pos_bank,
+                neg_bank=neg_bank,
                 tuned=tuned,
-                fold_done=1,
-                fold_total=1,
-                holdout_done=holdout_done,
-                holdout_total=len(holdout_tiles),
-                best_fold=manual_best_fold,
-                time_budget=_current_time_budget_status(),
-                model_bundle=model_bundle_info,
+                ps=ps,
+                tile_size=tile_size,
+                stride=stride,
+                feature_dir=feature_dir,
+                shape_dir=shape_dir,
+                plot_dir=inference_plot_dir,
+                context_radius=context_radius,
+                holdout_phase_metrics=holdout_phase_metrics,
+                append_union=lambda stream, variant, mask, ref_path, step: (
+                    _append_union(stream, variant, mask, ref_path, step)
+                    if (stream, variant) in union_states
+                    else None
+                ),
+                processed_log_path=processed_log_path,
+                write_checkpoint=lambda holdout_done: write_rolling_best_config(
+                    rolling_best_settings_path,
+                    stage="holdout_inference",
+                    tuned=tuned,
+                    fold_done=1,
+                    fold_total=1,
+                    holdout_done=holdout_done,
+                    holdout_total=len(holdout_tiles),
+                    best_fold=manual_best_fold,
+                    time_budget=_current_time_budget_status(),
+                    model_bundle=model_bundle_info,
+                ),
+                logger=logger,
             ),
-            logger=logger,
         )
-        _log_phase("END", "holdout_inference")
 
         _summarize_phase_metrics(val_phase_metrics, "validation")
         _summarize_phase_metrics(holdout_phase_metrics, "holdout")
@@ -1507,46 +1520,47 @@ def main():
         time_end("main (total)", t0_main)
         return
 
-    _log_phase("START", "holdout_inference")
-    run_holdout_inference(
-        holdout_tiles=holdout_tiles,
-        processed_tiles=processed_tiles,
-        gt_vector_paths=gt_vector_paths,
-        model=model,
-        processor=processor,
-        device=device,
-        pos_bank=pos_bank,
-        neg_bank=neg_bank,
-        tuned=tuned,
-        ps=ps,
-        tile_size=tile_size,
-        stride=stride,
-        feature_dir=feature_dir,
-        shape_dir=shape_dir,
-        plot_dir=inference_plot_dir,
-        context_radius=context_radius,
-        holdout_phase_metrics=holdout_phase_metrics,
-        append_union=lambda stream, variant, mask, ref_path, step: (
-            _append_union(stream, variant, mask, ref_path, step)
-            if (stream, variant) in union_states
-            else None
-        ),
-        processed_log_path=processed_log_path,
-        write_checkpoint=lambda holdout_done: write_rolling_best_config(
-            rolling_best_settings_path,
-            stage="holdout_inference",
+    _maybe_run_holdout_inference(
+        holdout_tiles,
+        lambda: run_holdout_inference(
+            holdout_tiles=holdout_tiles,
+            processed_tiles=processed_tiles,
+            gt_vector_paths=gt_vector_paths,
+            model=model,
+            processor=processor,
+            device=device,
+            pos_bank=pos_bank,
+            neg_bank=neg_bank,
             tuned=tuned,
-            fold_done=len(loo_fold_records),
-            fold_total=fold_total,
-            holdout_done=holdout_done,
-            holdout_total=len(holdout_tiles),
-            best_fold=best_fold,
-            time_budget=_current_time_budget_status(),
-            model_bundle=model_bundle_info,
+            ps=ps,
+            tile_size=tile_size,
+            stride=stride,
+            feature_dir=feature_dir,
+            shape_dir=shape_dir,
+            plot_dir=inference_plot_dir,
+            context_radius=context_radius,
+            holdout_phase_metrics=holdout_phase_metrics,
+            append_union=lambda stream, variant, mask, ref_path, step: (
+                _append_union(stream, variant, mask, ref_path, step)
+                if (stream, variant) in union_states
+                else None
+            ),
+            processed_log_path=processed_log_path,
+            write_checkpoint=lambda holdout_done: write_rolling_best_config(
+                rolling_best_settings_path,
+                stage="holdout_inference",
+                tuned=tuned,
+                fold_done=len(loo_fold_records),
+                fold_total=fold_total,
+                holdout_done=holdout_done,
+                holdout_total=len(holdout_tiles),
+                best_fold=best_fold,
+                time_budget=_current_time_budget_status(),
+                model_bundle=model_bundle_info,
+            ),
+            logger=logger,
         ),
-        logger=logger,
     )
-    _log_phase("END", "holdout_inference")
 
     _summarize_phase_metrics(val_phase_metrics, "loo_validation")
     _summarize_phase_metrics(holdout_phase_metrics, "holdout")

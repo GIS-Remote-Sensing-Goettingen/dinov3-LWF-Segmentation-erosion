@@ -9,6 +9,7 @@ from typing import Callable
 
 import numpy as np
 
+from .common import filter_tiles_by_source_label_raster_overlap
 from .runtime_utils import _update_phase_metrics, infer_on_holdout
 
 
@@ -42,10 +43,34 @@ def resolve_inference_tiles(
             tile_glob,
             len(tiles),
         )
-        return tiles, tiles_dir, tile_glob
+        filtered_tiles, excluded_count = filter_tiles_by_source_label_raster_overlap(
+            tiles
+        )
+        if excluded_count:
+            logger.info(
+                "inference: excluded %s tiles with no SOURCE_LABEL_RASTER overlap",
+                excluded_count,
+            )
+        return filtered_tiles, tiles_dir, tile_glob
     if explicit_tiles:
-        return explicit_tiles, None, tile_glob
-    return list(legacy_holdout_tiles), None, tile_glob
+        filtered_tiles, excluded_count = filter_tiles_by_source_label_raster_overlap(
+            explicit_tiles
+        )
+        if excluded_count:
+            logger.info(
+                "inference: excluded %s explicit tiles with no SOURCE_LABEL_RASTER overlap",
+                excluded_count,
+            )
+        return filtered_tiles, None, tile_glob
+    filtered_tiles, excluded_count = filter_tiles_by_source_label_raster_overlap(
+        list(legacy_holdout_tiles)
+    )
+    if excluded_count:
+        logger.info(
+            "inference: excluded %s legacy holdout tiles with no SOURCE_LABEL_RASTER overlap",
+            excluded_count,
+        )
+    return filtered_tiles, None, tile_glob
 
 
 def run_holdout_inference(

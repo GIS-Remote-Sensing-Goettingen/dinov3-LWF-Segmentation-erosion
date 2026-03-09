@@ -195,6 +195,61 @@ def _chunk_tiles(tile_paths: list[str], chunk_size: int) -> list[list[str]]:
     ]
 
 
+def filter_tiles_by_source_label_raster_overlap(
+    tile_paths: list[str],
+    raster_path: str | None = None,
+) -> tuple[list[str], int]:
+    """Filter tiles to those overlapping the source label raster extent.
+
+    Args:
+        tile_paths (list[str]): Candidate tile paths.
+        raster_path (str | None): Optional raster path override. When omitted,
+            uses ``cfg.io.paths.source_label_raster``.
+
+    Returns:
+        tuple[list[str], int]: Filtered tile paths and excluded tile count.
+
+    Examples:
+        >>> filter_tiles_by_source_label_raster_overlap([], raster_path=None)
+        ([], 0)
+    """
+    if not tile_paths:
+        return [], 0
+    raster_path = (
+        cfg.io.paths.source_label_raster if raster_path is None else str(raster_path)
+    )
+    if not raster_path:
+        return list(tile_paths), 0
+
+    with rio_open(raster_path) as src:
+        raster_crs = src.crs
+        raster_bounds = src.bounds
+
+    filtered_paths = []
+    excluded_count = 0
+    for tile_path in tile_paths:
+        with rio_open(tile_path) as tile_src:
+            tile_bounds = tile_src.bounds
+            tile_crs = tile_src.crs
+        if raster_crs is not None and tile_crs is not None and tile_crs != raster_crs:
+            tile_bounds = transform_bounds(
+                tile_crs, raster_crs, *tile_bounds, densify_pts=21
+            )
+        tb_left, tb_bottom, tb_right, tb_top = tile_bounds
+        rb_left, rb_bottom, rb_right, rb_top = raster_bounds
+        intersects = not (
+            tb_right <= rb_left
+            or tb_left >= rb_right
+            or tb_top <= rb_bottom
+            or tb_bottom >= rb_top
+        )
+        if intersects:
+            filtered_paths.append(tile_path)
+        else:
+            excluded_count += 1
+    return filtered_paths, excluded_count
+
+
 def _tiles_with_gt_chunk(
     tile_paths: list[str],
     gt_vector_paths: list[str],
@@ -378,36 +433,10 @@ def resolve_tiles_from_gt_presence(
     if downsample_factor is None:
         downsample_factor = int(cfg.model.backbone.resample_factor or 1)
 
-    raster_path = cfg.io.paths.source_label_raster
-    filtered_paths = []
-    excluded_by_raster = 0
-    if raster_path:
-        with rio_open(raster_path) as src:
-            raster_crs = src.crs
-            raster_bounds = src.bounds
-        for tile_path in tile_paths:
-            with rio_open(tile_path) as tile_src:
-                tile_bounds = tile_src.bounds
-                tile_crs = tile_src.crs
-            if raster_crs is not None and tile_crs is not None:
-                if tile_crs != raster_crs:
-                    tile_bounds = transform_bounds(
-                        tile_crs, raster_crs, *tile_bounds, densify_pts=21
-                    )
-            tb_left, tb_bottom, tb_right, tb_top = tile_bounds
-            rb_left, rb_bottom, rb_right, rb_top = raster_bounds
-            intersects = not (
-                tb_right <= rb_left
-                or tb_left >= rb_right
-                or tb_top <= rb_bottom
-                or tb_bottom >= rb_top
-            )
-            if intersects:
-                filtered_paths.append(tile_path)
-            else:
-                excluded_by_raster += 1
-    else:
-        filtered_paths = tile_paths
+    filtered_paths, excluded_by_raster = filter_tiles_by_source_label_raster_overlap(
+        tile_paths,
+        raster_path=cfg.io.paths.source_label_raster,
+    )
     if excluded_by_raster:
         logger.info(
             "auto split: excluded %s tiles with no SOURCE_LABEL_RASTER overlap",

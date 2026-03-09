@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Filter folder/list-based inference tiles by SOURCE_LABEL_RASTER overlap and keep rolling union outputs updated tile by tile.
+- file touched: `segedge/pipeline/common.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/run.py`, `tests/test_inference_flow.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Avoid spending inference time on tiles outside source-label coverage and preserve usable mask geometry if a long job stops mid-run.
+- problems fixed: Inference tile resolution now skips non-overlapping tiles in both training+inference and inference-only modes, empty filtered holdout sets no longer crash the run, and tests verify union-mask append/checkpoint updates happen after each inferred tile.
+
 - Description: Force serial CRF tuning when CUDA is active, cap CRF workers to candidate count, and retry serially if the CRF process pool crashes.
 - file touched: `config.yml`, `segedge/pipeline/tuning.py`, `CHANGELOG.md`
 - reason: Prevent `BrokenProcessPool` / `Bus error` failures during CRF tuning from unsafe process forking and pointless worker oversubscription.
