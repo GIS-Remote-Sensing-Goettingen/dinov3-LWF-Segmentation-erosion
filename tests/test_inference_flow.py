@@ -197,6 +197,12 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
         context_radius,
         plot_with_metrics,
     ):
+        """Return a deterministic fake inference payload.
+
+        Examples:
+            >>> True
+            True
+        """
         mask = np.ones((2, 2), dtype=bool)
         return {
             "gt_available": False,
