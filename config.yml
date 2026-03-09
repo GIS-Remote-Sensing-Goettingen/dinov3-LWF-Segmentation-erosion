@@ -2,8 +2,22 @@
 # Organized for readability by pipeline stage.
 
 io:
+  # true: train+tune then infer; false: load bundle and run inference only.
+  training: true
+
+  inference:
+    # In inference-only mode, load a previously saved model bundle from here.
+    model_bundle_dir: null
+    # Optional inference tile directory for both modes.
+    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
+    tile_glob: "*.tif"
+    # Optional explicit tile list fallback when tiles_dir is null.
+    tiles: []
+    # Save trained bundle at end of training.
+    save_bundle: true
+
   paths:
-    # Single-tile fallbacks (kept for compatibility; LOO uses auto_split tiles).
+    # Single-tile fallback used when source_tiles is empty.
     source_tile: data/tiles/dop20_596000_5974000_1km_20cm.tif
     target_tile: data/dop20_592000_5982000_1km_20cm.tif
 
@@ -15,9 +29,21 @@ io:
       - data/lables/lables_3.shp
       - data/lables/labels_final.shp
 
-    # Manual tile lists are deprecated when using directory-driven LOO.
-    source_tiles: []
-    val_tiles: []
+    # Manual mode tile lists (used when io.auto_split.enabled=false).
+    source_tiles:
+      - data/tiles/dop20_596000_5974000_1km_20cm.tif
+      - data/tiles/dop20_596000_5975000_1km_20cm.tif
+      - data/tiles/dop20_596000_5976000_1km_20cm.tif
+      - data/tiles/dop20_596000_5977000_1km_20cm.tif
+      - data/tiles/dop20_596000_5983000_1km_20cm.tif
+    val_tiles:
+      - data/tiles/dop20_596000_5974000_1km_20cm.tif
+      - data/tiles/dop20_596000_5977000_1km_20cm.tif
+      - data/tiles/dop20_596000_5983000_1km_20cm.tif
+    # Legacy manual inference source (fallback when io.inference.* is unset).
+    inference_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
+    inference_glob: "*.tif"
+    # Legacy fallback when inference_dir is null.
     holdout_tiles: []
 
     # Outputs and caches.
@@ -32,7 +58,8 @@ io:
     roads_mask_path: data/roads/roads_mask.shp
 
   auto_split:
-    enabled: true
+    # true: directory-driven LOO; false: manual source/val/holdout lists.
+    enabled: false
     # Input directory scanned for tiles.
     tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
     tile_glob: "*.tif"
@@ -64,15 +91,54 @@ model:
     neg_alpha: 1.0
     feat_context_radius: 0
     bank_erosion_radius: 0
-    max_neg_bank: 8000
+    # Cap positives to keep XGB search tractable on CPU.
+    max_pos_bank: 100000
+    max_neg_bank: 500000
 
   augmentation:
-    enabled: true
+    enabled: false
     include_identity: true
     horizontal_flip: true
     vertical_flip: true
     # Use right-angle rotations to avoid interpolation artifacts.
     rotations_deg: [90, 180, 270]
+
+  # Hybrid feature fusion: DINO embeddings + low-cost image patch descriptors.
+  # kNN and XGB intentionally use different normalization geometry.
+  hybrid_features:
+    enabled: false
+    # kNN branch: block-weighted concat + final L2 normalization.
+    knn_l2_normalize: true
+    # XGB branch: optional z-score standardization (fit on train folds only).
+    xgb_zscore: true
+    zscore_eps: 1.0e-6
+    blocks:
+      dino:
+        enabled: true
+        weight_knn: 1.0
+        weight_xgb: 1.0
+      rgb_stats:
+        enabled: true
+        weight_knn: 0.5
+        weight_xgb: 1.0
+      hsv_mean:
+        enabled: true
+        weight_knn: 0.4
+        weight_xgb: 0.8
+      grad_stats:
+        enabled: true
+        weight_knn: 0.6
+        weight_xgb: 1.0
+      grad_orient_hist:
+        enabled: true
+        bins: 8
+        weight_knn: 0.6
+        weight_xgb: 1.0
+      lbp_hist:
+        enabled: true
+        bins: 16
+        weight_knn: 0.4
+        weight_xgb: 0.8
 
 training:
   loo:
@@ -80,10 +146,17 @@ training:
     enabled: true
     # Minimum train tiles per fold (warning only when not met).
     min_train_tiles: 1
+    # Number of validation tiles used per fold (cyclic LOO windows).
+    val_tiles_per_fold: 2
+    # Skip folds with too little GT signal.
+    min_gt_positive_pixels: 1000
+    # skip_fold | keep_fold
+    low_gt_policy: skip_fold
 
 search:
   knn:
-    k_values: [25, 50, 75, 100, 150, 200, 250, 275 , 300]
+    enabled: false
+    k_values: [15, 25, 30,175,225]
     thresholds:
       start: 0.01
       stop: 0.5
@@ -94,83 +167,36 @@ search:
     threshold_cpu_batch_size: 32
 
   crf:
+    enabled: true
     prob_softness_values: [0.03]
     pos_w_values: [4.0]
     pos_xy_std_values: [3.0]
     bilateral_w_values: [7.0]
     bilateral_xy_std_values: [25.0]
     bilateral_rgb_std_values: [3.0]
-    num_workers: 16
+    num_workers: 1
     max_configs: 1
 
   xgb:
-    use_gpu: true
+    enabled: true
+    # Set true only when CUDA-enabled XGBoost is installed.
+    use_gpu: false
     val_fraction: 0.3
-    num_boost_round: 1200
-    early_stop: 80
+    num_boost_round: 40
+    early_stop: 40
     verbose_eval: 50
+    # null -> evaluate XGB thresholds from search.knn.thresholds.
+    fixed_threshold: null
     param_grid:
-      - max_depth: 6
-        eta: 0.05
-        colsample_bytree: 0.3
-        subsample: 0.9
-        reg_alpha: 0.05
-        min_child_weight: 1
       - max_depth: 7
         eta: 0.03
         colsample_bytree: 0.3
         subsample: 0.9
         reg_alpha: 0.05
         min_child_weight: 1
-      - max_depth: 6
-        eta: 0.05
-        colsample_bytree: 0.3
-        subsample: 0.9
-        reg_alpha: 0.1
-        min_child_weight: 1
-      # Tier 1: baseline, balanced
-      - max_depth: 5
-        eta: 0.05
-        subsample: 0.8
-        colsample_bytree: 0.4
-        min_child_weight: 5
-        gamma: 0.0
-        reg_alpha: 0.0
-        reg_lambda: 1.0
-        scale_pos_weight: 5
-
-      # Tier 2: more conservative (often reduces forest bleed)
-      - max_depth: 4
-        eta: 0.05
-        subsample: 0.7
-        colsample_bytree: 0.3
-        min_child_weight: 10
-        gamma: 1.0
-        reg_alpha: 0.1
-        reg_lambda: 2.0
-        scale_pos_weight: 8
-
-      # Tier 3: higher capacity + stronger regularization
-      - max_depth: 6
-        eta: 0.03
-        subsample: 0.8
-        colsample_bytree: 0.5
-        min_child_weight: 3
-        gamma: 0.0
-        reg_alpha: 0.05
-        reg_lambda: 1.5
-        scale_pos_weight: 5
-
-      # Tier 4: very conservative (precision-oriented)
-      - max_depth: 3
-        eta: 0.05
-        subsample: 0.6
-        colsample_bytree: 0.3
-        min_child_weight: 15
-        gamma: 2.0
-        reg_alpha: 0.2
-        reg_lambda: 3.0
-        scale_pos_weight: 10
+        objective: binary:logistic
+        eval_metric: logloss
+        tree_method: hist
 
 
 postprocess:
@@ -186,10 +212,32 @@ postprocess:
     protect_scores: [0.3, 0.4, 0.5, 0.6]
 
   roads:
-    penalty_values: [0.8,0.7, 0.6, 0.5]
+    penalty_values: [0.6 ,0.7, 0.8, 0.9]
+
+  # Propose new elongated LWF objects outside the incomplete label raster.
+  novel_proposals:
+    enabled: true
+    # strict | balanced | lax | very_lax
+    heuristic_preset: balanced
+    # whole_tile allows suggestions outside SH raster bounds.
+    search_scope: whole_tile
+    # champion_score | champion_mask
+    source: champion_score
+    # null -> use champion threshold per tile.
+    score_threshold: null
+    min_area_px: 100
+    min_length_m: 20.0
+    max_width_m: 18.0
+    min_skeleton_ratio: 6.0
+    min_pca_ratio: 2.0
+    max_circularity: 0.45
+    min_mean_score: 0.2
+    max_road_overlap: 0.8
+    connectivity: 2
 
 runtime:
-  feature_cache_mode: memory
+  # Disk cache strongly recommended for LOO + augmentation workloads.
+  feature_cache_mode: disk
   feature_batch_size: 4
   resume_run: false
   resume_run_dir: null
@@ -198,3 +246,18 @@ runtime:
   debug_timing: true
   debug_timing_verbose: false
   compact_timing_logs: true
+  plotting:
+    # Boundary band width for FP/FN diagnostics.
+    boundary_band_px: 12
+    # Overlay colors as RGB [0-255].
+    proposal_accept_rgb: [0, 255, 255]
+    proposal_reject_rgb: [255, 165, 0]
+    proposal_candidate_rgb: [255, 255, 0]
+  time_budget:
+    enabled: true
+    # Wall-clock budget in hours.
+    hours: 10.0
+    # immediate_inference | final_retrain_then_infer | stop
+    cutover_mode: immediate_inference
+    # total_wall_clock | training_only
+    scope: total_wall_clock

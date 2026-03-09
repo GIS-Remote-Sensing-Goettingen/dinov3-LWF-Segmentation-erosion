@@ -22,7 +22,11 @@ from transformers import AutoImageProcessor, AutoModel
 
 from ..core.banks import build_banks_single_scale
 from ..core.config_loader import cfg
-from ..core.features import prefetch_features_single_scale_image
+from ..core.features import (
+    apply_xgb_feature_stats,
+    fit_xgb_feature_stats,
+    prefetch_features_single_scale_image,
+)
 from ..core.io_utils import (
     build_sh_buffer_mask,
     load_dop20_image,
@@ -191,6 +195,61 @@ def _chunk_tiles(tile_paths: list[str], chunk_size: int) -> list[list[str]]:
     ]
 
 
+def filter_tiles_by_source_label_raster_overlap(
+    tile_paths: list[str],
+    raster_path: str | None = None,
+) -> tuple[list[str], int]:
+    """Filter tiles to those overlapping the source label raster extent.
+
+    Args:
+        tile_paths (list[str]): Candidate tile paths.
+        raster_path (str | None): Optional raster path override. When omitted,
+            uses ``cfg.io.paths.source_label_raster``.
+
+    Returns:
+        tuple[list[str], int]: Filtered tile paths and excluded tile count.
+
+    Examples:
+        >>> filter_tiles_by_source_label_raster_overlap([], raster_path=None)
+        ([], 0)
+    """
+    if not tile_paths:
+        return [], 0
+    raster_path = (
+        cfg.io.paths.source_label_raster if raster_path is None else str(raster_path)
+    )
+    if not raster_path:
+        return list(tile_paths), 0
+
+    with rio_open(raster_path) as src:
+        raster_crs = src.crs
+        raster_bounds = src.bounds
+
+    filtered_paths = []
+    excluded_count = 0
+    for tile_path in tile_paths:
+        with rio_open(tile_path) as tile_src:
+            tile_bounds = tile_src.bounds
+            tile_crs = tile_src.crs
+        if raster_crs is not None and tile_crs is not None and tile_crs != raster_crs:
+            tile_bounds = transform_bounds(
+                tile_crs, raster_crs, *tile_bounds, densify_pts=21
+            )
+        tb_left, tb_bottom, tb_right, tb_top = tile_bounds
+        rb_left, rb_bottom, rb_right, rb_top = raster_bounds
+        intersects = not (
+            tb_right <= rb_left
+            or tb_left >= rb_right
+            or tb_top <= rb_bottom
+            or tb_bottom >= rb_top
+        )
+        if intersects:
+            filtered_paths.append(tile_path)
+        else:
+            excluded_count += 1
+    return filtered_paths, excluded_count
+
+
 def _tiles_with_gt_chunk(
     tile_paths: list[str],
     gt_vector_paths: list[str],
@@ -214,6 +273,65 @@ def _tiles_with_gt_chunk(
     holdout_tiles = []
     for tile_path in tile_paths:
         if _tile_has_gt(tile_path, gt_vector_paths, downsample_factor):
+            gt_tiles.append(tile_path)
+        else:
+            holdout_tiles.append(tile_path)
+    return gt_tiles, holdout_tiles
+
+
+def _tile_effective_gt_pixels(
+    tile_path: str,
+    gt_vector_paths: list[str],
+    downsample_factor: int,
+) -> int:
+    """Return effective GT-positive pixel count for a tile.
+
+    Effective GT matches runtime evaluation behavior:
+    GT rasterized to tile, optionally clipped to SH buffer when configured.
+
+    Examples:
+        >>> callable(_tile_effective_gt_pixels)
+        True
+    """
+    ds = int(downsample_factor or 1)
+    img_b = load_dop20_image(tile_path, downsample_factor=ds)
+    labels_sh = reproject_labels_to_image(
+        tile_path, cfg.io.paths.source_label_raster, downsample_factor=ds
+    )
+    gt_mask = rasterize_vector_labels(gt_vector_paths, tile_path, downsample_factor=ds)
+    with rio_open(tile_path) as src:
+        pixel_size_m = abs(src.transform.a) * ds
+    buffer_m = float(cfg.model.priors.buffer_m)
+    buffer_pixels = int(round(buffer_m / pixel_size_m))
+    sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
+    if cfg.model.priors.clip_gt_to_buffer:
+        gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
+    else:
+        gt_mask_eval = gt_mask
+    # Keep shapes aligned with runtime expectation.
+    if gt_mask_eval.shape != img_b.shape[:2]:
+        return 0
+    return int(gt_mask_eval.sum())
+
+
+def _tiles_with_effective_gt_chunk(
+    tile_paths: list[str],
+    gt_vector_paths: list[str],
+    downsample_factor: int,
+) -> tuple[list[str], list[str]]:
+    """Split a chunk into effective-GT and no-effective-GT tiles.
+
+    Examples:
+        >>> callable(_tiles_with_effective_gt_chunk)
+        True
+    """
+    gt_tiles = []
+    holdout_tiles = []
+    for tile_path in tile_paths:
+        gt_pixels = _tile_effective_gt_pixels(
+            tile_path, gt_vector_paths, downsample_factor
+        )
+        if gt_pixels > 0:
             gt_tiles.append(tile_path)
         else:
             holdout_tiles.append(tile_path)
@@ -287,8 +405,9 @@ def resolve_tiles_from_gt_presence(
 ) -> tuple[list[str], list[str]]:
     """Resolve GT-positive and inference tiles from a directory.
 
-    Tiles with any GT overlap are returned as GT-positive tiles. Remaining tiles
-    are returned as inference tiles.
+    Tiles are first filtered by GT vector overlap. Then a second pass keeps only
+    tiles with effective GT positives in runtime evaluation space (post clipping
+    to SH buffer if configured). Remaining tiles are returned as inference tiles.
 
     Args:
         tiles_dir (str): Directory containing tiles.
@@ -314,36 +433,10 @@ def resolve_tiles_from_gt_presence(
     if downsample_factor is None:
         downsample_factor = int(cfg.model.backbone.resample_factor or 1)
 
-    raster_path = cfg.io.paths.source_label_raster
-    filtered_paths = []
-    excluded_by_raster = 0
-    if raster_path:
-        with rio_open(raster_path) as src:
-            raster_crs = src.crs
-            raster_bounds = src.bounds
-        for tile_path in tile_paths:
-            with rio_open(tile_path) as tile_src:
-                tile_bounds = tile_src.bounds
-                tile_crs = tile_src.crs
-            if raster_crs is not None and tile_crs is not None:
-                if tile_crs != raster_crs:
-                    tile_bounds = transform_bounds(
-                        tile_crs, raster_crs, *tile_bounds, densify_pts=21
-                    )
-            tb_left, tb_bottom, tb_right, tb_top = tile_bounds
-            rb_left, rb_bottom, rb_right, rb_top = raster_bounds
-            intersects = not (
-                tb_right <= rb_left
-                or tb_left >= rb_right
-                or tb_top <= rb_bottom
-                or tb_bottom >= rb_top
-            )
-            if intersects:
-                filtered_paths.append(tile_path)
-            else:
-                excluded_by_raster += 1
-    else:
-        filtered_paths = tile_paths
+    filtered_paths, excluded_by_raster = filter_tiles_by_source_label_raster_overlap(
+        tile_paths,
+        raster_path=cfg.io.paths.source_label_raster,
+    )
     if excluded_by_raster:
         logger.info(
             "auto split: excluded %s tiles with no SOURCE_LABEL_RASTER overlap",
@@ -386,6 +479,46 @@ def resolve_tiles_from_gt_presence(
             ):
                 gt_tiles.extend(gt_chunk)
                 inference_tiles.extend(holdout_chunk)
+
+    if gt_tiles:
+        logger.info(
+            "auto split: validating effective GT pixels on %s GT-overlap tiles",
+            len(gt_tiles),
+        )
+        filtered_gt_tiles = []
+        dropped_post_clip = 0
+        if num_workers <= 1:
+            for tile_path in gt_tiles:
+                if (
+                    _tile_effective_gt_pixels(
+                        tile_path, gt_vector_paths, downsample_factor
+                    )
+                    > 0
+                ):
+                    filtered_gt_tiles.append(tile_path)
+                else:
+                    inference_tiles.append(tile_path)
+                    dropped_post_clip += 1
+        else:
+            chunk_count = max(1, num_workers * 4)
+            chunk_size = max(1, (len(gt_tiles) + chunk_count - 1) // chunk_count)
+            gt_chunks = _chunk_tiles(gt_tiles, chunk_size)
+            with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                for gt_chunk, holdout_chunk in ex.map(
+                    _tiles_with_effective_gt_chunk,
+                    gt_chunks,
+                    repeat(gt_vector_paths),
+                    repeat(downsample_factor),
+                ):
+                    filtered_gt_tiles.extend(gt_chunk)
+                    inference_tiles.extend(holdout_chunk)
+                    dropped_post_clip += len(holdout_chunk)
+        if dropped_post_clip:
+            logger.info(
+                "auto split: excluded %s tiles with zero effective GT after clipping",
+                dropped_post_clip,
+            )
+        gt_tiles = filtered_gt_tiles
 
     return sorted(gt_tiles), sorted(inference_tiles)
 
@@ -503,7 +636,16 @@ def build_training_artifacts_for_tiles(
     feature_cache_mode: str,
     feature_dir: str | None,
     context_radius: int,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[str], list[str]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray,
+    np.ndarray,
+    list[str],
+    list[str],
+    dict | None,
+    dict | None,
+]:
     """Build banks and XGB training data from a set of source tiles.
 
     Args:
@@ -520,9 +662,19 @@ def build_training_artifacts_for_tiles(
         context_radius (int): Feature context radius.
 
     Returns:
-        tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, list[str], list[str]]:
+        tuple[
+            np.ndarray,
+            np.ndarray | None,
+            np.ndarray,
+            np.ndarray,
+            list[str],
+            list[str],
+            dict | None,
+            dict | None,
+        ]:
             Positive bank, negative bank, XGB feature matrix, XGB labels,
-            base image ids, augmentation modes.
+            base image ids, augmentation modes, XGB feature z-score stats,
+            and feature layout metadata.
 
     Examples:
         >>> callable(build_training_artifacts_for_tiles)
@@ -539,6 +691,7 @@ def build_training_artifacts_for_tiles(
     neg_banks = []
     x_list = []
     y_list = []
+    feature_layout: dict | None = None
     base_image_ids = [os.path.splitext(os.path.basename(p))[0] for p in source_tiles]
     ds = int(cfg.model.backbone.resample_factor or 1)
 
@@ -599,7 +752,7 @@ def build_training_artifacts_for_tiles(
             if neg_bank_i is not None and len(neg_bank_i) > 0:
                 neg_banks.append(neg_bank_i)
 
-            x_i, y_i = build_xgb_dataset(
+            x_i, y_i, layout_i = build_xgb_dataset(
                 img_a,
                 labels_a,
                 ps,
@@ -608,13 +761,17 @@ def build_training_artifacts_for_tiles(
                 feature_dir,
                 image_id_aug,
                 pos_frac=cfg.model.banks.pos_frac_thresh,
+                max_pos=cfg.model.banks.max_pos_bank,
                 max_neg=cfg.model.banks.max_neg_bank,
                 context_radius=context_radius,
                 prefetched_tiles=prefetched_a,
+                return_layout=feature_layout is None,
             )
             if x_i.size > 0 and y_i.size > 0:
                 x_list.append(x_i)
                 y_list.append(y_i)
+            if feature_layout is None and layout_i is not None:
+                feature_layout = layout_i
 
     if not pos_banks:
         raise ValueError("no positive banks were built; check source tiles and labels")
@@ -630,7 +787,22 @@ def build_training_artifacts_for_tiles(
     y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.float32)
     if x.size == 0 or y.size == 0:
         raise ValueError("XGBoost dataset is empty; check source tiles and labels")
-    return pos_bank, neg_bank, x, y, base_image_ids, aug_modes
+    xgb_feature_stats = None
+    if cfg.model.hybrid_features.enabled and cfg.model.hybrid_features.xgb_zscore:
+        xgb_feature_stats = fit_xgb_feature_stats(
+            x, eps=float(cfg.model.hybrid_features.zscore_eps)
+        )
+        x = apply_xgb_feature_stats(x, xgb_feature_stats)
+    return (
+        pos_bank,
+        neg_bank,
+        x,
+        y,
+        base_image_ids,
+        aug_modes,
+        xgb_feature_stats,
+        feature_layout,
+    )
 
 
 def build_banks_for_sources(
@@ -730,7 +902,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
         labels_a = reproject_labels_to_image(
             img_a_path, lab_a_path, downsample_factor=ds
         )
-        X_i, y_i = build_xgb_dataset(
+        X_i, y_i, _ = build_xgb_dataset(
             img_a,
             labels_a,
             ps,
@@ -739,6 +911,7 @@ def build_xgb_training_data(ps, tile_size, stride, feature_dir):
             feature_dir,
             image_id_a,
             pos_frac=cfg.model.banks.pos_frac_thresh,
+            max_pos=cfg.model.banks.max_pos_bank,
             max_neg=cfg.model.banks.max_neg_bank,
             context_radius=context_radius,
         )

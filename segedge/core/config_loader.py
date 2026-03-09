@@ -47,6 +47,8 @@ class IOPathsConfig:
     best_settings_path: str
     log_path: str
     roads_mask_path: str | None = None
+    inference_dir: str | None = None
+    inference_glob: str = "*.tif"
 
 
 @dataclass
@@ -66,8 +68,21 @@ class IOAutoSplitConfig:
 class IOConfig:
     """I/O config group."""
 
+    training: bool
+    inference: "IOInferenceConfig"
     paths: IOPathsConfig
     auto_split: IOAutoSplitConfig
+
+
+@dataclass
+class IOInferenceConfig:
+    """Inference-only execution and model-bundle settings."""
+
+    model_bundle_dir: str | None
+    tiles_dir: str | None
+    tile_glob: str
+    tiles: list[str]
+    save_bundle: bool
 
 
 @dataclass
@@ -103,6 +118,7 @@ class BanksConfig:
     neg_alpha: float
     feat_context_radius: int
     bank_erosion_radius: int
+    max_pos_bank: int
     max_neg_bank: int
 
 
@@ -118,6 +134,39 @@ class AugmentationConfig:
 
 
 @dataclass
+class HybridBlockConfig:
+    """Single hybrid feature block settings."""
+
+    enabled: bool
+    weight_knn: float
+    weight_xgb: float
+    bins: int | None = None
+
+
+@dataclass
+class HybridBlocksConfig:
+    """Hybrid feature block bundle."""
+
+    dino: HybridBlockConfig
+    rgb_stats: HybridBlockConfig
+    hsv_mean: HybridBlockConfig
+    grad_stats: HybridBlockConfig
+    grad_orient_hist: HybridBlockConfig
+    lbp_hist: HybridBlockConfig
+
+
+@dataclass
+class HybridFeaturesConfig:
+    """Hybrid DINO + image feature fusion settings."""
+
+    enabled: bool
+    knn_l2_normalize: bool
+    xgb_zscore: bool
+    zscore_eps: float
+    blocks: HybridBlocksConfig
+
+
+@dataclass
 class ModelConfig:
     """Model and representation settings."""
 
@@ -126,6 +175,7 @@ class ModelConfig:
     priors: PriorsConfig
     banks: BanksConfig
     augmentation: AugmentationConfig
+    hybrid_features: HybridFeaturesConfig
 
 
 @dataclass
@@ -134,6 +184,9 @@ class LOOConfig:
 
     enabled: bool
     min_train_tiles: int
+    val_tiles_per_fold: int
+    min_gt_positive_pixels: int
+    low_gt_policy: str
 
 
 @dataclass
@@ -147,6 +200,7 @@ class TrainingConfig:
 class KNNConfig:
     """kNN search settings."""
 
+    enabled: bool
     k_values: list[int]
     thresholds: ThresholdRangeConfig
     use_fp16_knn: bool
@@ -159,6 +213,7 @@ class KNNConfig:
 class CRFConfig:
     """CRF search settings."""
 
+    enabled: bool
     prob_softness_values: list[float]
     pos_w_values: list[float]
     pos_xy_std_values: list[float]
@@ -173,11 +228,13 @@ class CRFConfig:
 class XGBConfig:
     """XGBoost search settings."""
 
+    enabled: bool
     use_gpu: bool
     val_fraction: float
     num_boost_round: int
     early_stop: int
     verbose_eval: int
+    fixed_threshold: float | None
     param_grid: list[dict[str, Any]]
 
 
@@ -207,11 +264,52 @@ class RoadsConfig:
 
 
 @dataclass
+class NovelProposalsConfig:
+    """Shape-based proposal filtering for novel candidate objects."""
+
+    enabled: bool
+    heuristic_preset: str
+    search_scope: str
+    source: str
+    score_threshold: float | None
+    min_area_px: int
+    min_length_m: float
+    max_width_m: float
+    min_skeleton_ratio: float
+    min_pca_ratio: float
+    max_circularity: float
+    min_mean_score: float
+    max_road_overlap: float
+    connectivity: int
+
+
+@dataclass
 class PostprocessConfig:
     """Postprocess config group."""
 
     shadow: ShadowConfig
     roads: RoadsConfig
+    novel_proposals: NovelProposalsConfig
+
+
+@dataclass
+class PlottingConfig:
+    """Runtime plotting diagnostics settings."""
+
+    boundary_band_px: int
+    proposal_accept_rgb: tuple[int, int, int]
+    proposal_reject_rgb: tuple[int, int, int]
+    proposal_candidate_rgb: tuple[int, int, int]
+
+
+@dataclass
+class TimeBudgetConfig:
+    """Time-budget cutover settings."""
+
+    enabled: bool
+    hours: float
+    cutover_mode: str
+    scope: str
 
 
 @dataclass
@@ -227,6 +325,8 @@ class RuntimeConfig:
     debug_timing: bool
     debug_timing_verbose: bool
     compact_timing_logs: bool
+    plotting: PlottingConfig
+    time_budget: TimeBudgetConfig
 
 
 @dataclass
@@ -266,11 +366,97 @@ def _as_list_int(value: Any, field_name: str) -> list[int]:
     return [int(v) for v in value]
 
 
+def _as_enum(value: Any, field_name: str, allowed: set[str], default: str) -> str:
+    val = str(value) if value is not None else str(default)
+    if val not in allowed:
+        raise ValueError(
+            f"'{field_name}' must be one of {sorted(allowed)}, got '{val}'"
+        )
+    return val
+
+
 def _load_thresholds(data: dict[str, Any]) -> ThresholdRangeConfig:
     return ThresholdRangeConfig(
         start=float(data["start"]),
         stop=float(data["stop"]),
         count=int(data["count"]),
+    )
+
+
+def _as_rgb_tuple(value: Any, field_name: str) -> tuple[int, int, int]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"'{field_name}' must be a list of 3 integers")
+    rgb = tuple(int(v) for v in value)
+    if any(v < 0 or v > 255 for v in rgb):
+        raise ValueError(f"'{field_name}' values must be in [0, 255]")
+    return rgb
+
+
+def _novel_heuristic_defaults(preset: str) -> dict[str, float]:
+    presets: dict[str, dict[str, float]] = {
+        "strict": {
+            "min_area_px": 200,
+            "min_length_m": 35.0,
+            "max_width_m": 10.0,
+            "min_skeleton_ratio": 12.0,
+            "min_pca_ratio": 3.5,
+            "max_circularity": 0.2,
+            "min_mean_score": 0.4,
+            "max_road_overlap": 0.4,
+        },
+        "balanced": {
+            "min_area_px": 150,
+            "min_length_m": 30.0,
+            "max_width_m": 12.0,
+            "min_skeleton_ratio": 10.0,
+            "min_pca_ratio": 3.0,
+            "max_circularity": 0.3,
+            "min_mean_score": 0.33,
+            "max_road_overlap": 0.5,
+        },
+        "lax": {
+            "min_area_px": 100,
+            "min_length_m": 20.0,
+            "max_width_m": 18.0,
+            "min_skeleton_ratio": 6.0,
+            "min_pca_ratio": 2.0,
+            "max_circularity": 0.45,
+            "min_mean_score": 0.2,
+            "max_road_overlap": 0.8,
+        },
+        "very_lax": {
+            "min_area_px": 50,
+            "min_length_m": 10.0,
+            "max_width_m": 30.0,
+            "min_skeleton_ratio": 3.0,
+            "min_pca_ratio": 1.3,
+            "max_circularity": 0.7,
+            "min_mean_score": 0.1,
+            "max_road_overlap": 1.0,
+        },
+    }
+    return presets[preset]
+
+
+def _load_hybrid_block(
+    blocks: dict[str, Any],
+    key: str,
+    *,
+    default_enabled: bool,
+    default_weight_knn: float,
+    default_weight_xgb: float,
+    default_bins: int | None = None,
+) -> HybridBlockConfig:
+    raw = _require_mapping(blocks.get(key, {}), f"model.hybrid_features.blocks.{key}")
+    return HybridBlockConfig(
+        enabled=bool(raw.get("enabled", default_enabled)),
+        weight_knn=float(raw.get("weight_knn", default_weight_knn)),
+        weight_xgb=float(raw.get("weight_xgb", default_weight_xgb)),
+        bins=(
+            int(raw.get("bins", default_bins))
+            if raw.get("bins", default_bins) is not None
+            else None
+        ),
     )
 
 
@@ -285,6 +471,7 @@ def load_config(path: str | Path | None = None) -> Config:
     io = _require_mapping(root["io"], "io")
     io_paths = _require_mapping(io["paths"], "io.paths")
     io_auto_split = _require_mapping(io["auto_split"], "io.auto_split")
+    io_inference = _require_mapping(io.get("inference", {}), "io.inference")
 
     model = _require_mapping(root["model"], "model")
     model_backbone = _require_mapping(model["backbone"], "model.backbone")
@@ -293,6 +480,12 @@ def load_config(path: str | Path | None = None) -> Config:
     model_banks = _require_mapping(model["banks"], "model.banks")
     model_augmentation = _require_mapping(
         model.get("augmentation", {}), "model.augmentation"
+    )
+    model_hybrid = _require_mapping(
+        model.get("hybrid_features", {}), "model.hybrid_features"
+    )
+    model_hybrid_blocks = _require_mapping(
+        model_hybrid.get("blocks", {}), "model.hybrid_features.blocks"
     )
     training = _require_mapping(root.get("training", {}), "training")
     training_loo = _require_mapping(training.get("loo", {}), "training.loo")
@@ -305,8 +498,15 @@ def load_config(path: str | Path | None = None) -> Config:
     postprocess = _require_mapping(root["postprocess"], "postprocess")
     post_shadow = _require_mapping(postprocess["shadow"], "postprocess.shadow")
     post_roads = _require_mapping(postprocess["roads"], "postprocess.roads")
+    post_novel = _require_mapping(
+        postprocess.get("novel_proposals", {}), "postprocess.novel_proposals"
+    )
 
     runtime = _require_mapping(root["runtime"], "runtime")
+    runtime_plotting = _require_mapping(runtime.get("plotting", {}), "runtime.plotting")
+    runtime_time_budget = _require_mapping(
+        runtime.get("time_budget", {}), "runtime.time_budget"
+    )
 
     io_paths_cfg = IOPathsConfig(
         source_tile=str(io_paths["source_tile"]),
@@ -322,6 +522,12 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
         val_tiles=_as_list_str(io_paths["val_tiles"], "io.paths.val_tiles"),
         holdout_tiles=_as_list_str(io_paths["holdout_tiles"], "io.paths.holdout_tiles"),
+        inference_dir=(
+            str(io_paths["inference_dir"])
+            if io_paths.get("inference_dir") is not None
+            else None
+        ),
+        inference_glob=str(io_paths.get("inference_glob", "*.tif")),
         feature_dir=str(io_paths["feature_dir"]),
         bank_cache_dir=str(io_paths["bank_cache_dir"]),
         output_dir=str(io_paths["output_dir"]),
@@ -352,6 +558,21 @@ def load_config(path: str | Path | None = None) -> Config:
             else None
         ),
     )
+    io_inference_cfg = IOInferenceConfig(
+        model_bundle_dir=(
+            str(io_inference["model_bundle_dir"])
+            if io_inference.get("model_bundle_dir") is not None
+            else None
+        ),
+        tiles_dir=(
+            str(io_inference["tiles_dir"])
+            if io_inference.get("tiles_dir") is not None
+            else None
+        ),
+        tile_glob=str(io_inference.get("tile_glob", "*.tif")),
+        tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
+        save_bundle=bool(io_inference.get("save_bundle", True)),
+    )
 
     model_cfg = ModelConfig(
         backbone=BackboneConfig(
@@ -372,6 +593,7 @@ def load_config(path: str | Path | None = None) -> Config:
             neg_alpha=float(model_banks["neg_alpha"]),
             feat_context_radius=int(model_banks["feat_context_radius"]),
             bank_erosion_radius=int(model_banks["bank_erosion_radius"]),
+            max_pos_bank=int(model_banks.get("max_pos_bank", 120000)),
             max_neg_bank=int(model_banks["max_neg_bank"]),
         ),
         augmentation=AugmentationConfig(
@@ -384,16 +606,77 @@ def load_config(path: str | Path | None = None) -> Config:
                 "model.augmentation.rotations_deg",
             ),
         ),
+        hybrid_features=HybridFeaturesConfig(
+            enabled=bool(model_hybrid.get("enabled", False)),
+            knn_l2_normalize=bool(model_hybrid.get("knn_l2_normalize", True)),
+            xgb_zscore=bool(model_hybrid.get("xgb_zscore", True)),
+            zscore_eps=float(model_hybrid.get("zscore_eps", 1e-6)),
+            blocks=HybridBlocksConfig(
+                dino=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "dino",
+                    default_enabled=True,
+                    default_weight_knn=1.0,
+                    default_weight_xgb=1.0,
+                ),
+                rgb_stats=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "rgb_stats",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                ),
+                hsv_mean=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "hsv_mean",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                ),
+                grad_stats=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "grad_stats",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                ),
+                grad_orient_hist=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "grad_orient_hist",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                    default_bins=8,
+                ),
+                lbp_hist=_load_hybrid_block(
+                    model_hybrid_blocks,
+                    "lbp_hist",
+                    default_enabled=False,
+                    default_weight_knn=0.5,
+                    default_weight_xgb=1.0,
+                    default_bins=16,
+                ),
+            ),
+        ),
     )
     training_cfg = TrainingConfig(
         loo=LOOConfig(
             enabled=bool(training_loo.get("enabled", True)),
             min_train_tiles=int(training_loo.get("min_train_tiles", 1)),
+            val_tiles_per_fold=int(training_loo.get("val_tiles_per_fold", 1)),
+            min_gt_positive_pixels=int(training_loo.get("min_gt_positive_pixels", 0)),
+            low_gt_policy=_as_enum(
+                training_loo.get("low_gt_policy", "keep_fold"),
+                "training.loo.low_gt_policy",
+                {"skip_fold", "keep_fold"},
+                "keep_fold",
+            ),
         )
     )
 
     search_cfg = SearchConfig(
         knn=KNNConfig(
+            enabled=bool(search_knn.get("enabled", True)),
             k_values=[int(v) for v in search_knn["k_values"]],
             thresholds=_load_thresholds(
                 _require_mapping(search_knn["thresholds"], "search.knn.thresholds")
@@ -404,6 +687,7 @@ def load_config(path: str | Path | None = None) -> Config:
             threshold_cpu_batch_size=int(search_knn["threshold_cpu_batch_size"]),
         ),
         crf=CRFConfig(
+            enabled=bool(search_crf.get("enabled", True)),
             prob_softness_values=_as_list_float(
                 search_crf["prob_softness_values"], "search.crf.prob_softness_values"
             ),
@@ -428,11 +712,17 @@ def load_config(path: str | Path | None = None) -> Config:
             max_configs=int(search_crf["max_configs"]),
         ),
         xgb=XGBConfig(
+            enabled=bool(search_xgb.get("enabled", True)),
             use_gpu=bool(search_xgb["use_gpu"]),
             val_fraction=float(search_xgb["val_fraction"]),
             num_boost_round=int(search_xgb["num_boost_round"]),
             early_stop=int(search_xgb["early_stop"]),
             verbose_eval=int(search_xgb["verbose_eval"]),
+            fixed_threshold=(
+                None
+                if search_xgb.get("fixed_threshold") is None
+                else float(search_xgb.get("fixed_threshold"))
+            ),
             param_grid=list(search_xgb["param_grid"]),
         ),
     )
@@ -441,6 +731,14 @@ def load_config(path: str | Path | None = None) -> Config:
     if not isinstance(weight_sets_raw, list):
         raise ValueError("'postprocess.shadow.weight_sets' must be a list")
     weight_sets = [tuple(float(x) for x in row) for row in weight_sets_raw]
+
+    heuristic_preset = _as_enum(
+        post_novel.get("heuristic_preset", "balanced"),
+        "postprocess.novel_proposals.heuristic_preset",
+        {"strict", "balanced", "lax", "very_lax"},
+        "balanced",
+    )
+    heuristic_defaults = _novel_heuristic_defaults(heuristic_preset)
 
     postprocess_cfg = PostprocessConfig(
         shadow=ShadowConfig(
@@ -456,6 +754,56 @@ def load_config(path: str | Path | None = None) -> Config:
             penalty_values=_as_list_float(
                 post_roads["penalty_values"], "postprocess.roads.penalty_values"
             )
+        ),
+        novel_proposals=NovelProposalsConfig(
+            enabled=bool(post_novel.get("enabled", False)),
+            heuristic_preset=heuristic_preset,
+            search_scope=_as_enum(
+                post_novel.get("search_scope", "sh_buffer"),
+                "postprocess.novel_proposals.search_scope",
+                {"sh_buffer", "whole_tile"},
+                "sh_buffer",
+            ),
+            source=_as_enum(
+                post_novel.get("source", "champion_mask"),
+                "postprocess.novel_proposals.source",
+                {"champion_mask", "champion_score"},
+                "champion_mask",
+            ),
+            score_threshold=(
+                None
+                if post_novel.get("score_threshold") is None
+                else float(post_novel.get("score_threshold"))
+            ),
+            min_area_px=int(
+                post_novel.get("min_area_px", heuristic_defaults["min_area_px"])
+            ),
+            min_length_m=float(
+                post_novel.get("min_length_m", heuristic_defaults["min_length_m"])
+            ),
+            max_width_m=float(
+                post_novel.get("max_width_m", heuristic_defaults["max_width_m"])
+            ),
+            min_skeleton_ratio=float(
+                post_novel.get(
+                    "min_skeleton_ratio", heuristic_defaults["min_skeleton_ratio"]
+                )
+            ),
+            min_pca_ratio=float(
+                post_novel.get("min_pca_ratio", heuristic_defaults["min_pca_ratio"])
+            ),
+            max_circularity=float(
+                post_novel.get("max_circularity", heuristic_defaults["max_circularity"])
+            ),
+            min_mean_score=float(
+                post_novel.get("min_mean_score", heuristic_defaults["min_mean_score"])
+            ),
+            max_road_overlap=float(
+                post_novel.get(
+                    "max_road_overlap", heuristic_defaults["max_road_overlap"]
+                )
+            ),
+            connectivity=int(post_novel.get("connectivity", 2)),
         ),
     )
 
@@ -477,10 +825,84 @@ def load_config(path: str | Path | None = None) -> Config:
         debug_timing=bool(runtime["debug_timing"]),
         debug_timing_verbose=bool(runtime["debug_timing_verbose"]),
         compact_timing_logs=bool(runtime.get("compact_timing_logs", True)),
+        plotting=PlottingConfig(
+            boundary_band_px=int(runtime_plotting.get("boundary_band_px", 10)),
+            proposal_accept_rgb=_as_rgb_tuple(
+                runtime_plotting.get("proposal_accept_rgb", [0, 255, 255]),
+                "runtime.plotting.proposal_accept_rgb",
+            ),
+            proposal_reject_rgb=_as_rgb_tuple(
+                runtime_plotting.get("proposal_reject_rgb", [255, 165, 0]),
+                "runtime.plotting.proposal_reject_rgb",
+            ),
+            proposal_candidate_rgb=_as_rgb_tuple(
+                runtime_plotting.get("proposal_candidate_rgb", [255, 255, 0]),
+                "runtime.plotting.proposal_candidate_rgb",
+            ),
+        ),
+        time_budget=TimeBudgetConfig(
+            enabled=bool(runtime_time_budget.get("enabled", False)),
+            hours=float(runtime_time_budget.get("hours", 10.0)),
+            cutover_mode=_as_enum(
+                runtime_time_budget.get("cutover_mode", "immediate_inference"),
+                "runtime.time_budget.cutover_mode",
+                {
+                    "immediate_inference",
+                    "final_retrain_then_infer",
+                    "stop",
+                },
+                "immediate_inference",
+            ),
+            scope=_as_enum(
+                runtime_time_budget.get("scope", "total_wall_clock"),
+                "runtime.time_budget.scope",
+                {
+                    "total_wall_clock",
+                    "training_only",
+                },
+                "total_wall_clock",
+            ),
+        ),
     )
+    if runtime_cfg.time_budget.hours <= 0:
+        raise ValueError("'runtime.time_budget.hours' must be > 0")
+    if training_cfg.loo.val_tiles_per_fold <= 0:
+        raise ValueError("'training.loo.val_tiles_per_fold' must be > 0")
+    if training_cfg.loo.min_gt_positive_pixels < 0:
+        raise ValueError("'training.loo.min_gt_positive_pixels' must be >= 0")
+    if not (search_cfg.knn.enabled or search_cfg.xgb.enabled):
+        raise ValueError(
+            "at least one model must be enabled: search.knn.enabled or search.xgb.enabled"
+        )
+    if search_cfg.xgb.fixed_threshold is not None and not (
+        0.0 <= search_cfg.xgb.fixed_threshold <= 1.0
+    ):
+        raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
+    if not bool(io.get("training", True)):
+        if io_inference_cfg.model_bundle_dir is None:
+            raise ValueError(
+                "'io.inference.model_bundle_dir' must be set when io.training=false"
+            )
+        has_inference_tiles = bool(
+            io_inference_cfg.tiles_dir
+            or io_inference_cfg.tiles
+            or io_paths_cfg.inference_dir
+            or io_paths_cfg.holdout_tiles
+        )
+        if not has_inference_tiles:
+            raise ValueError(
+                "set inference tiles via io.inference.tiles_dir/io.inference.tiles "
+                "or legacy io.paths.inference_dir/io.paths.holdout_tiles "
+                "when io.training=false"
+            )
 
     return Config(
-        io=IOConfig(paths=io_paths_cfg, auto_split=io_auto_split_cfg),
+        io=IOConfig(
+            training=bool(io.get("training", True)),
+            inference=io_inference_cfg,
+            paths=io_paths_cfg,
+            auto_split=io_auto_split_cfg,
+        ),
         model=model_cfg,
         training=training_cfg,
         search=search_cfg,

@@ -13,6 +13,8 @@ from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
     extract_patch_features_single_scale,
+    fuse_patch_features,
+    hybrid_feature_spec_hash,
     labels_to_patch_masks,
     load_tile_features_if_valid,
     save_tile_features,
@@ -29,6 +31,7 @@ def cleanup_bank_cache(
     ps: int,
     context_radius: int,
     resample_factor: int,
+    feature_spec_hash: str,
 ):
     """Remove stale bank cache files for this image_id with mismatched settings.
 
@@ -43,18 +46,21 @@ def cleanup_bank_cache(
         >>> import os
         >>> import tempfile
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     keep = os.path.join(d, "img_ps16_ctx0_rs1_pos_bank.npy")
+        ...     keep = os.path.join(d, "img_ps16_ctx0_rs1_fhhash_pos_bank.npy")
         ...     drop = os.path.join(d, "img_ps8_ctx0_rs1_pos_bank.npy")
         ...     _ = open(keep, "w").close()
         ...     _ = open(drop, "w").close()
-        ...     cleanup_bank_cache(d, "img", 16, 0, 1)
+        ...     cleanup_bank_cache(d, "img", 16, 0, 1, "hash")
         ...     os.path.exists(keep), os.path.exists(drop)
         (True, False)
     """
     if not os.path.isdir(bank_cache_dir):
         return
     prefix = f"{image_id}_"
-    keep_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{int(resample_factor)}"
+    keep_tag = (
+        f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{int(resample_factor)}"
+        f"_fh{feature_spec_hash}"
+    )
     for fname in os.listdir(bank_cache_dir):
         if not fname.startswith(prefix):
             continue
@@ -118,10 +124,19 @@ def build_banks_single_scale(
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
         resample_factor = int(cfg.model.backbone.resample_factor or 1)
+        feat_hash = hybrid_feature_spec_hash()
         cleanup_bank_cache(
-            bank_cache_dir, image_id, ps, context_radius, resample_factor
+            bank_cache_dir,
+            image_id,
+            ps,
+            context_radius,
+            resample_factor,
+            feat_hash,
         )
-        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
+        cache_tag = (
+            f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
+            f"_fh{feat_hash}"
+        )
         pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
         neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         if os.path.exists(pos_cache_path):
@@ -152,6 +167,7 @@ def build_banks_single_scale(
             w_eff = prefetched["w_eff"]
             if h_eff < ps or w_eff < ps:
                 continue
+            img_c = img_tile[:h_eff, :w_eff]
             lab_c = lab_tile[:h_eff, :w_eff] if lab_tile is not None else None
             feats_tile = prefetched["feats"]
             hp = prefetched["hp"]
@@ -197,6 +213,7 @@ def build_banks_single_scale(
                         "resample_factor": resample_factor,
                         "h_eff": h_eff,
                         "w_eff": w_eff,
+                        "feature_spec_hash": hybrid_feature_spec_hash(),
                     }
                     save_tile_features(
                         feats_tile, feature_dir, image_id, y, x, meta=meta
@@ -207,6 +224,13 @@ def build_banks_single_scale(
             continue
         if context_radius and context_radius > 0:
             feats_tile = add_local_context_mean(feats_tile, context_radius)
+        feats_tile, _ = fuse_patch_features(
+            feats_tile,
+            img_c,
+            ps,
+            mode="knn",
+            return_layout=False,
+        )
 
         if hp is None or wp is None:
             logger.warning(
@@ -234,6 +258,16 @@ def build_banks_single_scale(
     neg_bank = np.concatenate(neg_list, axis=0) if neg_list else None
 
     logger.info("Positive bank size: %s patches", len(pos_bank))
+    max_pos = int(cfg.model.banks.max_pos_bank)
+    if len(pos_bank) > max_pos:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(pos_bank), size=max_pos, replace=False)
+        pos_bank = pos_bank[idx]
+        logger.info(
+            "subsampled positive bank to %s (MAX_POS_BANK=%s)",
+            len(pos_bank),
+            max_pos,
+        )
     if neg_bank is not None:
         max_neg = cfg.model.banks.max_neg_bank
         logger.info("Negative bank size: %s patches", len(neg_bank))
@@ -252,7 +286,10 @@ def build_banks_single_scale(
 
     if bank_cache_dir is not None and image_id is not None:
         os.makedirs(bank_cache_dir, exist_ok=True)
-        cache_tag = f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
+        cache_tag = (
+            f"{image_id}_ps{ps}_ctx{int(context_radius)}_rs{resample_factor}"
+            f"_fh{hybrid_feature_spec_hash()}"
+        )
         pos_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_pos_bank.npy")
         neg_cache_path = os.path.join(bank_cache_dir, f"{cache_tag}_neg_bank.npy")
         np.save(pos_cache_path, pos_bank.astype(np.float32))

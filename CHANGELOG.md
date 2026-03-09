@@ -2,6 +2,81 @@
 
 
 ## [Unreleased]
+- Description: Filter folder/list-based inference tiles by SOURCE_LABEL_RASTER overlap and keep rolling union outputs updated tile by tile.
+- file touched: `segedge/pipeline/common.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/run.py`, `tests/test_inference_flow.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Avoid spending inference time on tiles outside source-label coverage and preserve usable mask geometry if a long job stops mid-run.
+- problems fixed: Inference tile resolution now skips non-overlapping tiles in both training+inference and inference-only modes, empty filtered holdout sets no longer crash the run, and tests verify union-mask append/checkpoint updates happen after each inferred tile.
+
+- Description: Force serial CRF tuning when CUDA is active, cap CRF workers to candidate count, and retry serially if the CRF process pool crashes.
+- file touched: `config.yml`, `segedge/pipeline/tuning.py`, `CHANGELOG.md`
+- reason: Prevent `BrokenProcessPool` / `Bus error` failures during CRF tuning from unsafe process forking and pointless worker oversubscription.
+- problems fixed: Default config no longer requests 16 CRF workers for a single config; runtime now avoids CRF process pools on CUDA, reduces workers to the available config count, and falls back to serial CRF evaluation if a worker pool still dies.
+
+- Description: Switch persisted inference bundle to XGB-only artifacts, drop bank `.npy` files, and restore legacy `best_setting.yml` alongside `inference_best_setting.yml`.
+- file touched: `segedge/pipeline/artifacts.py`, `segedge/pipeline/run.py`, `tests/test_model_bundle.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: kNN bank arrays are too large for practical persistence, while current inference reuse only needs XGB.
+- problems fixed: Bundle save/load now requires only `xgb_model.json` + manifest metadata, avoids writing huge `pos_bank.npy`/`neg_bank.npy`, forces XGB-only behavior for `io.training=false` loads, and writes both best-settings filenames for compatibility.
+
+- Description: Add persisted model bundles plus inference-only runtime mode (`io.training=false`) to run massive-scale inference without retraining.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/artifacts.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `tests/test_model_bundle.py`, `tests/test_config_loader_inference_mode.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Enable train-once/infer-many operation by reloading tuned XGB/kNN/CRF settings and feature banks.
+- problems fixed: Saves `manifest.yml` + banks + optional XGB model after training, validates bundle/runtime compatibility at load time, supports inference-only tile resolution through `io.inference`, and records bundle metadata in rolling and best-settings outputs.
+
+- Description: Prevent kNN GPU OOM during large-bank scoring by chunking top-k similarity matmuls.
+- file touched: `segedge/core/knn.py`, `CHANGELOG.md`
+- reason: Full `[tile_patches x bank_size]` GPU similarity matrices can exceed memory with multi-million negative banks.
+- problems fixed: Replaces full-matrix kNN similarity matmul with chunked top-k aggregation for both positive and negative banks, avoiding 100+ GiB temporary allocations.
+
+- Description: Add manual-mode inference directory support and switch config to directory-driven inference tiles.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Avoid maintaining long manual `holdout_tiles` lists when inference should cover a full folder.
+- problems fixed: Manual mode now resolves inference tiles from `io.paths.inference_dir` + `io.paths.inference_glob` (fallback to `io.paths.holdout_tiles`), and `config.yml` now points inference to `/mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1`.
+
+- Description: Switch runtime config to manual tile mode using the same tile filenames as `main`.
+- file touched: `config.yml`, `CHANGELOG.md`
+- reason: Restore explicit train/validate/holdout tile selection for manual runs.
+- problems fixed: Sets `io.auto_split.enabled=false` and populates `io.paths.source_tiles`, `io.paths.val_tiles`, and `io.paths.holdout_tiles` with the `main` branch tile lists.
+
+- Description: Restore optional manual tile selection flow while keeping directory-driven LOO as default.
+- file touched: `config.yml`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `KB.md`, `CHANGELOG.md`
+- reason: Allow selecting explicit source/validation/holdout tiles again (main-style) without removing current LOO workflow.
+- problems fixed: `io.auto_split.enabled=false` now runs manual source-tile training + validation tuning + holdout inference using `io.paths.source_tiles`/`source_tile`, `io.paths.val_tiles`, and `io.paths.holdout_tiles`; exported inference settings now include `extra.mode` (`manual` or `loo`).
+
+- Description: Switch inference visual outputs to single active model panels (XGB or kNN), split plots by stage, and upgrade novel proposal acceptance/diagnostics.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `segedge/core/plotting.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Reduce confusion from multi-stream inference plots, allow disabling kNN/CRF cleanly, and make proposal decisions auditable.
+- problems fixed: Adds model enable toggles (`search.knn.enabled`, `search.xgb.enabled`, `search.crf.enabled`), writes validation/inference plots into separate folders, annotates proposal overlays with `component_id:acceptance_score`, auto-accepts proposal components inside SH buffer while evaluating outside components heuristically, and exports per-component proposal records with rejection reasons.
+
+- Description: Fix LOO tile eligibility mismatch by requiring effective GT positives after optional SH-buffer clipping.
+- file touched: `segedge/pipeline/common.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Prevent tiles with vector overlap but zero post-clip GT from entering LOO train/val.
+- problems fixed: Auto split now performs a second eligibility pass and moves tiles with zero effective GT pixels to inference tiles, avoiding no-GT validation plots during training.
+
+- Description: Restore variable XGB threshold selection for tuning runs.
+- file touched: `config.yml`, `CHANGELOG.md`
+- reason: Keep threshold adaptive per fold/run instead of pinning to a single fixed value.
+- problems fixed: Sets `search.xgb.fixed_threshold` back to `null`, so XGB threshold is selected from the configured threshold range.
+
+- Description: Add fast-stable LOO tuning defaults with fixed XGB threshold/config, low-GT fold skipping, and outside-SH proposal candidate scope.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`, `ARCHITECTURE.md`
+- reason: Reduce wasted tuning time on sparse folds, preserve best-so-far under 10h budget, and surface novel linear-feature proposals beyond SH bounds during inference.
+- problems fixed: Shrinks kNN/XGB search space, supports 2-tile validation folds, skips low-signal folds, applies budget checks at tuning checkpoints, pins XGB threshold when configured, and enables whole-tile proposal sourcing for accepted/rejected overlays and shapefiles.
+
+- Description: Add time-budget cutover that uses best-so-far settings and transitions to inference after budget expiry.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`, `ARCHITECTURE.md`
+- reason: Long LOO runs need a deterministic wall-clock stop point with interruption-safe continuation to inference.
+- problems fixed: Adds configurable runtime budget (`runtime.time_budget`), resume-aware deadline handling, rolling checkpoint time-budget metadata, and immediate inference cutover using best completed fold artifacts when the budget is hit.
+
+- Description: Reduce LOO tuning runtime with stronger caching defaults and XGB scoring/training efficiency improvements.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/features.py`, `segedge/core/banks.py`, `segedge/core/xdboost.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `segedge/pipeline/runtime_utils.py`, `CHANGELOG.md`
+- reason: Address repeated DINO extraction, CPU fallback overhead, expensive roads rasterization, and oversized training samples.
+- problems fixed: Defaulted to disk feature cache + auto-force disk in LOO+augmentation mode, added roads-mask disk caching, switched XGB tile inference to `inplace_predict`, capped positive samples (`max_pos_bank`) for banks/XGB dataset, hardened feature-cache validity via `feature_spec_hash`, and reduced repeated GPU retry behavior.
+
+- Description: Add hybrid DINO+image feature fusion for kNN/XGB, shape-filtered novel proposals, and richer inference diagnostics plots.
+- file touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/features.py`, `segedge/core/banks.py`, `segedge/core/knn.py`, `segedge/core/xdboost.py`, `segedge/core/plotting.py`, `segedge/pipeline/common.py`, `segedge/pipeline/run.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
+- reason: Improve thin-structure segmentation boundaries and auditability by combining semantic embeddings with local patch cues and object-level heuristics.
+- problems fixed: Enables leakage-safe train-fold feature standardization for XGB, preserves kNN cosine geometry, exports feature-spec/model metadata, proposes accepted/rejected novel objects outside incomplete labels, and adds boundary/disagreement/uncertainty/importance visual diagnostics.
+
 - Description: Add interruption-safe rolling best-config checkpoints during LOO tuning and holdout inference.
 - file touched: `segedge/pipeline/run.py`, `segedge/pipeline/common.py`, `CHANGELOG.md`
 - reason: Persist the current best configuration while long runs are still in progress.
