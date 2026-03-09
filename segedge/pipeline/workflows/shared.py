@@ -90,6 +90,24 @@ def _novel_proposals_payload() -> dict[str, object]:
     }
 
 
+def _inference_score_prior_payload() -> dict[str, object]:
+    """Return the active manual inference score-prior config as a dict.
+
+    Examples:
+        >>> isinstance(_inference_score_prior_payload(), dict)
+        True
+    """
+    prior_cfg = cfg.io.inference.score_prior
+    return {
+        "enabled": prior_cfg.enabled,
+        "apply_to": prior_cfg.apply_to,
+        "target": prior_cfg.target,
+        "mode": prior_cfg.mode,
+        "factor": prior_cfg.factor,
+        "clip_max": prior_cfg.clip_max,
+    }
+
+
 def _maybe_run_holdout_inference(
     holdout_tiles: list[str],
     runner: Callable[[], None],
@@ -285,5 +303,6 @@ def run_holdout_with_checkpoint(
             processed_log_path=processed_log_path,
             write_checkpoint=write_checkpoint,
             logger=logger,
+            final_inference_phase=True,
         ),
     )

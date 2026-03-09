@@ -94,6 +94,7 @@ def run_holdout_inference(
     processed_log_path: str,
     write_checkpoint: Callable[[int], None],
     logger,
+    final_inference_phase: bool = True,
 ) -> int:
     """Run holdout inference tiles and update rolling checkpoints.
 
@@ -134,6 +135,7 @@ def run_holdout_inference(
             plot_dir,
             context_radius,
             plot_with_metrics=False,
+            final_inference_phase=final_inference_phase,
         )
         if result["gt_available"]:
             _update_phase_metrics(holdout_phase_metrics, result["metrics"])

@@ -174,6 +174,7 @@ def _compute_xgb_stream(
     stride: int,
     feature_dir: str | None,
     context_radius: int,
+    final_inference_phase: bool,
 ) -> dict[str, object]:
     """Return XGB scores, masks, and metrics for one tile.
 
@@ -212,6 +213,12 @@ def _compute_xgb_stream(
         context["roads_mask"],
         context["roads_penalty"],
     )
+    score_penalized = _apply_inference_score_prior(
+        score_penalized,
+        context["labels_sh"],
+        context["image_id_b"],
+        final_inference_phase=final_inference_phase,
+    )
     mask = (score_penalized >= threshold) & sh_buffer_mask
     mask = median_filter(mask.astype(np.uint8), size=3) > 0
     output.update(
@@ -223,6 +230,49 @@ def _compute_xgb_stream(
         }
     )
     return output
+
+
+def _apply_inference_score_prior(
+    score_map: np.ndarray,
+    labels_sh: np.ndarray,
+    image_id_b: str,
+    *,
+    final_inference_phase: bool,
+) -> np.ndarray:
+    """Apply the manual inference-only score prior inside source-label pixels.
+
+    Examples:
+        >>> score = np.array([[0.5, 0.5]], dtype=np.float32)
+        >>> labels = np.array([[1, 0]], dtype=np.uint8)
+        >>> out = _apply_inference_score_prior(
+        ...     score,
+        ...     labels,
+        ...     "tile",
+        ...     final_inference_phase=False,
+        ... )
+        >>> np.allclose(out, score)
+        True
+    """
+    prior_cfg = cfg.io.inference.score_prior
+    if not final_inference_phase or not prior_cfg.enabled:
+        return score_map
+    inside_mask = labels_sh > 0
+    if not np.any(inside_mask):
+        return score_map
+    score_with_prior = score_map.astype(np.float32, copy=True)
+    score_before = score_with_prior[inside_mask]
+    score_with_prior[inside_mask] *= float(prior_cfg.factor)
+    score_with_prior = np.clip(score_with_prior, 0.0, float(prior_cfg.clip_max))
+    score_after = score_with_prior[inside_mask]
+    logger.info(
+        "inference score prior: tile=%s factor=%.3f boosted_pixels=%s mean_before=%.4f mean_after=%.4f",
+        image_id_b,
+        float(prior_cfg.factor),
+        int(inside_mask.sum()),
+        float(score_before.mean()),
+        float(score_after.mean()),
+    )
+    return score_with_prior
 
 
 def _resolve_champion_stream(
@@ -635,6 +685,7 @@ def infer_on_holdout(
     plot_dir: str,
     context_radius: int,
     plot_with_metrics: bool = True,
+    final_inference_phase: bool = False,
 ) -> dict[str, object]:
     """Run inference on a holdout tile using tuned settings.
 
@@ -679,6 +730,7 @@ def infer_on_holdout(
         stride,
         feature_dir,
         context_radius,
+        final_inference_phase,
     )
     champion_source = _resolve_champion_stream(
         tuned,

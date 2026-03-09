@@ -65,6 +65,18 @@ class IOAutoSplitConfig:
 
 
 @dataclass
+class IOInferenceScorePriorConfig:
+    """Manual inference-phase score prior settings."""
+
+    enabled: bool
+    apply_to: str
+    target: str
+    mode: str
+    factor: float
+    clip_max: float
+
+
+@dataclass
 class IOConfig:
     """I/O config group."""
 
@@ -83,6 +95,7 @@ class IOInferenceConfig:
     tile_glob: str
     tiles: list[str]
     save_bundle: bool
+    score_prior: IOInferenceScorePriorConfig
 
 
 @dataclass
@@ -470,6 +483,10 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
     io_paths = _require_mapping(io["paths"], "io.paths")
     io_auto_split = _require_mapping(io["auto_split"], "io.auto_split")
     io_inference = _require_mapping(io.get("inference", {}), "io.inference")
+    io_inference_score_prior = _require_mapping(
+        io_inference.get("score_prior", {}),
+        "io.inference.score_prior",
+    )
     return IOConfig(
         training=bool(io.get("training", True)),
         inference=IOInferenceConfig(
@@ -486,6 +503,29 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
             tile_glob=str(io_inference.get("tile_glob", "*.tif")),
             tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
             save_bundle=bool(io_inference.get("save_bundle", True)),
+            score_prior=IOInferenceScorePriorConfig(
+                enabled=bool(io_inference_score_prior.get("enabled", False)),
+                apply_to=_as_enum(
+                    io_inference_score_prior.get("apply_to", "xgb"),
+                    "io.inference.score_prior.apply_to",
+                    {"xgb"},
+                    "xgb",
+                ),
+                target=_as_enum(
+                    io_inference_score_prior.get("target", "source_labels"),
+                    "io.inference.score_prior.target",
+                    {"source_labels"},
+                    "source_labels",
+                ),
+                mode=_as_enum(
+                    io_inference_score_prior.get("mode", "multiply"),
+                    "io.inference.score_prior.mode",
+                    {"multiply"},
+                    "multiply",
+                ),
+                factor=float(io_inference_score_prior.get("factor", 1.15)),
+                clip_max=float(io_inference_score_prior.get("clip_max", 1.0)),
+            ),
         ),
         paths=IOPathsConfig(
             source_tile=str(io_paths["source_tile"]),
@@ -910,6 +950,10 @@ def _validate_loaded_config(config: Config) -> None:
         0.0 <= config.search.xgb.fixed_threshold <= 1.0
     ):
         raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
+    if config.io.inference.score_prior.factor < 0.0:
+        raise ValueError("'io.inference.score_prior.factor' must be >= 0")
+    if not (0.0 <= config.io.inference.score_prior.clip_max <= 1.0):
+        raise ValueError("'io.inference.score_prior.clip_max' must be in [0, 1]")
     if not config.io.training:
         if config.io.inference.model_bundle_dir is None:
             raise ValueError(

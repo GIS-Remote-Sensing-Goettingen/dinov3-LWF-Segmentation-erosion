@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Add a manual `io.inference.score_prior` that boosts XGB scores inside `SOURCE_LABEL_RASTER` pixels during the final holdout/inference phase only.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/workflows/shared.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Allow manual recall-oriented score adjustment inside known source-label regions without affecting validation metrics or threshold tuning.
+- Problems fixed: Final holdout inference can now apply a configurable XGB-only in-label score boost in both training and inference-only runs, while validation and fold-tuning inference remain unchanged.
+
 - Description: Add per-tile holdout progress logs in the form `Processing tile <path>, <current> / <total>`.
 - Files touched: `segedge/pipeline/inference_flow.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/CHANGELOG.md`
 - Reason: Make long inference runs easier to track from logs, especially when resuming partially completed jobs.

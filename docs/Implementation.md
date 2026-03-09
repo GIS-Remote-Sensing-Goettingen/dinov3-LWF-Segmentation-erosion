@@ -101,6 +101,8 @@ Its job is orchestration at the holdout-set level:
 
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 
+When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply a manual XGB score boost inside `SOURCE_LABEL_RASTER` pixels. This boost is not used during validation inference or tuning.
+
 ## Major Functions
 ### `segedge.pipeline.run.main`
 - Inputs: global `cfg`

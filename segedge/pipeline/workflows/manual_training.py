@@ -19,6 +19,7 @@ from ..runtime_utils import (
 from ..tuning import tune_on_validation_multi
 from .shared import (
     _export_best_settings_dual,
+    _inference_score_prior_payload,
     _novel_proposals_payload,
     build_weighted_phase_metrics,
     export_shared_feature_payloads,
@@ -212,6 +213,7 @@ def run_manual_training(
                 "crf_enabled": cfg.search.crf.enabled,
             },
             "novel_proposals": _novel_proposals_payload(),
+            "inference_score_prior": _inference_score_prior_payload(),
             "feature_spec_hash": hybrid_feature_spec_hash(),
             "xgb_feature_stats": xgb_feature_stats_payload,
             "feature_layout": feature_layout_payload,

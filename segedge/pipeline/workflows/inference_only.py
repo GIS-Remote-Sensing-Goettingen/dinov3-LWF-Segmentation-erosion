@@ -14,6 +14,7 @@ from ..runtime_utils import (
 )
 from .shared import (
     _export_best_settings_dual,
+    _inference_score_prior_payload,
     _novel_proposals_payload,
     export_shared_feature_payloads,
     run_holdout_with_checkpoint,
@@ -116,6 +117,7 @@ def run_inference_only(
                 "crf_enabled": tuned.get("crf_enabled"),
             },
             "novel_proposals": _novel_proposals_payload(),
+            "inference_score_prior": _inference_score_prior_payload(),
             "feature_spec_hash": hybrid_feature_spec_hash(),
             "xgb_feature_stats": xgb_feature_stats_payload,
             "feature_layout": feature_layout_payload,

@@ -44,6 +44,14 @@ def write_rolling_best_config(
         "best_shadow_config": tuned.get("shadow_cfg"),
         "champion_source": tuned.get("champion_source"),
         "roads_penalty": tuned.get("roads_penalty"),
+        "inference_score_prior": {
+            "enabled": bool(cfg.io.inference.score_prior.enabled),
+            "apply_to": cfg.io.inference.score_prior.apply_to,
+            "target": cfg.io.inference.score_prior.target,
+            "mode": cfg.io.inference.score_prior.mode,
+            "factor": float(cfg.io.inference.score_prior.factor),
+            "clip_max": float(cfg.io.inference.score_prior.clip_max),
+        },
         "feature_spec_hash": hybrid_feature_spec_hash(),
         "hybrid_features_enabled": bool(cfg.model.hybrid_features.enabled),
     }

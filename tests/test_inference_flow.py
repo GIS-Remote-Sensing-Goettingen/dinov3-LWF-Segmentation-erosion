@@ -19,6 +19,7 @@ from segedge.pipeline.inference_flow import (
     run_holdout_inference,
 )
 from segedge.pipeline.run import _maybe_run_holdout_inference
+from segedge.pipeline.runtime.holdout_inference import _apply_inference_score_prior
 
 
 def _write_test_raster(
@@ -217,6 +218,53 @@ def test_resolve_tiles_from_gt_presence_prefilters_by_source_label_presence(
     )
 
 
+def test_apply_inference_score_prior_boosts_only_inside_source_labels(monkeypatch):
+    """The manual score prior should affect only source-label pixels.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(cfg.io.inference.score_prior, "enabled", True)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "factor", 1.2)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "clip_max", 1.0)
+    score_map = np.array([[0.4, 0.4]], dtype=np.float32)
+    labels_sh = np.array([[1, 0]], dtype=np.uint8)
+
+    boosted = _apply_inference_score_prior(
+        score_map,
+        labels_sh,
+        "tile_a",
+        final_inference_phase=True,
+    )
+
+    assert np.allclose(boosted, np.array([[0.48, 0.4]], dtype=np.float32))
+
+
+def test_apply_inference_score_prior_is_disabled_outside_final_inference(
+    monkeypatch,
+):
+    """Validation-phase inference should not receive the manual score prior.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(cfg.io.inference.score_prior, "enabled", True)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "factor", 1.2)
+    score_map = np.array([[0.4, 0.4]], dtype=np.float32)
+    labels_sh = np.array([[1, 0]], dtype=np.uint8)
+
+    boosted = _apply_inference_score_prior(
+        score_map,
+        labels_sh,
+        "tile_a",
+        final_inference_phase=False,
+    )
+
+    assert np.allclose(boosted, score_map)
+
+
 def test_maybe_run_holdout_inference_skips_empty_tiles(caplog):
     """Empty holdout sets should skip inference cleanly.
 
@@ -247,6 +295,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
     append_calls: list[tuple[str, str, int]] = []
     checkpoint_calls: list[int] = []
     call_order: list[tuple[str, str | int]] = []
+    phase_flags: list[bool] = []
 
     def _fake_infer_on_holdout(
         holdout_path,
@@ -265,6 +314,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
         plot_dir,
         context_radius,
         plot_with_metrics,
+        final_inference_phase,
     ):
         """Return a deterministic fake inference payload.
 
@@ -272,6 +322,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
             >>> True
             True
         """
+        phase_flags.append(final_inference_phase)
         mask = np.ones((2, 2), dtype=bool)
         return {
             "gt_available": False,
@@ -328,6 +379,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
         ("append", "tile_b.tif"),
         ("checkpoint", 2),
     ]
+    assert phase_flags == [True, True]
     assert len(processed_log_path.read_text(encoding="utf-8").splitlines()) == 2
     assert "Processing tile tile_a.tif, 1 / 2" in caplog.text
     assert "Processing tile tile_b.tif, 2 / 2" in caplog.text
@@ -344,6 +396,7 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
         >>> True
         True
     """
+    phase_flags: list[bool] = []
 
     def _fake_infer_on_holdout(
         holdout_path,
@@ -362,6 +415,7 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
         plot_dir,
         context_radius,
         plot_with_metrics,
+        final_inference_phase,
     ):
         """Return a deterministic fake inference payload.
 
@@ -369,6 +423,7 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
             >>> True
             True
         """
+        phase_flags.append(final_inference_phase)
         mask = np.ones((2, 2), dtype=bool)
         return {
             "gt_available": False,
@@ -409,5 +464,6 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
         )
 
     assert processed == 2
+    assert phase_flags == [True]
     assert "holdout skip (already processed): tile_done.tif" in caplog.text
     assert "Processing tile tile_pending.tif, 1 / 1" in caplog.text
