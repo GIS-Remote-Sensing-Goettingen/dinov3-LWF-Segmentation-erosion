@@ -106,7 +106,7 @@ model:
   # Hybrid feature fusion: DINO embeddings + low-cost image patch descriptors.
   # kNN and XGB intentionally use different normalization geometry.
   hybrid_features:
-    enabled: true
+    enabled: false
     # kNN branch: block-weighted concat + final L2 normalization.
     knn_l2_normalize: true
     # XGB branch: optional z-score standardization (fit on train folds only).
@@ -174,7 +174,7 @@ search:
     bilateral_w_values: [7.0]
     bilateral_xy_std_values: [25.0]
     bilateral_rgb_std_values: [3.0]
-    num_workers: 16
+    num_workers: 1
     max_configs: 1
 
   xgb:

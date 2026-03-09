@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Callable
 
 import numpy as np
@@ -44,6 +45,37 @@ logger = logging.getLogger(__name__)
 
 class TimeBudgetExceededError(RuntimeError):
     """Raised when runtime budget is exceeded during tuning checkpoints."""
+
+
+def _resolve_crf_workers(
+    requested_workers: int,
+    candidate_count: int,
+    device,
+) -> int:
+    """Return a safe CRF worker count for the current runtime.
+
+    Avoid process-based CRF search after CUDA initialization because forking a
+    GPU-touched parent can terminate child workers abruptly. Also avoid
+    oversubscribing workers beyond the number of CRF configs.
+
+    Args:
+        requested_workers (int): Configured CRF worker count.
+        candidate_count (int): Number of CRF configs to evaluate.
+        device: Torch device used by the pipeline.
+
+    Returns:
+        int: Effective CRF worker count.
+
+    Examples:
+        >>> _resolve_crf_workers(16, 1, torch.device("cpu"))
+        1
+        >>> _resolve_crf_workers(4, 4, torch.device("cuda:0"))
+        1
+    """
+    safe_workers = max(1, min(int(requested_workers), int(candidate_count)))
+    if getattr(device, "type", "cpu") == "cuda":
+        return 1
+    return safe_workers
 
 
 def tune_on_validation_multi(
@@ -510,7 +542,24 @@ def tune_on_validation_multi(
         _maybe_stop("crf_search")
         best_crf_iou = None
         crf_candidates = crf_candidates[:CRF_MAX_CONFIGS]
-        num_workers = int(cfg.search.crf.num_workers or 1)
+        requested_workers = int(cfg.search.crf.num_workers or 1)
+        num_workers = _resolve_crf_workers(
+            requested_workers=requested_workers,
+            candidate_count=len(crf_candidates),
+            device=device,
+        )
+        if requested_workers != num_workers:
+            if getattr(device, "type", "cpu") == "cuda" and requested_workers > 1:
+                logger.warning(
+                    "tune: forcing serial CRF search because CUDA is active; "
+                    "process pools after GPU initialization can crash workers"
+                )
+            elif requested_workers > len(crf_candidates):
+                logger.info(
+                    "tune: reducing CRF workers from %s to %s to match config count",
+                    requested_workers,
+                    num_workers,
+                )
         logger.info(
             "tune: CRF grid search configs=%s, workers=%s",
             len(crf_candidates),
@@ -518,9 +567,28 @@ def tune_on_validation_multi(
         )
         _init_crf_parallel(val_contexts)
         if num_workers > 1:
-            with ProcessPoolExecutor(max_workers=num_workers) as ex:
-                for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
+            try:
+                with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                    for med_iou, cand in ex.map(_eval_crf_config, crf_candidates):
+                        _maybe_stop("crf_search")
+                        if best_crf_iou is None or med_iou > best_crf_iou:
+                            best_crf_iou = med_iou
+                            best_crf_cfg = {
+                                "enabled": True,
+                                "prob_softness": cand[0],
+                                "pos_w": cand[1],
+                                "pos_xy_std": cand[2],
+                                "bilateral_w": cand[3],
+                                "bilateral_xy_std": cand[4],
+                                "bilateral_rgb_std": cand[5],
+                            }
+            except BrokenProcessPool:
+                logger.exception(
+                    "tune: CRF worker pool crashed; retrying CRF search serially"
+                )
+                for cand in crf_candidates:
                     _maybe_stop("crf_search")
+                    med_iou, _ = _eval_crf_config(cand)
                     if best_crf_iou is None or med_iou > best_crf_iou:
                         best_crf_iou = med_iou
                         best_crf_cfg = {

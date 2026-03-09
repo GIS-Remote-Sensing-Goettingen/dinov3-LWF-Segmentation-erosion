@@ -2,6 +2,11 @@
 
 
 ## [Unreleased]
+- Description: Force serial CRF tuning when CUDA is active, cap CRF workers to candidate count, and retry serially if the CRF process pool crashes.
+- file touched: `config.yml`, `segedge/pipeline/tuning.py`, `CHANGELOG.md`
+- reason: Prevent `BrokenProcessPool` / `Bus error` failures during CRF tuning from unsafe process forking and pointless worker oversubscription.
+- problems fixed: Default config no longer requests 16 CRF workers for a single config; runtime now avoids CRF process pools on CUDA, reduces workers to the available config count, and falls back to serial CRF evaluation if a worker pool still dies.
+
 - Description: Switch persisted inference bundle to XGB-only artifacts, drop bank `.npy` files, and restore legacy `best_setting.yml` alongside `inference_best_setting.yml`.
 - file touched: `segedge/pipeline/artifacts.py`, `segedge/pipeline/run.py`, `tests/test_model_bundle.py`, `ARCHITECTURE.md`, `CHANGELOG.md`
 - reason: kNN bank arrays are too large for practical persistence, while current inference reuse only needs XGB.
