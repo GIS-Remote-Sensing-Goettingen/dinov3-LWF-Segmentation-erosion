@@ -15,10 +15,15 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
-- Description: Filter folder/list-based inference tiles by `SOURCE_LABEL_RASTER` overlap and keep rolling union outputs updated tile by tile.
+- Description: Add per-tile holdout progress logs in the form `Processing tile <path>, <current> / <total>`.
+- Files touched: `segedge/pipeline/inference_flow.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: Make long inference runs easier to track from logs, especially when resuming partially completed jobs.
+- Problems fixed: Holdout inference now reports stable run-level progress counts that exclude already processed tiles, while preserving the existing skip logs and append/checkpoint ordering.
+
+- Description: Filter folder/list-based inference tiles by actual `SOURCE_LABEL_RASTER` label presence and keep rolling union outputs updated tile by tile.
 - Files touched: `segedge/pipeline/common.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/run.py`, `tests/test_inference_flow.py`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`
-- Reason: Avoid spending inference time on tiles outside source-label coverage and preserve usable mask geometry if a long job stops mid-run.
-- Problems fixed: Inference tile resolution now skips non-overlapping tiles in both training+inference and inference-only modes, empty filtered holdout sets no longer crash the run, and tests verify union-mask append/checkpoint updates happen after each inferred tile.
+- Reason: Avoid spending inference time on tiles that only intersect the label-raster extent while containing no source labels, and preserve usable mask geometry if a long job stops mid-run.
+- Problems fixed: Inference tile resolution now skips tiles with no positive source-label pixels in both training+inference and inference-only modes, auto split uses the same stricter eligibility rule, empty filtered holdout sets no longer crash the run, and tests verify union-mask append/checkpoint updates happen after each inferred tile.
 
 - Description: Force serial CRF tuning when CUDA is active, cap CRF workers to candidate count, and retry serially if the CRF process pool crashes.
 - Files touched: `config.yml`, `segedge/pipeline/tuning.py`, `docs/CHANGELOG.md`

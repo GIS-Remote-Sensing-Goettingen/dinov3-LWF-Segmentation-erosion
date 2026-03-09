@@ -15,6 +15,7 @@ from pyproj import Transformer
 from rasterio import open as rio_open
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
+from rasterio.windows import from_bounds
 from shapely.geometry import box, shape
 from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
@@ -195,11 +196,11 @@ def _chunk_tiles(tile_paths: list[str], chunk_size: int) -> list[list[str]]:
     ]
 
 
-def filter_tiles_by_source_label_raster_overlap(
+def filter_tiles_by_source_label_presence(
     tile_paths: list[str],
     raster_path: str | None = None,
 ) -> tuple[list[str], int]:
-    """Filter tiles to those overlapping the source label raster extent.
+    """Filter tiles to those containing positive source-label pixels.
 
     Args:
         tile_paths (list[str]): Candidate tile paths.
@@ -210,7 +211,7 @@ def filter_tiles_by_source_label_raster_overlap(
         tuple[list[str], int]: Filtered tile paths and excluded tile count.
 
     Examples:
-        >>> filter_tiles_by_source_label_raster_overlap([], raster_path=None)
+        >>> filter_tiles_by_source_label_presence([], raster_path=None)
         ([], 0)
     """
     if not tile_paths:
@@ -224,29 +225,52 @@ def filter_tiles_by_source_label_raster_overlap(
     with rio_open(raster_path) as src:
         raster_crs = src.crs
         raster_bounds = src.bounds
+        nodata = src.nodata
 
-    filtered_paths = []
-    excluded_count = 0
-    for tile_path in tile_paths:
-        with rio_open(tile_path) as tile_src:
-            tile_bounds = tile_src.bounds
-            tile_crs = tile_src.crs
-        if raster_crs is not None and tile_crs is not None and tile_crs != raster_crs:
-            tile_bounds = transform_bounds(
-                tile_crs, raster_crs, *tile_bounds, densify_pts=21
+        filtered_paths = []
+        excluded_count = 0
+        for tile_path in tile_paths:
+            with rio_open(tile_path) as tile_src:
+                tile_bounds = tile_src.bounds
+                tile_crs = tile_src.crs
+            if (
+                raster_crs is not None
+                and tile_crs is not None
+                and tile_crs != raster_crs
+            ):
+                tile_bounds = transform_bounds(
+                    tile_crs, raster_crs, *tile_bounds, densify_pts=21
+                )
+            tb_left, tb_bottom, tb_right, tb_top = tile_bounds
+            rb_left, rb_bottom, rb_right, rb_top = raster_bounds
+            overlap_left = max(tb_left, rb_left)
+            overlap_bottom = max(tb_bottom, rb_bottom)
+            overlap_right = min(tb_right, rb_right)
+            overlap_top = min(tb_top, rb_top)
+            if overlap_left >= overlap_right or overlap_bottom >= overlap_top:
+                excluded_count += 1
+                continue
+            window = from_bounds(
+                overlap_left,
+                overlap_bottom,
+                overlap_right,
+                overlap_top,
+                transform=src.transform,
             )
-        tb_left, tb_bottom, tb_right, tb_top = tile_bounds
-        rb_left, rb_bottom, rb_right, rb_top = raster_bounds
-        intersects = not (
-            tb_right <= rb_left
-            or tb_left >= rb_right
-            or tb_top <= rb_bottom
-            or tb_bottom >= rb_top
-        )
-        if intersects:
-            filtered_paths.append(tile_path)
-        else:
-            excluded_count += 1
+            label_data = src.read(1, window=window, masked=True)
+            if label_data.size == 0:
+                excluded_count += 1
+                continue
+            positive_mask = np.logical_and(
+                ~np.ma.getmaskarray(label_data),
+                np.asarray(label_data) > 0,
+            )
+            if nodata is not None:
+                positive_mask &= np.asarray(label_data) != nodata
+            if np.any(positive_mask):
+                filtered_paths.append(tile_path)
+            else:
+                excluded_count += 1
     return filtered_paths, excluded_count
 
 
@@ -433,18 +457,18 @@ def resolve_tiles_from_gt_presence(
     if downsample_factor is None:
         downsample_factor = int(cfg.model.backbone.resample_factor or 1)
 
-    filtered_paths, excluded_by_raster = filter_tiles_by_source_label_raster_overlap(
+    filtered_paths, excluded_by_raster = filter_tiles_by_source_label_presence(
         tile_paths,
         raster_path=cfg.io.paths.source_label_raster,
     )
     if excluded_by_raster:
         logger.info(
-            "auto split: excluded %s tiles with no SOURCE_LABEL_RASTER overlap",
+            "auto split: excluded %s tiles with no SOURCE_LABEL_RASTER labels inside tile",
             excluded_by_raster,
         )
     tile_paths = filtered_paths
     if not tile_paths:
-        raise ValueError("no tiles overlap SOURCE_LABEL_RASTER")
+        raise ValueError("no tiles contain SOURCE_LABEL_RASTER labels")
 
     num_workers = _resolve_gt_workers(num_workers)
     logger.info(

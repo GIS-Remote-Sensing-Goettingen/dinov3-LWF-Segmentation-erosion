@@ -19,8 +19,7 @@ def test_counted_function_lines_excludes_docstring_and_doctests():
         >>> True
         True
     """
-    tree = __import__("ast").parse(
-        """
+    tree = __import__("ast").parse("""
 def sample():
     \"\"\"Example.
 
@@ -30,8 +29,7 @@ def sample():
     a = 1
     b = 2
     return a + b
-"""
-    )
+""")
 
     assert counted_function_lines(tree.body[0]) == 4
 

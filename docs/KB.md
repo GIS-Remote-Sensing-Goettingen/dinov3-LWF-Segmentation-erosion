@@ -46,7 +46,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `output/run_*/model_bundle/` when bundle saving is enabled
 
 ## Important runtime behavior
-- Inference tile filtering respects `io.paths.source_label_raster`.
+- Inference tile filtering respects `io.paths.source_label_raster` and keeps only tiles that contain at least one positive source-label pixel.
 - Holdout inference is interruption-safe at tile granularity.
 - CRF tuning is guarded against unsafe CUDA multiprocessing.
 - Time-budget state is persisted in the rolling checkpoint and can trigger cutover behavior.
@@ -65,7 +65,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
   - reduce workers to 1
   - verify the CUDA-safe fallback path is active
 - Empty holdout inference:
-  - check `SOURCE_LABEL_RASTER` overlap filtering
+  - check `SOURCE_LABEL_RASTER` label-presence filtering
   - verify inference directory/list inputs
 - Very low IoU:
   - verify SH-buffer alignment and CRS

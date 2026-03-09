@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-from .common import filter_tiles_by_source_label_raster_overlap
+from .common import filter_tiles_by_source_label_presence
 from .runtime_utils import _update_phase_metrics, infer_on_holdout
 
 
@@ -43,31 +43,29 @@ def resolve_inference_tiles(
             tile_glob,
             len(tiles),
         )
-        filtered_tiles, excluded_count = filter_tiles_by_source_label_raster_overlap(
-            tiles
-        )
+        filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(tiles)
         if excluded_count:
             logger.info(
-                "inference: excluded %s tiles with no SOURCE_LABEL_RASTER overlap",
+                "inference: excluded %s tiles with no SOURCE_LABEL_RASTER labels inside tile",
                 excluded_count,
             )
         return filtered_tiles, tiles_dir, tile_glob
     if explicit_tiles:
-        filtered_tiles, excluded_count = filter_tiles_by_source_label_raster_overlap(
+        filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
             explicit_tiles
         )
         if excluded_count:
             logger.info(
-                "inference: excluded %s explicit tiles with no SOURCE_LABEL_RASTER overlap",
+                "inference: excluded %s explicit tiles with no SOURCE_LABEL_RASTER labels inside tile",
                 excluded_count,
             )
         return filtered_tiles, None, tile_glob
-    filtered_tiles, excluded_count = filter_tiles_by_source_label_raster_overlap(
+    filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
         list(legacy_holdout_tiles)
     )
     if excluded_count:
         logger.info(
-            "inference: excluded %s legacy holdout tiles with no SOURCE_LABEL_RASTER overlap",
+            "inference: excluded %s legacy holdout tiles with no SOURCE_LABEL_RASTER labels inside tile",
             excluded_count,
         )
     return filtered_tiles, None, tile_glob
@@ -104,10 +102,21 @@ def run_holdout_inference(
         True
     """
     holdout_tiles_processed = len(processed_tiles)
+    total_pending_tiles = sum(
+        1 for tile_path in holdout_tiles if tile_path not in processed_tiles
+    )
+    pending_tile_index = 0
     for b_path in holdout_tiles:
         if b_path in processed_tiles:
             logger.info("holdout skip (already processed): %s", b_path)
             continue
+        pending_tile_index += 1
+        logger.info(
+            "Processing tile %s, %s / %s",
+            b_path,
+            pending_tile_index,
+            total_pending_tiles,
+        )
         result = infer_on_holdout(
             b_path,
             gt_vector_paths,

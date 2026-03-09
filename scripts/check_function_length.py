@@ -84,7 +84,14 @@ def counted_function_lines(
     """Return counted function lines excluding the leading docstring span.
 
     Examples:
-        >>> tree = ast.parse("def f():\\n    \\'\\'\\'doc\\n    >>> 1\\n    \\'\\'\\'\\n    x = 1\\n    return x\\n")
+        >>> tree = ast.parse(
+        ...     "def f():\\n"
+        ...     "    \\'\\'\\'doc\\n"
+        ...     "    >>> 1\\n"
+        ...     "    \\'\\'\\'\\n"
+        ...     "    x = 1\\n"
+        ...     "    return x\\n"
+        ... )
         >>> counted_function_lines(tree.body[0])
         3
     """

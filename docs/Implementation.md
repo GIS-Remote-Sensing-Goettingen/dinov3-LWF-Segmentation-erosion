@@ -30,7 +30,7 @@ Execution order:
 
 Important behavior:
 - No training artifacts are built in this mode.
-- If inference tile resolution returns an empty set after `SOURCE_LABEL_RASTER` filtering, holdout inference is skipped cleanly.
+- If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
 
 ### Manual training workflow
@@ -93,6 +93,7 @@ Responsibilities:
 The tile loop itself lives in `segedge.pipeline.inference_flow.run_holdout_inference`.
 Its job is orchestration at the holdout-set level:
 - skip already processed tiles on resume
+- log per-tile progress as `Processing tile <path>, <current> / <total>`
 - call `infer_on_holdout` for each tile
 - append new masks into rolling union shapefiles
 - append one processed record to `processed_tiles.jsonl`
