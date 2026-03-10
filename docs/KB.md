@@ -1,0 +1,83 @@
+# Knowledge Base
+
+## What this repository is
+SegEdge is a zero-shot segmentation pipeline for linear woody features. It uses DINOv3 patch features, optional XGBoost scoring, CRF refinement, and shadow filtering to produce holdout masks, plots, and rolling shapefile outputs.
+
+For architecture details, read `docs/ARCHITECTURE.md`.
+For workflow and function-level behavior, read `docs/Implementation.md`.
+
+## Current Code Map
+- `main.py`: CLI wrapper
+- `segedge/pipeline/run.py`: bootstrap and workflow dispatch
+- `segedge/pipeline/workflows/`: inference-only, manual, and LOO workflows
+- `segedge/pipeline/runtime/`: per-concern runtime helpers
+- `segedge/core/feature_ops/`: feature extraction, fusion, tiling, and cache helpers
+- `segedge/pipeline/artifacts.py`: model bundle persistence
+- `config.yml`: runtime configuration
+
+## Run Modes
+### Inference-only
+- Set `io.training=false`.
+- Requires `io.inference.model_bundle_dir`.
+- Resolves inference tiles from `io.inference.*` or legacy inference config.
+- Skips training and goes directly to holdout inference.
+
+### Manual training
+- Set `io.training=true`.
+- Set `io.auto_split.enabled=false`.
+- Provide explicit source, validation, and holdout tile lists.
+- Builds training artifacts once, tunes once, then runs holdout inference.
+
+### LOO training
+- Set `io.training=true`.
+- Set `io.auto_split.enabled=true`.
+- Auto-discovers GT-positive tiles for fold construction.
+- Tunes fold by fold, selects the best fold, optionally retrains on all GT tiles, then runs holdout inference.
+
+## Outputs to inspect
+- `output/run_*/run.log`
+- `output/run_*/rolling_best_setting.yml`
+- `output/run_*/processed_tiles.jsonl`
+- `output/run_*/plots/validation/`
+- `output/run_*/plots/inference/`
+- `output/run_*/shapes/unions/{knn|xgb|champion}/{raw|crf|shadow}/union.shp`
+- `output/run_*/inference_best_setting.yml`
+- `output/run_*/best_setting.yml`
+- `output/run_*/model_bundle/` when bundle saving is enabled
+
+## Important runtime behavior
+- Inference tile filtering respects `io.paths.source_label_raster` and keeps only tiles that contain at least one positive source-label pixel.
+- `io.inference.score_prior` can manually boost XGB scores inside `SOURCE_LABEL_RASTER` pixels during the final inference phase.
+- Holdout inference is interruption-safe at tile granularity.
+- CRF tuning is guarded against unsafe CUDA multiprocessing.
+- Time-budget state is persisted in the rolling checkpoint and can trigger cutover behavior.
+- Disk feature cache mode consolidates per-tile caches after successful workflows.
+
+## Major Functions to know
+- `segedge.pipeline.run.main`: dispatcher and bootstrap.
+- `segedge.pipeline.workflows.run_inference_only`: bundle load plus holdout inference.
+- `segedge.pipeline.workflows.run_manual_training`: explicit train/validate/holdout flow.
+- `segedge.pipeline.workflows.run_loo_training`: fold tuning and optional final retraining.
+- `segedge.pipeline.runtime.holdout_inference.infer_on_holdout`: one-tile inference path.
+- `segedge.pipeline.runtime.checkpointing.write_rolling_best_config`: rolling checkpoint writer.
+
+## Troubleshooting
+- `BrokenProcessPool` during CRF tuning:
+  - reduce workers to 1
+  - verify the CUDA-safe fallback path is active
+- Empty holdout inference:
+  - check `SOURCE_LABEL_RASTER` label-presence filtering
+  - check whether `io.inference.score_prior` is enabled
+  - verify inference directory/list inputs
+- Very low IoU:
+  - verify SH-buffer alignment and CRS
+  - confirm GT clipping behavior
+- Stale features:
+  - delete the affected files under `FEATURE_DIR`
+  - rerun to rebuild them with the current feature-spec hash
+
+## Tooling
+- `pre-commit run --all-files`: formatter, lint, doctest-ratio, file-length, and function-length checks
+- `pytest --doctest-modules`: doctests plus pytest suite
+- `scripts/check_file_length.py`: file-size guard
+- `scripts/check_function_length.py`: function-size guard that ignores leading docstrings and doctests by excluding the full docstring block from the count

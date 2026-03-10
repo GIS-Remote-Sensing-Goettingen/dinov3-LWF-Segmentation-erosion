@@ -65,6 +65,18 @@ class IOAutoSplitConfig:
 
 
 @dataclass
+class IOInferenceScorePriorConfig:
+    """Manual inference-phase score prior settings."""
+
+    enabled: bool
+    apply_to: str
+    target: str
+    mode: str
+    factor: float
+    clip_max: float
+
+
+@dataclass
 class IOConfig:
     """I/O config group."""
 
@@ -83,6 +95,7 @@ class IOInferenceConfig:
     tile_glob: str
     tiles: list[str]
     save_bundle: bool
+    score_prior: IOInferenceScorePriorConfig
 
 
 @dataclass
@@ -460,20 +473,121 @@ def _load_hybrid_block(
     )
 
 
-def load_config(path: str | Path | None = None) -> Config:
-    """Load the repository config YAML into a typed config object."""
-    if path is None:
-        path = Path(__file__).resolve().parents[2] / "config.yml"
-    cfg_path = Path(path)
-    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+def _load_io_config(io: dict[str, Any]) -> IOConfig:
+    """Build the I/O configuration subtree.
 
-    root = _require_mapping(raw, "root")
-    io = _require_mapping(root["io"], "io")
+    Examples:
+        >>> callable(_load_io_config)
+        True
+    """
     io_paths = _require_mapping(io["paths"], "io.paths")
     io_auto_split = _require_mapping(io["auto_split"], "io.auto_split")
     io_inference = _require_mapping(io.get("inference", {}), "io.inference")
+    io_inference_score_prior = _require_mapping(
+        io_inference.get("score_prior", {}),
+        "io.inference.score_prior",
+    )
+    return IOConfig(
+        training=bool(io.get("training", True)),
+        inference=IOInferenceConfig(
+            model_bundle_dir=(
+                str(io_inference["model_bundle_dir"])
+                if io_inference.get("model_bundle_dir") is not None
+                else None
+            ),
+            tiles_dir=(
+                str(io_inference["tiles_dir"])
+                if io_inference.get("tiles_dir") is not None
+                else None
+            ),
+            tile_glob=str(io_inference.get("tile_glob", "*.tif")),
+            tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
+            save_bundle=bool(io_inference.get("save_bundle", True)),
+            score_prior=IOInferenceScorePriorConfig(
+                enabled=bool(io_inference_score_prior.get("enabled", False)),
+                apply_to=_as_enum(
+                    io_inference_score_prior.get("apply_to", "xgb"),
+                    "io.inference.score_prior.apply_to",
+                    {"xgb"},
+                    "xgb",
+                ),
+                target=_as_enum(
+                    io_inference_score_prior.get("target", "source_labels"),
+                    "io.inference.score_prior.target",
+                    {"source_labels"},
+                    "source_labels",
+                ),
+                mode=_as_enum(
+                    io_inference_score_prior.get("mode", "multiply"),
+                    "io.inference.score_prior.mode",
+                    {"multiply"},
+                    "multiply",
+                ),
+                factor=float(io_inference_score_prior.get("factor", 1.15)),
+                clip_max=float(io_inference_score_prior.get("clip_max", 1.0)),
+            ),
+        ),
+        paths=IOPathsConfig(
+            source_tile=str(io_paths["source_tile"]),
+            target_tile=str(io_paths["target_tile"]),
+            source_label_raster=str(io_paths["source_label_raster"]),
+            eval_gt_vectors=_as_list_str(
+                io_paths["eval_gt_vectors"], "io.paths.eval_gt_vectors"
+            ),
+            source_tiles=(
+                None
+                if io_paths.get("source_tiles") is None
+                else _as_list_str(io_paths["source_tiles"], "io.paths.source_tiles")
+            ),
+            val_tiles=_as_list_str(io_paths["val_tiles"], "io.paths.val_tiles"),
+            holdout_tiles=_as_list_str(
+                io_paths["holdout_tiles"], "io.paths.holdout_tiles"
+            ),
+            inference_dir=(
+                str(io_paths["inference_dir"])
+                if io_paths.get("inference_dir") is not None
+                else None
+            ),
+            inference_glob=str(io_paths.get("inference_glob", "*.tif")),
+            feature_dir=str(io_paths["feature_dir"]),
+            bank_cache_dir=str(io_paths["bank_cache_dir"]),
+            output_dir=str(io_paths["output_dir"]),
+            plot_dir=str(io_paths["plot_dir"]),
+            best_settings_path=str(io_paths["best_settings_path"]),
+            log_path=str(io_paths["log_path"]),
+            roads_mask_path=(
+                str(io_paths["roads_mask_path"])
+                if io_paths.get("roads_mask_path") is not None
+                else None
+            ),
+        ),
+        auto_split=IOAutoSplitConfig(
+            enabled=bool(io_auto_split["enabled"]),
+            tiles_dir=str(io_auto_split["tiles_dir"]),
+            tile_glob=str(io_auto_split["tile_glob"]),
+            val_split_fraction=float(io_auto_split["val_split_fraction"]),
+            split_seed=int(io_auto_split["split_seed"]),
+            gt_presence_downsample=(
+                int(io_auto_split["gt_presence_downsample"])
+                if io_auto_split.get("gt_presence_downsample") is not None
+                else None
+            ),
+            gt_presence_workers=(
+                int(io_auto_split["gt_presence_workers"])
+                if io_auto_split.get("gt_presence_workers") is not None
+                else None
+            ),
+        ),
+    )
 
-    model = _require_mapping(root["model"], "model")
+
+def _load_model_config(model: dict[str, Any]) -> ModelConfig:
+    """Build the model configuration subtree.
+
+    Examples:
+        >>> callable(_load_model_config)
+        True
+    """
     model_backbone = _require_mapping(model["backbone"], "model.backbone")
     model_tiling = _require_mapping(model["tiling"], "model.tiling")
     model_priors = _require_mapping(model["priors"], "model.priors")
@@ -487,94 +601,7 @@ def load_config(path: str | Path | None = None) -> Config:
     model_hybrid_blocks = _require_mapping(
         model_hybrid.get("blocks", {}), "model.hybrid_features.blocks"
     )
-    training = _require_mapping(root.get("training", {}), "training")
-    training_loo = _require_mapping(training.get("loo", {}), "training.loo")
-
-    search = _require_mapping(root["search"], "search")
-    search_knn = _require_mapping(search["knn"], "search.knn")
-    search_crf = _require_mapping(search["crf"], "search.crf")
-    search_xgb = _require_mapping(search["xgb"], "search.xgb")
-
-    postprocess = _require_mapping(root["postprocess"], "postprocess")
-    post_shadow = _require_mapping(postprocess["shadow"], "postprocess.shadow")
-    post_roads = _require_mapping(postprocess["roads"], "postprocess.roads")
-    post_novel = _require_mapping(
-        postprocess.get("novel_proposals", {}), "postprocess.novel_proposals"
-    )
-
-    runtime = _require_mapping(root["runtime"], "runtime")
-    runtime_plotting = _require_mapping(runtime.get("plotting", {}), "runtime.plotting")
-    runtime_time_budget = _require_mapping(
-        runtime.get("time_budget", {}), "runtime.time_budget"
-    )
-
-    io_paths_cfg = IOPathsConfig(
-        source_tile=str(io_paths["source_tile"]),
-        target_tile=str(io_paths["target_tile"]),
-        source_label_raster=str(io_paths["source_label_raster"]),
-        eval_gt_vectors=_as_list_str(
-            io_paths["eval_gt_vectors"], "io.paths.eval_gt_vectors"
-        ),
-        source_tiles=(
-            None
-            if io_paths.get("source_tiles") is None
-            else _as_list_str(io_paths["source_tiles"], "io.paths.source_tiles")
-        ),
-        val_tiles=_as_list_str(io_paths["val_tiles"], "io.paths.val_tiles"),
-        holdout_tiles=_as_list_str(io_paths["holdout_tiles"], "io.paths.holdout_tiles"),
-        inference_dir=(
-            str(io_paths["inference_dir"])
-            if io_paths.get("inference_dir") is not None
-            else None
-        ),
-        inference_glob=str(io_paths.get("inference_glob", "*.tif")),
-        feature_dir=str(io_paths["feature_dir"]),
-        bank_cache_dir=str(io_paths["bank_cache_dir"]),
-        output_dir=str(io_paths["output_dir"]),
-        plot_dir=str(io_paths["plot_dir"]),
-        best_settings_path=str(io_paths["best_settings_path"]),
-        log_path=str(io_paths["log_path"]),
-        roads_mask_path=(
-            str(io_paths["roads_mask_path"])
-            if io_paths.get("roads_mask_path") is not None
-            else None
-        ),
-    )
-
-    io_auto_split_cfg = IOAutoSplitConfig(
-        enabled=bool(io_auto_split["enabled"]),
-        tiles_dir=str(io_auto_split["tiles_dir"]),
-        tile_glob=str(io_auto_split["tile_glob"]),
-        val_split_fraction=float(io_auto_split["val_split_fraction"]),
-        split_seed=int(io_auto_split["split_seed"]),
-        gt_presence_downsample=(
-            int(io_auto_split["gt_presence_downsample"])
-            if io_auto_split.get("gt_presence_downsample") is not None
-            else None
-        ),
-        gt_presence_workers=(
-            int(io_auto_split["gt_presence_workers"])
-            if io_auto_split.get("gt_presence_workers") is not None
-            else None
-        ),
-    )
-    io_inference_cfg = IOInferenceConfig(
-        model_bundle_dir=(
-            str(io_inference["model_bundle_dir"])
-            if io_inference.get("model_bundle_dir") is not None
-            else None
-        ),
-        tiles_dir=(
-            str(io_inference["tiles_dir"])
-            if io_inference.get("tiles_dir") is not None
-            else None
-        ),
-        tile_glob=str(io_inference.get("tile_glob", "*.tif")),
-        tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
-        save_bundle=bool(io_inference.get("save_bundle", True)),
-    )
-
-    model_cfg = ModelConfig(
+    return ModelConfig(
         backbone=BackboneConfig(
             name=str(model_backbone["name"]),
             patch_size=int(model_backbone["patch_size"]),
@@ -659,7 +686,17 @@ def load_config(path: str | Path | None = None) -> Config:
             ),
         ),
     )
-    training_cfg = TrainingConfig(
+
+
+def _load_training_config(training: dict[str, Any]) -> TrainingConfig:
+    """Build the training configuration subtree.
+
+    Examples:
+        >>> callable(_load_training_config)
+        True
+    """
+    training_loo = _require_mapping(training.get("loo", {}), "training.loo")
+    return TrainingConfig(
         loo=LOOConfig(
             enabled=bool(training_loo.get("enabled", True)),
             min_train_tiles=int(training_loo.get("min_train_tiles", 1)),
@@ -674,7 +711,18 @@ def load_config(path: str | Path | None = None) -> Config:
         )
     )
 
-    search_cfg = SearchConfig(
+
+def _load_search_config(search: dict[str, Any]) -> SearchConfig:
+    """Build the search configuration subtree.
+
+    Examples:
+        >>> callable(_load_search_config)
+        True
+    """
+    search_knn = _require_mapping(search["knn"], "search.knn")
+    search_crf = _require_mapping(search["crf"], "search.crf")
+    search_xgb = _require_mapping(search["xgb"], "search.xgb")
+    return SearchConfig(
         knn=KNNConfig(
             enabled=bool(search_knn.get("enabled", True)),
             k_values=[int(v) for v in search_knn["k_values"]],
@@ -727,11 +775,22 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
     )
 
+
+def _load_postprocess_config(postprocess: dict[str, Any]) -> PostprocessConfig:
+    """Build the postprocess configuration subtree.
+
+    Examples:
+        >>> callable(_load_postprocess_config)
+        True
+    """
+    post_shadow = _require_mapping(postprocess["shadow"], "postprocess.shadow")
+    post_roads = _require_mapping(postprocess["roads"], "postprocess.roads")
+    post_novel = _require_mapping(
+        postprocess.get("novel_proposals", {}), "postprocess.novel_proposals"
+    )
     weight_sets_raw = post_shadow["weight_sets"]
     if not isinstance(weight_sets_raw, list):
         raise ValueError("'postprocess.shadow.weight_sets' must be a list")
-    weight_sets = [tuple(float(x) for x in row) for row in weight_sets_raw]
-
     heuristic_preset = _as_enum(
         post_novel.get("heuristic_preset", "balanced"),
         "postprocess.novel_proposals.heuristic_preset",
@@ -739,10 +798,9 @@ def load_config(path: str | Path | None = None) -> Config:
         "balanced",
     )
     heuristic_defaults = _novel_heuristic_defaults(heuristic_preset)
-
-    postprocess_cfg = PostprocessConfig(
+    return PostprocessConfig(
         shadow=ShadowConfig(
-            weight_sets=weight_sets,
+            weight_sets=[tuple(float(x) for x in row) for row in weight_sets_raw],
             thresholds=_as_list_float(
                 post_shadow["thresholds"], "postprocess.shadow.thresholds"
             ),
@@ -807,7 +865,19 @@ def load_config(path: str | Path | None = None) -> Config:
         ),
     )
 
-    runtime_cfg = RuntimeConfig(
+
+def _load_runtime_config(runtime: dict[str, Any]) -> RuntimeConfig:
+    """Build the runtime configuration subtree.
+
+    Examples:
+        >>> callable(_load_runtime_config)
+        True
+    """
+    runtime_plotting = _require_mapping(runtime.get("plotting", {}), "runtime.plotting")
+    runtime_time_budget = _require_mapping(
+        runtime.get("time_budget", {}), "runtime.time_budget"
+    )
+    return RuntimeConfig(
         feature_cache_mode=str(runtime["feature_cache_mode"]),
         feature_batch_size=int(runtime["feature_batch_size"]),
         resume_run=bool(runtime["resume_run"]),
@@ -846,48 +916,54 @@ def load_config(path: str | Path | None = None) -> Config:
             cutover_mode=_as_enum(
                 runtime_time_budget.get("cutover_mode", "immediate_inference"),
                 "runtime.time_budget.cutover_mode",
-                {
-                    "immediate_inference",
-                    "final_retrain_then_infer",
-                    "stop",
-                },
+                {"immediate_inference", "final_retrain_then_infer", "stop"},
                 "immediate_inference",
             ),
             scope=_as_enum(
                 runtime_time_budget.get("scope", "total_wall_clock"),
                 "runtime.time_budget.scope",
-                {
-                    "total_wall_clock",
-                    "training_only",
-                },
+                {"total_wall_clock", "training_only"},
                 "total_wall_clock",
             ),
         ),
     )
-    if runtime_cfg.time_budget.hours <= 0:
+
+
+def _validate_loaded_config(config: Config) -> None:
+    """Validate cross-field constraints after config construction.
+
+    Examples:
+        >>> callable(_validate_loaded_config)
+        True
+    """
+    if config.runtime.time_budget.hours <= 0:
         raise ValueError("'runtime.time_budget.hours' must be > 0")
-    if training_cfg.loo.val_tiles_per_fold <= 0:
+    if config.training.loo.val_tiles_per_fold <= 0:
         raise ValueError("'training.loo.val_tiles_per_fold' must be > 0")
-    if training_cfg.loo.min_gt_positive_pixels < 0:
+    if config.training.loo.min_gt_positive_pixels < 0:
         raise ValueError("'training.loo.min_gt_positive_pixels' must be >= 0")
-    if not (search_cfg.knn.enabled or search_cfg.xgb.enabled):
+    if not (config.search.knn.enabled or config.search.xgb.enabled):
         raise ValueError(
             "at least one model must be enabled: search.knn.enabled or search.xgb.enabled"
         )
-    if search_cfg.xgb.fixed_threshold is not None and not (
-        0.0 <= search_cfg.xgb.fixed_threshold <= 1.0
+    if config.search.xgb.fixed_threshold is not None and not (
+        0.0 <= config.search.xgb.fixed_threshold <= 1.0
     ):
         raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
-    if not bool(io.get("training", True)):
-        if io_inference_cfg.model_bundle_dir is None:
+    if config.io.inference.score_prior.factor < 0.0:
+        raise ValueError("'io.inference.score_prior.factor' must be >= 0")
+    if not (0.0 <= config.io.inference.score_prior.clip_max <= 1.0):
+        raise ValueError("'io.inference.score_prior.clip_max' must be in [0, 1]")
+    if not config.io.training:
+        if config.io.inference.model_bundle_dir is None:
             raise ValueError(
                 "'io.inference.model_bundle_dir' must be set when io.training=false"
             )
         has_inference_tiles = bool(
-            io_inference_cfg.tiles_dir
-            or io_inference_cfg.tiles
-            or io_paths_cfg.inference_dir
-            or io_paths_cfg.holdout_tiles
+            config.io.inference.tiles_dir
+            or config.io.inference.tiles
+            or config.io.paths.inference_dir
+            or config.io.paths.holdout_tiles
         )
         if not has_inference_tiles:
             raise ValueError(
@@ -896,19 +972,28 @@ def load_config(path: str | Path | None = None) -> Config:
                 "when io.training=false"
             )
 
-    return Config(
-        io=IOConfig(
-            training=bool(io.get("training", True)),
-            inference=io_inference_cfg,
-            paths=io_paths_cfg,
-            auto_split=io_auto_split_cfg,
+
+def load_config(path: str | Path | None = None) -> Config:
+    """Load the repository config YAML into a typed config object."""
+    if path is None:
+        path = Path(__file__).resolve().parents[2] / "config.yml"
+    cfg_path = Path(path)
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    root = _require_mapping(raw, "root")
+    config = Config(
+        io=_load_io_config(_require_mapping(root["io"], "io")),
+        model=_load_model_config(_require_mapping(root["model"], "model")),
+        training=_load_training_config(
+            _require_mapping(root.get("training", {}), "training")
         ),
-        model=model_cfg,
-        training=training_cfg,
-        search=search_cfg,
-        postprocess=postprocess_cfg,
-        runtime=runtime_cfg,
+        search=_load_search_config(_require_mapping(root["search"], "search")),
+        postprocess=_load_postprocess_config(
+            _require_mapping(root["postprocess"], "postprocess")
+        ),
+        runtime=_load_runtime_config(_require_mapping(root["runtime"], "runtime")),
     )
+    _validate_loaded_config(config)
+    return config
 
 
 cfg = load_config()

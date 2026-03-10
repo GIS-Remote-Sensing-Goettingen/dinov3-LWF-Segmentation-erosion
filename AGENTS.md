@@ -16,9 +16,9 @@ This repository is documentation + configuration (Markdown-first). Optimize for 
 If requirements are ambiguous, ask before making broad changes.
 
 ## Important files (read before changing behavior/structure)
-- ARCHITECTURE.md — overall design and repo structure
-- STYLE.md — writing + formatting conventions
-- CHANGELOG.md — user-visible changes (keep it current)
+- docs/ARCHITECTURE.md — overall design and repo structure
+- docs/STYLE.MD — writing + formatting conventions
+- docs/CHANGELOG.md — user-visible changes (keep it current)
 
 ## Quick start (commands)
 - Install hooks: `pre-commit install`
@@ -31,8 +31,8 @@ WARNING THE FOLLOWING IS MANDATORY YOU MUST FOLLOW THESE STEPS BEFORE COMING BAC
 1. Run: `pre-commit run --all-files` (mandatory; do not respond without running it unless the user explicitly says not to). Do not ask for confirmation to run it.
 2. If you create new files, add them to git (e.g., `git add <file>`).
 3. Run 'pytest --doctest-modules ' and other tests if you have them; do not respond without running them unless the user explicitly says not to).
-4. Update CHANGELOG.md with a short entry describing what changed (and why).
-5. If design/structure changed, update ARCHITECTURE.md.
+4. Update `docs/CHANGELOG.md` with a short entry describing what changed (and why).
+5. If design/structure changed, update `docs/ARCHITECTURE.md`.
 6. In the PR/response, include:
    - Summary of changes (1–3 bullets)
    - Commands you ran + results
@@ -42,13 +42,13 @@ WARNING THE FOLLOWING IS MANDATORY YOU MUST FOLLOW THESE STEPS BEFORE COMING BAC
 
 
 ## Project map
-- `/` — top-level docs and configs
-- `[docs/ or other folders if present]` — what belongs there
-- `[templates/ etc]` — what belongs there
--  `[test/ etc]`  — e2e test files or others
+- `/` — repository root; keep `AGENTS.md`, code, configs, and entrypoints here
+- `/docs` — all human-maintained project documentation except `AGENTS.md`
+- `/scripts` — repository health checks used by pre-commit
+- `/tests` — doctest, smoke, and targeted regression tests
 
 ## Writing and style rules (reader-optimized)
 - Prefer declarative, intention-revealing writing.
 - Keep sections short; avoid repetition.
-- Use consistent headings and terminology (follow STYLE.md).
+- Use consistent headings and terminology (follow `docs/STYLE.MD`).
 - Avoid mass whitespace/format-only changes unless required.
