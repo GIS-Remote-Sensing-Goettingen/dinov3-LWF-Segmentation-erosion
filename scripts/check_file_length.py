@@ -64,6 +64,8 @@ def iter_repo_files(root: Path) -> Iterable[Path]:
             continue
         if any(part in excluded for part in path.parts):
             continue
+        if path.name == "performance.jsonl":
+            continue
         yield path
 
 

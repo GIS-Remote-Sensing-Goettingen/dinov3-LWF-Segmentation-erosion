@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Add `scripts/analyze_performance_log.py` to summarize `performance.jsonl` by stage, substage, and hottest tile contributors, and ignore generated `performance.jsonl` files in the repo file-length guard.
+- Files touched: `scripts/analyze_performance_log.py`, `tests/test_analyze_performance_log.py`, `scripts/check_file_length.py`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Make the new structured performance log usable for iterative bottleneck analysis without hand-parsing JSONL.
+- Problems fixed: The repository now has a repeatable EDA entrypoint that reports average durations per process, per sub-process, per tile, can export CSV summaries for deeper comparison across runs, and pre-commit no longer fails on large generated profiling logs.
+
 - Description: Allow inference-only runs with `io.inference.model_bundle_dir: null` to reuse the newest valid previous `output/run_*/model_bundle`.
 - Files touched: `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `docs/KB.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
 - Reason: Remove the need to manually copy the last bundle path into the config for every inference-only run.

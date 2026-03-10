@@ -7,7 +7,7 @@ io:
 
   inference:
     # In inference-only mode, load a previously saved model bundle from here.
-    # if null it will load the previous run bundle  if it exists.
+  # if null it will load the previous run bundle  if it exists.
     model_bundle_dir: null
     # Optional inference tile directory for both modes.
     tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
