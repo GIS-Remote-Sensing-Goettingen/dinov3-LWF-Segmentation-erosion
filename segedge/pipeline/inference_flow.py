@@ -96,6 +96,7 @@ def run_holdout_inference(
     write_checkpoint: Callable[[int], None],
     logger,
     final_inference_phase: bool = True,
+    plot_every: int = 1,
 ) -> int:
     """Run holdout inference tiles and update rolling checkpoints.
 
@@ -109,11 +110,20 @@ def run_holdout_inference(
     )
     pending_tile_index = 0
     summary_stride = 10
+    xgb_guard_state = {
+        "enabled": bool(final_inference_phase),
+        "checked_tiles": 0,
+        "fallback_to_legacy": False,
+        "guard_tiles": 3,
+        "atol": 1e-5,
+        "rtol": 1e-4,
+    }
     for b_path in holdout_tiles:
         if b_path in processed_tiles:
             logger.info("holdout skip (already processed): %s", b_path)
             continue
         pending_tile_index += 1
+        save_plots = ((pending_tile_index - 1) % max(1, int(plot_every))) == 0
         logger.info(
             "Processing tile %s, %s / %s",
             b_path,
@@ -143,6 +153,8 @@ def run_holdout_inference(
                 context_radius,
                 plot_with_metrics=False,
                 final_inference_phase=final_inference_phase,
+                save_plots=save_plots,
+                xgb_guard_state=xgb_guard_state,
             )
         if result["gt_available"]:
             _update_phase_metrics(holdout_phase_metrics, result["metrics"])

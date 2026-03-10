@@ -56,9 +56,10 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ### Feature Helpers
 - `feature_ops/extraction.py`: DINO feature extraction and batched tile prefetch.
   - for XGB-only inference, cached feature tiles can stay lazy until the scorer actually needs each tile.
+  - cache-hit validation can reuse a per-image manifest instead of reopening every tile sidecar.
 - `feature_ops/tiling.py`: tile iteration, patch-size cropping, and patch-label mapping.
 - `feature_ops/fusion.py`: hybrid DINO + image-descriptor feature assembly and XGB feature-stat transforms.
-- `feature_ops/cache.py`: per-tile feature cache persistence and validation.
+- `feature_ops/cache.py`: per-tile feature cache persistence, validation, and per-image manifests.
 - `feature_ops/spec.py`: feature layout hashing for cache compatibility.
 
 ## End-to-End Flow

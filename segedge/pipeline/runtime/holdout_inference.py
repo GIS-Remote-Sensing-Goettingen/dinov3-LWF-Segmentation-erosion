@@ -23,7 +23,7 @@ from ...core.plotting import (
     save_unified_plot,
 )
 from ...core.timing_utils import perf_span
-from ...core.xdboost import xgb_score_image_b
+from ...core.xdboost import xgb_score_image_b, xgb_score_image_b_legacy
 from .postprocess import _apply_shadow_filter, filter_novel_proposals
 from .roads import _apply_roads_penalty, _get_roads_mask
 from .tile_context import load_b_tile_context
@@ -179,6 +179,7 @@ def _compute_xgb_stream(
     feature_dir: str | None,
     context_radius: int,
     final_inference_phase: bool,
+    xgb_guard_state: dict[str, object] | None,
 ) -> dict[str, object]:
     """Return XGB scores, masks, and metrics for one tile.
 
@@ -200,17 +201,16 @@ def _compute_xgb_stream(
     if bst is None:
         raise ValueError("XGB enabled but no trained booster is available")
     threshold = float(tuned["best_xgb_config"]["threshold"])
-    score_map = xgb_score_image_b(
-        context["img_b"],
-        bst,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        context["image_id_b"],
-        prefetched_tiles=context["prefetched_b"],
+    score_map = _score_xgb_with_guard(
+        context=context,
+        tuned=tuned,
+        bst=bst,
+        ps=ps,
+        tile_size=tile_size,
+        stride=stride,
+        feature_dir=feature_dir,
         context_radius=context_radius,
-        xgb_feature_stats=context["xgb_feature_stats"],
+        xgb_guard_state=xgb_guard_state,
     )
     score_penalized = _apply_roads_penalty(
         score_map,
@@ -234,6 +234,155 @@ def _compute_xgb_stream(
         }
     )
     return output
+
+
+def _score_xgb_with_guard(
+    *,
+    context: dict[str, object],
+    tuned: dict,
+    bst,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str | None,
+    context_radius: int,
+    xgb_guard_state: dict[str, object] | None,
+) -> np.ndarray:
+    """Score one tile with the optimized XGB path and optional legacy guard."""
+    if not xgb_guard_state or not bool(xgb_guard_state.get("enabled", False)):
+        return xgb_score_image_b(
+            context["img_b"],
+            bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            context["image_id_b"],
+            prefetched_tiles=context["prefetched_b"],
+            context_radius=context_radius,
+            xgb_feature_stats=context["xgb_feature_stats"],
+        )
+    if bool(xgb_guard_state.get("fallback_to_legacy", False)):
+        return _score_xgb_legacy(
+            context=context,
+            bst=bst,
+            ps=ps,
+            tile_size=tile_size,
+            stride=stride,
+            feature_dir=feature_dir,
+            context_radius=context_radius,
+        )
+    checked_tiles = int(xgb_guard_state.get("checked_tiles", 0))
+    guard_tiles = int(xgb_guard_state.get("guard_tiles", 0))
+    if checked_tiles >= guard_tiles:
+        return xgb_score_image_b(
+            context["img_b"],
+            bst,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            context["image_id_b"],
+            prefetched_tiles=context["prefetched_b"],
+            context_radius=context_radius,
+            xgb_feature_stats=context["xgb_feature_stats"],
+        )
+    score_map = xgb_score_image_b(
+        context["img_b"],
+        bst,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        context["image_id_b"],
+        prefetched_tiles=context["prefetched_b"],
+        context_radius=context_radius,
+        xgb_feature_stats=context["xgb_feature_stats"],
+    )
+    legacy_score = _score_xgb_legacy(
+        context=context,
+        bst=bst,
+        ps=ps,
+        tile_size=tile_size,
+        stride=stride,
+        feature_dir=feature_dir,
+        context_radius=context_radius,
+    )
+    meaningful_diff, mean_abs_diff, max_abs_diff = _xgb_guard_diff_is_meaningful(
+        optimized_score=score_map,
+        legacy_score=legacy_score,
+        threshold=float(tuned["best_xgb_config"]["threshold"]),
+        atol=float(xgb_guard_state.get("atol", 1e-5)),
+        rtol=float(xgb_guard_state.get("rtol", 1e-4)),
+    )
+    xgb_guard_state["checked_tiles"] = checked_tiles + 1
+    logger.info(
+        "xgb scorer guard: tile=%s compared=%s/%s mean_abs_diff=%.6f max_abs_diff=%.6f fallback=%s",
+        context["image_id_b"],
+        int(xgb_guard_state["checked_tiles"]),
+        guard_tiles,
+        mean_abs_diff,
+        max_abs_diff,
+        meaningful_diff,
+    )
+    if meaningful_diff:
+        xgb_guard_state["fallback_to_legacy"] = True
+        logger.warning(
+            "xgb scorer guard triggered fallback to legacy scorer after meaningful difference on tile=%s",
+            context["image_id_b"],
+        )
+        return legacy_score
+    return score_map
+
+
+def _score_xgb_legacy(
+    *,
+    context: dict[str, object],
+    bst,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str | None,
+    context_radius: int,
+) -> np.ndarray:
+    """Run the legacy XGB scorer for guard comparisons and fallback."""
+    return xgb_score_image_b_legacy(
+        context["img_b"],
+        bst,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        context["image_id_b"],
+        prefetched_tiles=context["prefetched_b"],
+        context_radius=context_radius,
+        xgb_feature_stats=context["xgb_feature_stats"],
+    )
+
+
+def _xgb_guard_diff_is_meaningful(
+    *,
+    optimized_score: np.ndarray,
+    legacy_score: np.ndarray,
+    threshold: float,
+    atol: float,
+    rtol: float,
+) -> tuple[bool, float, float]:
+    """Return whether optimized and legacy XGB scores differ meaningfully."""
+    abs_diff = np.abs(
+        optimized_score.astype(np.float32) - legacy_score.astype(np.float32)
+    )
+    mean_abs_diff = float(abs_diff.mean())
+    max_abs_diff = float(abs_diff.max()) if abs_diff.size > 0 else 0.0
+    masks_match = np.array_equal(
+        optimized_score >= threshold, legacy_score >= threshold
+    )
+    return (
+        (not masks_match)
+        or (not np.allclose(optimized_score, legacy_score, atol=atol, rtol=rtol)),
+        mean_abs_diff,
+        max_abs_diff,
+    )
 
 
 def _apply_inference_score_prior(
@@ -604,72 +753,77 @@ def _save_holdout_plots(
         True
     """
     image_id_b = context["image_id_b"]
-    save_unified_plot(
-        img_b=context["img_b"],
-        gt_mask=context["gt_mask_eval"],
-        labels_sh=context["labels_sh"],
-        masks={
-            f"{active_stream}_raw": active_raw_mask,
-            f"{active_stream}_crf": active_crf_mask,
-            f"{active_stream}_shadow": active_shadow_mask,
-        },
-        metrics=metrics_map,
-        plot_dir=plot_dir,
-        image_id_b=image_id_b,
-        show_metrics=plot_with_metrics and context["gt_available"],
-        gt_available=context["gt_available"],
-        similarity_map=score_knn_raw if active_stream == "knn" else None,
-        score_maps={active_stream: champion_score},
-        proposal_masks={
-            "candidate": proposal_masks["candidate_mask"],
-            "accepted": proposal_masks["accepted_mask"],
-            "rejected": proposal_masks["rejected_mask"],
-        },
-    )
-    save_core_qualitative_plot(
-        img_b=context["img_b"],
-        gt_mask=context["gt_mask_eval"],
-        pred_mask=active_shadow_mask,
-        plot_dir=plot_dir,
-        image_id_b=image_id_b,
-        gt_available=context["gt_available"],
-        model_label=active_label,
-        boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
-    )
-    save_score_threshold_plot(
-        score_map=champion_score,
-        threshold=champion_thr,
-        sh_buffer_mask=context["sh_buffer_mask"],
-        plot_dir=plot_dir,
-        image_id_b=image_id_b,
-        model_label=active_label,
-    )
-    save_disagreement_entropy_plot(
-        disagreement_map=disagreement_map,
-        entropy_map=entropy_map,
-        candidate_mask=proposal_masks["candidate_mask"],
-        plot_dir=plot_dir,
-        image_id_b=image_id_b,
-        model_label=active_label,
-    )
-    save_proposal_overlay_plot(
-        img_b=context["img_b"],
-        prediction_mask=active_shadow_mask,
-        candidate_mask=proposal_masks["candidate_mask"],
-        candidate_inside_mask=proposal_masks["candidate_inside_mask"],
-        evaluated_outside_mask=proposal_masks["evaluated_outside_mask"],
-        accepted_mask=proposal_masks["accepted_mask"],
-        accepted_inside_mask=proposal_masks["accepted_inside_mask"],
-        accepted_outside_mask=proposal_masks["accepted_outside_mask"],
-        rejected_mask=proposal_masks["rejected_mask"],
-        proposal_records=proposal_bundle.get("records"),
-        plot_dir=plot_dir,
-        image_id_b=image_id_b,
-        model_label=active_label,
-        accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
-        reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
-        candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
-    )
+    with perf_span("save_holdout_plots", substage="unified"):
+        save_unified_plot(
+            img_b=context["img_b"],
+            gt_mask=context["gt_mask_eval"],
+            labels_sh=context["labels_sh"],
+            masks={
+                f"{active_stream}_raw": active_raw_mask,
+                f"{active_stream}_crf": active_crf_mask,
+                f"{active_stream}_shadow": active_shadow_mask,
+            },
+            metrics=metrics_map,
+            plot_dir=plot_dir,
+            image_id_b=image_id_b,
+            show_metrics=plot_with_metrics and context["gt_available"],
+            gt_available=context["gt_available"],
+            similarity_map=score_knn_raw if active_stream == "knn" else None,
+            score_maps={active_stream: champion_score},
+            proposal_masks={
+                "candidate": proposal_masks["candidate_mask"],
+                "accepted": proposal_masks["accepted_mask"],
+                "rejected": proposal_masks["rejected_mask"],
+            },
+        )
+    with perf_span("save_holdout_plots", substage="qualitative_core"):
+        save_core_qualitative_plot(
+            img_b=context["img_b"],
+            gt_mask=context["gt_mask_eval"],
+            pred_mask=active_shadow_mask,
+            plot_dir=plot_dir,
+            image_id_b=image_id_b,
+            gt_available=context["gt_available"],
+            model_label=active_label,
+            boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
+        )
+    with perf_span("save_holdout_plots", substage="score_threshold"):
+        save_score_threshold_plot(
+            score_map=champion_score,
+            threshold=champion_thr,
+            sh_buffer_mask=context["sh_buffer_mask"],
+            plot_dir=plot_dir,
+            image_id_b=image_id_b,
+            model_label=active_label,
+        )
+    with perf_span("save_holdout_plots", substage="disagreement_entropy"):
+        save_disagreement_entropy_plot(
+            disagreement_map=disagreement_map,
+            entropy_map=entropy_map,
+            candidate_mask=proposal_masks["candidate_mask"],
+            plot_dir=plot_dir,
+            image_id_b=image_id_b,
+            model_label=active_label,
+        )
+    with perf_span("save_holdout_plots", substage="proposal_overlay"):
+        save_proposal_overlay_plot(
+            img_b=context["img_b"],
+            prediction_mask=active_shadow_mask,
+            candidate_mask=proposal_masks["candidate_mask"],
+            candidate_inside_mask=proposal_masks["candidate_inside_mask"],
+            evaluated_outside_mask=proposal_masks["evaluated_outside_mask"],
+            accepted_mask=proposal_masks["accepted_mask"],
+            accepted_inside_mask=proposal_masks["accepted_inside_mask"],
+            accepted_outside_mask=proposal_masks["accepted_outside_mask"],
+            rejected_mask=proposal_masks["rejected_mask"],
+            proposal_records=proposal_bundle.get("records"),
+            plot_dir=plot_dir,
+            image_id_b=image_id_b,
+            model_label=active_label,
+            accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
+            reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
+            candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
+        )
 
 
 def infer_on_holdout(
@@ -690,6 +844,8 @@ def infer_on_holdout(
     context_radius: int,
     plot_with_metrics: bool = True,
     final_inference_phase: bool = False,
+    save_plots: bool = True,
+    xgb_guard_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Run inference on a holdout tile using tuned settings.
 
@@ -738,6 +894,7 @@ def infer_on_holdout(
             feature_dir,
             context_radius,
             final_inference_phase,
+            xgb_guard_state,
         )
     champion_source = _resolve_champion_stream(
         tuned,
@@ -831,25 +988,26 @@ def infer_on_holdout(
         knn_result["score"],
         xgb_result["score"],
     )
-    with perf_span("infer_on_holdout", substage="plot_exports"):
-        _save_holdout_plots(
-            context=context,
-            plot_dir=plot_dir,
-            plot_with_metrics=plot_with_metrics,
-            active_stream=active_stream,
-            active_label=active_label,
-            champion_score=champion_score,
-            champion_thr=champion_thr,
-            active_raw_mask=active_raw_mask,
-            active_crf_mask=active_crf_mask,
-            active_shadow_mask=active_shadow_mask,
-            metrics_map=metrics_map,
-            proposal_masks=proposal_masks,
-            proposal_bundle=proposal_bundle,
-            score_knn_raw=knn_result["score_raw"],
-            disagreement_map=disagreement_map,
-            entropy_map=entropy_map,
-        )
+    if save_plots:
+        with perf_span("infer_on_holdout", substage="plot_exports"):
+            _save_holdout_plots(
+                context=context,
+                plot_dir=plot_dir,
+                plot_with_metrics=plot_with_metrics,
+                active_stream=active_stream,
+                active_label=active_label,
+                champion_score=champion_score,
+                champion_thr=champion_thr,
+                active_raw_mask=active_raw_mask,
+                active_crf_mask=active_crf_mask,
+                active_shadow_mask=active_shadow_mask,
+                metrics_map=metrics_map,
+                proposal_masks=proposal_masks,
+                proposal_bundle=proposal_bundle,
+                score_knn_raw=knn_result["score_raw"],
+                disagreement_map=disagreement_map,
+                entropy_map=entropy_map,
+            )
 
     return {
         "ref_path": holdout_path,

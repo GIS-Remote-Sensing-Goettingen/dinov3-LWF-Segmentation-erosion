@@ -80,16 +80,21 @@ def _compute_component_shape_metrics(
     if basic_metrics is not None:
         metrics.update(basic_metrics)
 
-    boundary = np.logical_and(component_mask, ~binary_erosion(component_mask))
-    perimeter_px = float(boundary.sum())
-    circularity = float(4.0 * np.pi * area_px / (perimeter_px**2 + 1e-8))
+    with perf_span("compute_component_shape_metrics", substage="boundary_metrics"):
+        boundary = np.logical_and(component_mask, ~binary_erosion(component_mask))
+        perimeter_px = float(boundary.sum())
+        circularity = float(4.0 * np.pi * area_px / (perimeter_px**2 + 1e-8))
 
-    skel = skeletonize(component_mask)
-    length_px = float(skel.sum())
+    with perf_span("compute_component_shape_metrics", substage="skeletonize"):
+        skel = skeletonize(component_mask)
+        length_px = float(skel.sum())
     if length_px > 0:
-        dt = distance_transform_edt(component_mask)
-        widths = 2.0 * dt[skel]
-        mean_width_px = float(widths.mean()) if widths.size > 0 else 0.0
+        with perf_span(
+            "compute_component_shape_metrics", substage="distance_transform"
+        ):
+            dt = distance_transform_edt(component_mask)
+            widths = 2.0 * dt[skel]
+            mean_width_px = float(widths.mean()) if widths.size > 0 else 0.0
     else:
         mean_width_px = 0.0
     skeleton_ratio = float(length_px / max(mean_width_px, 1e-6))
@@ -171,6 +176,8 @@ def _compute_component_basic_metrics(
     road_overlap = (
         float(roads_mask[component_mask].mean()) if roads_mask is not None else 0.0
     )
+    with perf_span("compute_component_basic_metrics", substage="pca_ratio"):
+        pca_ratio = float(_compute_pca_ratio(coords))
     return {
         "area_px": float(area_px),
         "length_px": 0.0,
@@ -178,7 +185,7 @@ def _compute_component_basic_metrics(
         "mean_width_px": 0.0,
         "mean_width_m": 0.0,
         "skeleton_ratio": 0.0,
-        "pca_ratio": float(_compute_pca_ratio(coords)),
+        "pca_ratio": pca_ratio,
         "circularity": 1.0,
         "mean_score": float(mean_score),
         "road_overlap": float(road_overlap),

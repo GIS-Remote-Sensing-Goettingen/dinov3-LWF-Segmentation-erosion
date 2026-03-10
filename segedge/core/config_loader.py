@@ -94,6 +94,7 @@ class IOInferenceConfig:
     tiles_dir: str | None
     tile_glob: str
     tiles: list[str]
+    plot_every: int
     save_bundle: bool
     score_prior: IOInferenceScorePriorConfig
 
@@ -502,6 +503,7 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
             ),
             tile_glob=str(io_inference.get("tile_glob", "*.tif")),
             tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
+            plot_every=int(io_inference.get("plot_every", 1)),
             save_bundle=bool(io_inference.get("save_bundle", True)),
             score_prior=IOInferenceScorePriorConfig(
                 enabled=bool(io_inference_score_prior.get("enabled", False)),
@@ -954,6 +956,8 @@ def _validate_loaded_config(config: Config) -> None:
         raise ValueError("'io.inference.score_prior.factor' must be >= 0")
     if not (0.0 <= config.io.inference.score_prior.clip_max <= 1.0):
         raise ValueError("'io.inference.score_prior.clip_max' must be in [0, 1]")
+    if config.io.inference.plot_every <= 0:
+        raise ValueError("'io.inference.plot_every' must be > 0")
     if not config.io.training:
         has_inference_tiles = bool(
             config.io.inference.tiles_dir

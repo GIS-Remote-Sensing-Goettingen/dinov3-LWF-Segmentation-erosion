@@ -3,7 +3,7 @@
 
 io:
   # true: train+tune then infer; false: load bundle and run inference only.
-  training: false
+  training: true
 
   inference:
     # In inference-only mode, load a previously saved model bundle from here.
@@ -14,6 +14,8 @@ io:
     tile_glob: "*.tif"
     # Optional explicit tile list fallback when tiles_dir is null.
     tiles: []
+    # Render plots every N pending inference tiles. 1 means every tile.
+    plot_every: 1
     # Save trained bundle at end of training.
     save_bundle: true
     # Optional manual score prior applied only during the final holdout/inference phase.
@@ -176,15 +178,15 @@ search:
     threshold_cpu_batch_size: 32
 
   crf:
-    enabled: true
-    prob_softness_values: [0.03]
-    pos_w_values: [4.0]
-    pos_xy_std_values: [3.0]
-    bilateral_w_values: [7.0]
-    bilateral_xy_std_values: [25.0]
-    bilateral_rgb_std_values: [3.0]
-    num_workers: 1
-    max_configs: 1
+      enabled: true
+      prob_softness_values: [0.1]       # INCREASED (was 0.03)
+      pos_w_values: [7.0]               # INCREASED (was 4.0)
+      pos_xy_std_values: [5.0]          # INCREASED (was 3.0)
+      bilateral_w_values: [12.0]        # INCREASED (was 7.0)
+      bilateral_xy_std_values: [50.0]   # INCREASED (was 25.0)
+      bilateral_rgb_std_values: [5.0]   # SLIGHTLY INCREASED (was 3.0)
+      num_workers: 1
+      max_configs: 1
 
   xgb:
     enabled: true

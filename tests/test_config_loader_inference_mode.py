@@ -56,6 +56,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
     assert loaded.io.inference.model_bundle_dir is None
     assert loaded.io.inference.tile_glob == "*.tif"
     assert loaded.io.inference.tiles == []
+    assert loaded.io.inference.plot_every == 1
     assert loaded.io.inference.save_bundle is True
     assert loaded.io.inference.score_prior.enabled is False
     assert loaded.io.inference.score_prior.apply_to == "xgb"
@@ -88,3 +89,23 @@ def test_inference_score_prior_parses_from_config(tmp_path):
     assert loaded.io.inference.score_prior.enabled is True
     assert loaded.io.inference.score_prior.factor == 1.3
     assert loaded.io.inference.score_prior.clip_max == 0.95
+
+
+def test_inference_plot_every_must_be_positive(tmp_path):
+    """io.inference.plot_every should reject non-positive values.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["io"].setdefault("inference", {})
+    raw["io"]["inference"]["plot_every"] = 0
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    try:
+        load_config(cfg_path)
+    except ValueError as exc:
+        assert "io.inference.plot_every" in str(exc)
+    else:
+        raise AssertionError("expected plot_every validation error")

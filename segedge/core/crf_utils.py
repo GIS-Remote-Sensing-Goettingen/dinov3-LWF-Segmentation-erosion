@@ -9,7 +9,7 @@ import numpy as np
 from skimage.transform import resize
 
 from .metrics_utils import compute_metrics
-from .timing_utils import time_end, time_start
+from .timing_utils import perf_span, time_end, time_start
 
 try:
     from pydensecrf import densecrf as dcrf  # type: ignore[import-not-found]
@@ -104,45 +104,51 @@ def refine_with_densecrf(
     t0 = time_start()
     h, w, _ = img_rgb.shape
     assert score_map.shape == (h, w), "score_map must have shape (H, W)"
-    s = score_map.astype(np.float32)
-    logits_fg = (s - threshold_center) / prob_softness
-    p_fg = 1.0 / (1.0 + np.exp(-logits_fg))
-    eps = 1e-6
-    p_fg = np.clip(p_fg, eps, 1.0 - eps)
-    if sh_mask is not None:
-        sh_mask = sh_mask.astype(bool)
-        p_fg[~sh_mask] = eps
-    p_bg = 1.0 - p_fg
-    probs = np.stack([p_bg, p_fg], axis=0)
+    with perf_span("refine_with_densecrf", substage="build_unary"):
+        s = score_map.astype(np.float32)
+        logits_fg = (s - threshold_center) / prob_softness
+        p_fg = 1.0 / (1.0 + np.exp(-logits_fg))
+        eps = 1e-6
+        p_fg = np.clip(p_fg, eps, 1.0 - eps)
+        if sh_mask is not None:
+            sh_mask = sh_mask.astype(bool)
+            p_fg[~sh_mask] = eps
+        p_bg = 1.0 - p_fg
+        probs = np.stack([p_bg, p_fg], axis=0)
 
-    d = dcrf_any.DenseCRF2D(w, h, 2)
-    unary = unary_from_softmax_any(probs)
-    d.setUnaryEnergy(unary)
-    d.addPairwiseGaussian(
-        sxy=(pos_xy_std, pos_xy_std),
-        compat=pos_w,
-        kernel=dcrf_any.DIAG_KERNEL,
-        normalization=dcrf_any.NORMALIZE_SYMMETRIC,
-    )
-    img_rgb_u8 = img_rgb.astype(np.uint8) if img_rgb.dtype != np.uint8 else img_rgb
-    if not img_rgb_u8.flags["C_CONTIGUOUS"]:
-        img_rgb_u8 = np.ascontiguousarray(img_rgb_u8)
-    d.addPairwiseBilateral(
-        sxy=(bilateral_xy_std, bilateral_xy_std),
-        srgb=(bilateral_rgb_std, bilateral_rgb_std, bilateral_rgb_std),
-        rgbim=img_rgb_u8,
-        compat=bilateral_w,
-        kernel=dcrf_any.DIAG_KERNEL,
-        normalization=dcrf_any.NORMALIZE_SYMMETRIC,
-    )
-    Q = d.inference(n_iters)
-    Q = np.array(Q).reshape(2, h, w)
-    p_fg_crf = Q[1].astype(np.float32)
-    labels = np.argmax(Q, axis=0).astype(np.uint8)
-    refined_mask = labels == 1
-    if sh_mask is not None:
-        refined_mask = np.logical_and(refined_mask, sh_mask)
-        p_fg_crf[~sh_mask] = eps
+    with perf_span("refine_with_densecrf", substage="setup_densecrf"):
+        d = dcrf_any.DenseCRF2D(w, h, 2)
+        unary = unary_from_softmax_any(probs)
+        d.setUnaryEnergy(unary)
+    with perf_span("refine_with_densecrf", substage="add_pairwise_gaussian"):
+        d.addPairwiseGaussian(
+            sxy=(pos_xy_std, pos_xy_std),
+            compat=pos_w,
+            kernel=dcrf_any.DIAG_KERNEL,
+            normalization=dcrf_any.NORMALIZE_SYMMETRIC,
+        )
+    with perf_span("refine_with_densecrf", substage="add_pairwise_bilateral"):
+        img_rgb_u8 = img_rgb.astype(np.uint8) if img_rgb.dtype != np.uint8 else img_rgb
+        if not img_rgb_u8.flags["C_CONTIGUOUS"]:
+            img_rgb_u8 = np.ascontiguousarray(img_rgb_u8)
+        d.addPairwiseBilateral(
+            sxy=(bilateral_xy_std, bilateral_xy_std),
+            srgb=(bilateral_rgb_std, bilateral_rgb_std, bilateral_rgb_std),
+            rgbim=img_rgb_u8,
+            compat=bilateral_w,
+            kernel=dcrf_any.DIAG_KERNEL,
+            normalization=dcrf_any.NORMALIZE_SYMMETRIC,
+        )
+    with perf_span("refine_with_densecrf", substage="densecrf_inference"):
+        Q = d.inference(n_iters)
+    with perf_span("refine_with_densecrf", substage="postprocess_output"):
+        Q = np.array(Q).reshape(2, h, w)
+        p_fg_crf = Q[1].astype(np.float32)
+        labels = np.argmax(Q, axis=0).astype(np.uint8)
+        refined_mask = labels == 1
+        if sh_mask is not None:
+            refined_mask = np.logical_and(refined_mask, sh_mask)
+            p_fg_crf[~sh_mask] = eps
     time_end("refine_with_densecrf", t0)
     if return_prob:
         return refined_mask, p_fg_crf

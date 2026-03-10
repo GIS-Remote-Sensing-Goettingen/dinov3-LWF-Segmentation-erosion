@@ -260,12 +260,27 @@ def emit_performance_summary(
             "substage": substage,
             "total_s": float(stats["total"]),
         }
+    top_by_total = [
+        {
+            "phase": phase,
+            "stage": stage,
+            "substage": substage,
+            "total_s": float(stats["total"]),
+            "mean_s": float(stats["total"] / max(1, int(stats["count"]))),
+        }
+        for (phase, stage, substage), stats in sorted(
+            _PERF_AGG_STATS.items(),
+            key=lambda item: item[1]["total"],
+            reverse=True,
+        )[:5]
+    ]
     _write_perf_record(
         {
             "kind": "summary",
             "reason": reason,
             "run_id": _PERF_RUN_ID,
             "stats": summary,
+            "top_by_total_s": top_by_total,
             "tile_index": tile_index,
             "ts": datetime.now(timezone.utc).isoformat(),
         }

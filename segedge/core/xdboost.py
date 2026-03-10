@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 
 import numpy as np
 import xgboost as xgb
@@ -561,31 +562,52 @@ def xgb_score_image_b(
     context_radius: int = 0,
     xgb_feature_stats: dict | None = None,
 ):
-    """Apply a trained XGBoost model to Image B and return a score map.
-
-    Args:
-        img_b (np.ndarray): Image B array.
-        bst (xgb.Booster): Trained booster.
-        ps (int): Patch size.
-        tile_size (int): Tile size in pixels.
-        stride (int): Tile stride.
-        feature_dir (str): Feature cache directory.
-        image_id_b (str): Image B identifier.
-        prefetched_tiles (dict | None): Optional in-memory cache.
-        context_radius (int): Feature context radius.
-
-    Returns:
-        np.ndarray: Score map at pixel resolution.
-
-    Examples:
-        >>> callable(xgb_score_image_b)
-        True
-    """
-    if feature_dir is None and prefetched_tiles is None:
-        raise ValueError("feature_dir or prefetched_tiles must be provided")
+    """Apply a trained XGBoost model to Image B and return a score map."""
+    batch_tile_limit = max(1, int(cfg.runtime.feature_batch_size or 1))
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
+    pending_tiles: list[dict[str, np.ndarray | int]] = []
+
+    for tile_info in _iter_xgb_tile_payloads(
+        img_b,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        image_id_b,
+        prefetched_tiles=prefetched_tiles,
+        context_radius=context_radius,
+        xgb_feature_stats=xgb_feature_stats,
+    ):
+        pending_tiles.append(tile_info)
+        if len(pending_tiles) >= batch_tile_limit:
+            _flush_xgb_prediction_batch(pending_tiles, bst, score_full, weight_full)
+            pending_tiles.clear()
+
+    if pending_tiles:
+        _flush_xgb_prediction_batch(pending_tiles, bst, score_full, weight_full)
+
+    mask_nonzero = weight_full > 0
+    score_full[mask_nonzero] /= weight_full[mask_nonzero]
+    return score_full
+
+
+def _iter_xgb_tile_payloads(
+    img_b,
+    ps,
+    tile_size,
+    stride,
+    feature_dir,
+    image_id_b,
+    *,
+    prefetched_tiles=None,
+    context_radius: int = 0,
+    xgb_feature_stats: dict | None = None,
+) -> Iterator[dict[str, np.ndarray | int]]:
+    """Yield flattened tile payloads for batched XGB prediction."""
+    if feature_dir is None and prefetched_tiles is None:
+        raise ValueError("feature_dir or prefetched_tiles must be provided")
 
     if prefetched_tiles is not None:
         tile_items = sorted(prefetched_tiles.items())
@@ -641,6 +663,23 @@ def xgb_score_image_b(
                     continue
                 img_c = img_c[:h_eff, :w_eff]
 
+            if feats_tile is None:
+                continue
+            feats_tile = np.asarray(feats_tile, dtype=np.float32)
+            if feats_tile.shape[:2] != (hp, wp):
+                logger.warning(
+                    (
+                        "xgb_score_image_b: cached feature shape mismatch for "
+                        "image_id=%s y=%s x=%s expected=(%s,%s) actual=%s"
+                    ),
+                    image_id_b,
+                    y,
+                    x,
+                    hp,
+                    wp,
+                    feats_tile.shape[:2],
+                )
+                continue
             if context_radius and context_radius > 0:
                 with perf_span(
                     "xgb_score_image_b",
@@ -675,42 +714,174 @@ def xgb_score_image_b(
                 flat_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(
                     np.float32, copy=False
                 )
-            try:
-                with perf_span(
-                    "xgb_score_image_b",
-                    substage="predict_inplace",
-                    extra={"y": y, "x": x},
-                ):
-                    scores_flat = bst.inplace_predict(flat_feats)
-            except Exception:
-                with perf_span(
-                    "xgb_score_image_b",
-                    substage="predict_dmatrix_fallback",
-                    extra={"y": y, "x": x},
-                ):
-                    dtest = xgb.DMatrix(flat_feats)
-                    scores_flat = bst.predict(dtest)
-            scores_patch = np.asarray(scores_flat, dtype=np.float32).reshape(hp, wp)
-            with perf_span(
-                "xgb_score_image_b",
-                substage="resize_patch_scores",
-                extra={"y": y, "x": x},
-            ):
-                scores_tile = resize(
-                    scores_patch,
-                    (h_eff, w_eff),
-                    order=1,
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(np.float32)
-            with perf_span(
-                "xgb_score_image_b",
-                substage="accumulate_scores",
-                extra={"y": y, "x": x},
-            ):
-                score_full[y : y + h_eff, x : x + w_eff] += scores_tile
-                weight_full[y : y + h_eff, x : x + w_eff] += 1.0
+            yield {
+                "y": y,
+                "x": x,
+                "h_eff": h_eff,
+                "w_eff": w_eff,
+                "hp": hp,
+                "wp": wp,
+                "flat_feats": flat_feats,
+            }
 
+
+def _flush_xgb_prediction_batch(
+    tile_payloads: list[dict[str, np.ndarray | int]],
+    bst,
+    score_full: np.ndarray,
+    weight_full: np.ndarray,
+) -> None:
+    """Run one batched XGB predict call and accumulate outputs."""
+    if not tile_payloads:
+        return
+    batch_rows = [payload["flat_feats"] for payload in tile_payloads]
+    if len(batch_rows) == 1:
+        flat_feats = np.asarray(batch_rows[0], dtype=np.float32)
+    else:
+        with perf_span(
+            "xgb_score_image_b",
+            substage="concat_predict_batch",
+            extra={
+                "tile_count": len(tile_payloads),
+                "row_count": int(sum(rows.shape[0] for rows in batch_rows)),
+            },
+        ):
+            flat_feats = np.concatenate(batch_rows, axis=0).astype(
+                np.float32, copy=False
+            )
+    try:
+        with perf_span(
+            "xgb_score_image_b",
+            substage="predict_inplace",
+            extra={
+                "tile_count": len(tile_payloads),
+                "row_count": int(flat_feats.shape[0]),
+            },
+        ):
+            scores_batch = bst.inplace_predict(flat_feats)
+    except Exception:
+        with perf_span(
+            "xgb_score_image_b",
+            substage="predict_dmatrix_fallback",
+            extra={
+                "tile_count": len(tile_payloads),
+                "row_count": int(flat_feats.shape[0]),
+            },
+        ):
+            dtest = xgb.DMatrix(flat_feats)
+            scores_batch = bst.predict(dtest)
+    scores_batch = np.asarray(scores_batch, dtype=np.float32)
+    offset = 0
+    for payload in tile_payloads:
+        hp = int(payload["hp"])
+        wp = int(payload["wp"])
+        h_eff = int(payload["h_eff"])
+        w_eff = int(payload["w_eff"])
+        y = int(payload["y"])
+        x = int(payload["x"])
+        rows = hp * wp
+        scores_patch = scores_batch[offset : offset + rows].reshape(hp, wp)
+        offset += rows
+        with perf_span(
+            "xgb_score_image_b",
+            substage="resize_patch_scores",
+            extra={"y": y, "x": x},
+        ):
+            scores_tile = resize(
+                scores_patch,
+                (h_eff, w_eff),
+                order=1,
+                preserve_range=True,
+                anti_aliasing=True,
+            ).astype(np.float32)
+        with perf_span(
+            "xgb_score_image_b",
+            substage="accumulate_scores",
+            extra={"y": y, "x": x},
+        ):
+            score_full[y : y + h_eff, x : x + w_eff] += scores_tile
+            weight_full[y : y + h_eff, x : x + w_eff] += 1.0
+
+
+def xgb_score_image_b_legacy(
+    img_b,
+    bst,
+    ps,
+    tile_size,
+    stride,
+    feature_dir,
+    image_id_b,
+    prefetched_tiles=None,
+    context_radius: int = 0,
+    xgb_feature_stats: dict | None = None,
+):
+    """Legacy tile-by-tile XGB scorer kept for guard comparisons and fallback.
+
+    Examples:
+        >>> callable(xgb_score_image_b_legacy)
+        True
+    """
+    if feature_dir is None and prefetched_tiles is None:
+        raise ValueError("feature_dir or prefetched_tiles must be provided")
+    h_full, w_full = img_b.shape[:2]
+    score_full = np.zeros((h_full, w_full), dtype=np.float32)
+    weight_full = np.zeros((h_full, w_full), dtype=np.float32)
+    for payload in _iter_xgb_tile_payloads(
+        img_b,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        image_id_b,
+        prefetched_tiles=prefetched_tiles,
+        context_radius=context_radius,
+        xgb_feature_stats=xgb_feature_stats,
+    ):
+        flat_feats = np.asarray(payload["flat_feats"], dtype=np.float32)
+        try:
+            with perf_span(
+                "xgb_score_image_b_legacy",
+                substage="predict_inplace",
+                extra={"y": int(payload["y"]), "x": int(payload["x"])},
+            ):
+                scores_flat = bst.inplace_predict(flat_feats)
+        except Exception:
+            with perf_span(
+                "xgb_score_image_b_legacy",
+                substage="predict_dmatrix_fallback",
+                extra={"y": int(payload["y"]), "x": int(payload["x"])},
+            ):
+                dtest = xgb.DMatrix(flat_feats)
+                scores_flat = bst.predict(dtest)
+        scores_patch = np.asarray(scores_flat, dtype=np.float32).reshape(
+            int(payload["hp"]),
+            int(payload["wp"]),
+        )
+        with perf_span(
+            "xgb_score_image_b_legacy",
+            substage="resize_patch_scores",
+            extra={"y": int(payload["y"]), "x": int(payload["x"])},
+        ):
+            scores_tile = resize(
+                scores_patch,
+                (int(payload["h_eff"]), int(payload["w_eff"])),
+                order=1,
+                preserve_range=True,
+                anti_aliasing=True,
+            ).astype(np.float32)
+        with perf_span(
+            "xgb_score_image_b_legacy",
+            substage="accumulate_scores",
+            extra={"y": int(payload["y"]), "x": int(payload["x"])},
+        ):
+            score_full[
+                int(payload["y"]) : int(payload["y"]) + int(payload["h_eff"]),
+                int(payload["x"]) : int(payload["x"]) + int(payload["w_eff"]),
+            ] += scores_tile
+            weight_full[
+                int(payload["y"]) : int(payload["y"]) + int(payload["h_eff"]),
+                int(payload["x"]) : int(payload["x"]) + int(payload["w_eff"]),
+            ] += 1.0
     mask_nonzero = weight_full > 0
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
     return score_full

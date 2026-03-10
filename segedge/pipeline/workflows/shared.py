@@ -304,5 +304,6 @@ def run_holdout_with_checkpoint(
             write_checkpoint=write_checkpoint,
             logger=logger,
             final_inference_phase=True,
+            plot_every=int(cfg.io.inference.plot_every),
         ),
     )

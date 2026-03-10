@@ -35,6 +35,7 @@ Important behavior:
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
 - The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
+- `io.inference.plot_every` can sample inference plots over pending tiles without changing mask generation, processed-tile logging, or union shapefile updates.
 
 ### Manual training workflow
 Function: `segedge.pipeline.workflows.run_manual_training`
@@ -106,6 +107,7 @@ Its job is orchestration at the holdout-set level:
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 
 When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply a manual XGB score boost inside `SOURCE_LABEL_RASTER` pixels. This boost is not used during validation inference or tuning.
+When the optimized XGB scorer is active, the first 3 pending holdout tiles are also compared against the legacy scorer. If the optimized and legacy score maps differ meaningfully, the run logs the mismatch and automatically falls back to the legacy scorer for the rest of that holdout phase.
 
 ## Major Functions
 ### `segedge.pipeline.run.main`

@@ -47,38 +47,41 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     time_end("data_loading_and_reprojection", t0_data)
     target_shape = img_b.shape[:2]
     if labels_sh.shape != target_shape:
-        logger.warning(
-            "labels_sh shape %s != image shape %s; resizing to match",
-            labels_sh.shape,
-            target_shape,
-        )
-        labels_sh = resize(
-            labels_sh,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(labels_sh.dtype)
+        with perf_span("load_b_tile_context", substage="resize_source_labels"):
+            logger.warning(
+                "labels_sh shape %s != image shape %s; resizing to match",
+                labels_sh.shape,
+                target_shape,
+            )
+            labels_sh = resize(
+                labels_sh,
+                target_shape,
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            ).astype(labels_sh.dtype)
     if gt_mask is not None and gt_mask.shape != target_shape:
-        logger.warning(
-            "gt_mask shape %s != image shape %s; resizing to match",
-            gt_mask.shape,
-            target_shape,
-        )
-        gt_mask = resize(
-            gt_mask,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(gt_mask.dtype)
+        with perf_span("load_b_tile_context", substage="resize_gt_mask"):
+            logger.warning(
+                "gt_mask shape %s != image shape %s; resizing to match",
+                gt_mask.shape,
+                target_shape,
+            )
+            gt_mask = resize(
+                gt_mask,
+                target_shape,
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            ).astype(gt_mask.dtype)
 
     if gt_mask is not None:
         logger.debug("GT positives on B: %s", gt_mask.sum())
     logger.debug("SH_2022 positives on B: %s", (labels_sh > 0).sum())
 
-    with rio_open(img_path) as src:
-        pixel_size_m = abs(src.transform.a)
+    with perf_span("load_b_tile_context", substage="read_pixel_size"):
+        with rio_open(img_path) as src:
+            pixel_size_m = abs(src.transform.a)
     pixel_size_m = pixel_size_m * ds
     buffer_m = cfg.model.priors.buffer_m
     buffer_pixels = int(round(buffer_m / pixel_size_m))

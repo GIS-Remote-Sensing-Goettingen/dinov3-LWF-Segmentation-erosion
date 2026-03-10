@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -11,14 +12,38 @@ from ..config_loader import cfg
 from ..timing_utils import perf_span, time_end, time_start
 from .cache import (
     inspect_tile_features_if_valid,
+    load_feature_manifest_if_valid,
     load_tile_features_if_valid,
+    save_feature_manifest,
     save_tile_features,
+    tile_feature_path,
 )
 from .fusion import l2_normalize
 from .spec import hybrid_feature_spec_hash
 from .tiling import crop_to_multiple_of_ps, tile_iterator
 
 logger = logging.getLogger(__name__)
+
+
+def _manifest_feature_path_if_loadable(
+    feature_path: str,
+    *,
+    expected_hp: int,
+    expected_wp: int,
+) -> str | None:
+    """Return the path when the cached feature array is readable and shaped correctly.
+
+    Examples:
+        >>> _manifest_feature_path_if_loadable("/tmp/missing.npy", expected_hp=1, expected_wp=1) is None
+        True
+    """
+    try:
+        feats = np.load(feature_path, mmap_mode="r")
+    except (OSError, ValueError):
+        return None
+    if feats.shape[:2] != (expected_hp, expected_wp):
+        return None
+    return feature_path
 
 
 def extract_patch_features_single_scale(
@@ -130,11 +155,28 @@ def prefetch_features_single_scale_image(
     batch_size = int(cfg.runtime.feature_batch_size or 1)
     batch_size = max(1, batch_size)
     pending: dict[tuple[int, int], list[tuple[int, int, np.ndarray, int, int]]] = {}
+    manifest_tiles: dict[tuple[int, int], dict[str, int]] | None = None
+    manifest_entries: dict[tuple[int, int], dict[str, int]] = {}
+    manifest_dirty = False
+    if feature_dir is not None and image_id is not None:
+        with perf_span(
+            "prefetch_features_single_scale_image",
+            substage="load_feature_manifest",
+            extra={"image_id": image_id},
+        ):
+            manifest_tiles = load_feature_manifest_if_valid(
+                feature_dir,
+                image_id,
+                ps,
+                resample_factor,
+            )
+        if manifest_tiles:
+            manifest_entries.update(manifest_tiles)
 
     def flush_pending(
         items: list[tuple[int, int, np.ndarray, int, int]],
     ) -> None:
-        nonlocal computed_tiles
+        nonlocal computed_tiles, manifest_dirty
         if not items:
             return
         if batch_size <= 1:
@@ -176,6 +218,13 @@ def prefetch_features_single_scale_image(
                     "hp": hp_i,
                     "wp": wp_i,
                 }
+                manifest_entries[(y_i, x_i)] = {
+                    "h_eff": int(h_i),
+                    "w_eff": int(w_i),
+                    "hp": int(hp_i),
+                    "wp": int(wp_i),
+                }
+                manifest_dirty = True
             return
 
         for start in range(0, len(items), batch_size):
@@ -237,6 +286,13 @@ def prefetch_features_single_scale_image(
                     "hp": hp_i,
                     "wp": wp_i,
                 }
+                manifest_entries[(y_i, x_i)] = {
+                    "h_eff": int(h_i),
+                    "w_eff": int(w_i),
+                    "hp": int(hp_i),
+                    "wp": int(wp_i),
+                }
+                manifest_dirty = True
 
     for y, x, img_tile, _ in tile_iterator(img_hw3, None, tile_size, stride):
         img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
@@ -248,46 +304,108 @@ def prefetch_features_single_scale_image(
         if feature_dir is not None and image_id is not None:
             hp = h_eff // ps
             wp = w_eff // ps
-            with perf_span(
-                "prefetch_features_single_scale_image",
-                substage="validate_cached_tile",
-                extra={"image_id": image_id, "y": y, "x": x},
+            manifest_entry = (
+                manifest_tiles.get((y, x)) if manifest_tiles is not None else None
+            )
+            if (
+                manifest_entry is not None
+                and manifest_entry["hp"] == hp
+                and manifest_entry["wp"] == wp
+                and manifest_entry["h_eff"] == h_eff
+                and manifest_entry["w_eff"] == w_eff
             ):
-                if materialize_cached:
-                    feats_tile = load_tile_features_if_valid(
-                        feature_dir,
-                        image_id,
-                        y,
-                        x,
-                        expected_hp=hp,
-                        expected_wp=wp,
-                        ps=ps,
-                        resample_factor=resample_factor,
-                    )
-                    if feats_tile is not None:
-                        cached_tiles += 1
+                feature_path = tile_feature_path(feature_dir, image_id, y, x)
+                if feature_dir is not None and not os.path.exists(feature_path):
+                    manifest_dirty = True
+                    manifest_entries.pop((y, x), None)
                 else:
-                    feature_path = inspect_tile_features_if_valid(
-                        feature_dir,
-                        image_id,
-                        y,
-                        x,
-                        expected_hp=hp,
-                        expected_wp=wp,
-                        ps=ps,
-                        resample_factor=resample_factor,
-                    )
-                    if feature_path is not None:
-                        cached_tiles += 1
-                        cache[(y, x)] = {
-                            "feats": None,
-                            "feature_path": feature_path,
-                            "h_eff": h_eff,
-                            "w_eff": w_eff,
-                            "hp": hp,
-                            "wp": wp,
-                        }
-                        continue
+                    with perf_span(
+                        "prefetch_features_single_scale_image",
+                        substage="manifest_cache_hit",
+                        extra={"image_id": image_id, "y": y, "x": x},
+                    ):
+                        if materialize_cached:
+                            checked_path = _manifest_feature_path_if_loadable(
+                                feature_path,
+                                expected_hp=hp,
+                                expected_wp=wp,
+                            )
+                            if checked_path is None:
+                                feats_tile = None
+                                manifest_dirty = True
+                                manifest_entries.pop((y, x), None)
+                            else:
+                                feats_tile = np.load(checked_path, mmap_mode="r")
+                                feats_tile = np.asarray(feats_tile, dtype=np.float32)
+                                cached_tiles += 1
+                        else:
+                            checked_path = _manifest_feature_path_if_loadable(
+                                feature_path,
+                                expected_hp=hp,
+                                expected_wp=wp,
+                            )
+                            if checked_path is None:
+                                manifest_dirty = True
+                                manifest_entries.pop((y, x), None)
+                            else:
+                                cached_tiles += 1
+                                cache[(y, x)] = {
+                                    "feats": None,
+                                    "feature_path": checked_path,
+                                    "h_eff": h_eff,
+                                    "w_eff": w_eff,
+                                    "hp": hp,
+                                    "wp": wp,
+                                }
+                                continue
+            if feats_tile is None:
+                with perf_span(
+                    "prefetch_features_single_scale_image",
+                    substage="validate_cached_tile",
+                    extra={"image_id": image_id, "y": y, "x": x},
+                ):
+                    if materialize_cached:
+                        feats_tile = load_tile_features_if_valid(
+                            feature_dir,
+                            image_id,
+                            y,
+                            x,
+                            expected_hp=hp,
+                            expected_wp=wp,
+                            ps=ps,
+                            resample_factor=resample_factor,
+                        )
+                        if feats_tile is not None:
+                            cached_tiles += 1
+                    else:
+                        feature_path = inspect_tile_features_if_valid(
+                            feature_dir,
+                            image_id,
+                            y,
+                            x,
+                            expected_hp=hp,
+                            expected_wp=wp,
+                            ps=ps,
+                            resample_factor=resample_factor,
+                        )
+                        if feature_path is not None:
+                            cached_tiles += 1
+                            cache[(y, x)] = {
+                                "feats": None,
+                                "feature_path": feature_path,
+                                "h_eff": h_eff,
+                                "w_eff": w_eff,
+                                "hp": hp,
+                                "wp": wp,
+                            }
+                            manifest_entries[(y, x)] = {
+                                "h_eff": int(h_eff),
+                                "w_eff": int(w_eff),
+                                "hp": int(hp),
+                                "wp": int(wp),
+                            }
+                            manifest_dirty = True
+                            continue
         if feats_tile is None:
             key = (h_eff, w_eff)
             pending.setdefault(key, []).append((y, x, img_c, h_eff, w_eff))
@@ -301,9 +419,39 @@ def prefetch_features_single_scale_image(
                 "hp": hp,
                 "wp": wp,
             }
+            if (
+                feature_dir is not None
+                and image_id is not None
+                and hp is not None
+                and wp is not None
+            ):
+                manifest_entries[(y, x)] = {
+                    "h_eff": int(h_eff),
+                    "w_eff": int(w_eff),
+                    "hp": int(hp),
+                    "wp": int(wp),
+                }
 
     for items in pending.values():
         flush_pending(items)
+    if feature_dir is not None and image_id is not None and manifest_entries:
+        if (
+            manifest_dirty
+            or manifest_tiles is None
+            or len(manifest_entries) != len(manifest_tiles)
+        ):
+            with perf_span(
+                "prefetch_features_single_scale_image",
+                substage="save_feature_manifest",
+                extra={"image_id": image_id, "tile_count": len(manifest_entries)},
+            ):
+                save_feature_manifest(
+                    feature_dir,
+                    image_id,
+                    ps,
+                    resample_factor,
+                    manifest_entries,
+                )
     time_end("prefetch_features_single_scale_image", t0)
     logger.info(
         "prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)",

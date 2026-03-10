@@ -49,7 +49,9 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 ## Important runtime behavior
 - Inference tile filtering respects `io.paths.source_label_raster` and keeps only tiles that contain at least one positive source-label pixel.
 - `io.inference.score_prior` can manually boost XGB scores inside `SOURCE_LABEL_RASTER` pixels during the final inference phase.
+- `io.inference.plot_every` samples holdout plot rendering over pending tiles without changing inference masks or checkpoint cadence.
 - Holdout inference is interruption-safe at tile granularity.
+- The optimized XGB scorer checks the first 3 pending holdout tiles against the legacy scorer and auto-falls back if the difference is meaningful.
 - CRF tuning is guarded against unsafe CUDA multiprocessing.
 - Time-budget state is persisted in the rolling checkpoint and can trigger cutover behavior.
 - Disk feature cache mode consolidates per-tile caches after successful workflows.

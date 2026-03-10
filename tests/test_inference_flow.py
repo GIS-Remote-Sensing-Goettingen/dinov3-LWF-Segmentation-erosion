@@ -19,7 +19,10 @@ from segedge.pipeline.inference_flow import (
     run_holdout_inference,
 )
 from segedge.pipeline.run import _maybe_run_holdout_inference
-from segedge.pipeline.runtime.holdout_inference import _apply_inference_score_prior
+from segedge.pipeline.runtime.holdout_inference import (
+    _apply_inference_score_prior,
+    _compute_xgb_stream,
+)
 
 
 def _write_test_raster(
@@ -265,6 +268,87 @@ def test_apply_inference_score_prior_is_disabled_outside_final_inference(
     assert np.allclose(boosted, score_map)
 
 
+def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatch):
+    """The scorer guard should switch to the legacy path after a meaningful diff.
+
+    Examples:
+        >>> True
+        True
+    """
+    optimized_calls = {"count": 0}
+    legacy_calls = {"count": 0}
+
+    def _fake_optimized(*args, **kwargs):
+        optimized_calls["count"] += 1
+        return np.ones((2, 2), dtype=np.float32)
+
+    def _fake_legacy(*args, **kwargs):
+        legacy_calls["count"] += 1
+        return np.zeros((2, 2), dtype=np.float32)
+
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.xgb_score_image_b",
+        _fake_optimized,
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.xgb_score_image_b_legacy",
+        _fake_legacy,
+    )
+    context = {
+        "sh_buffer_mask": np.ones((2, 2), dtype=bool),
+        "gt_mask_eval": np.zeros((2, 2), dtype=bool),
+        "xgb_enabled": True,
+        "img_b": np.zeros((2, 2, 3), dtype=np.uint8),
+        "image_id_b": "tile_guard",
+        "prefetched_b": {},
+        "roads_mask": None,
+        "roads_penalty": 1.0,
+        "xgb_feature_stats": None,
+        "labels_sh": np.zeros((2, 2), dtype=np.uint8),
+    }
+    tuned = {
+        "bst": object(),
+        "best_xgb_config": {"threshold": 0.5},
+    }
+    guard_state = {
+        "enabled": True,
+        "checked_tiles": 0,
+        "fallback_to_legacy": False,
+        "guard_tiles": 3,
+        "atol": 1e-5,
+        "rtol": 1e-4,
+    }
+
+    result_a = _compute_xgb_stream(
+        context,
+        tuned,
+        ps=16,
+        tile_size=32,
+        stride=32,
+        feature_dir=None,
+        context_radius=0,
+        final_inference_phase=True,
+        xgb_guard_state=guard_state,
+    )
+    result_b = _compute_xgb_stream(
+        context,
+        tuned,
+        ps=16,
+        tile_size=32,
+        stride=32,
+        feature_dir=None,
+        context_radius=0,
+        final_inference_phase=True,
+        xgb_guard_state=guard_state,
+    )
+
+    assert guard_state["fallback_to_legacy"] is True
+    assert np.array_equal(result_a["mask"], np.zeros((2, 2), dtype=bool))
+    assert np.array_equal(result_b["mask"], np.zeros((2, 2), dtype=bool))
+    assert optimized_calls["count"] == 1
+    assert legacy_calls["count"] == 2
+
+
 def test_maybe_run_holdout_inference_skips_empty_tiles(caplog):
     """Empty holdout sets should skip inference cleanly.
 
@@ -296,6 +380,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
     checkpoint_calls: list[int] = []
     call_order: list[tuple[str, str | int]] = []
     phase_flags: list[bool] = []
+    save_plot_flags: list[bool] = []
 
     def _fake_infer_on_holdout(
         holdout_path,
@@ -315,6 +400,8 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
         context_radius,
         plot_with_metrics,
         final_inference_phase,
+        save_plots,
+        xgb_guard_state,
     ):
         """Return a deterministic fake inference payload.
 
@@ -323,6 +410,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
             True
         """
         phase_flags.append(final_inference_phase)
+        save_plot_flags.append(save_plots)
         mask = np.ones((2, 2), dtype=bool)
         return {
             "gt_available": False,
@@ -380,6 +468,7 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
         ("checkpoint", 2),
     ]
     assert phase_flags == [True, True]
+    assert save_plot_flags == [True, True]
     assert len(processed_log_path.read_text(encoding="utf-8").splitlines()) == 2
     assert "Processing tile tile_a.tif, 1 / 2" in caplog.text
     assert "Processing tile tile_b.tif, 2 / 2" in caplog.text
@@ -397,6 +486,7 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
         True
     """
     phase_flags: list[bool] = []
+    save_plot_flags: list[bool] = []
 
     def _fake_infer_on_holdout(
         holdout_path,
@@ -416,6 +506,8 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
         context_radius,
         plot_with_metrics,
         final_inference_phase,
+        save_plots,
+        xgb_guard_state,
     ):
         """Return a deterministic fake inference payload.
 
@@ -424,6 +516,7 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
             True
         """
         phase_flags.append(final_inference_phase)
+        save_plot_flags.append(save_plots)
         mask = np.ones((2, 2), dtype=bool)
         return {
             "gt_available": False,
@@ -465,5 +558,83 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
 
     assert processed == 2
     assert phase_flags == [True]
+    assert save_plot_flags == [True]
     assert "holdout skip (already processed): tile_done.tif" in caplog.text
     assert "Processing tile tile_pending.tif, 1 / 1" in caplog.text
+
+
+def test_run_holdout_inference_plots_every_pending_n_tiles(
+    tmp_path,
+    monkeypatch,
+):
+    """Plot cadence should count only pending tiles in the current run.
+
+    Examples:
+        >>> True
+        True
+    """
+    save_plot_flags: list[bool] = []
+
+    def _fake_infer_on_holdout(
+        holdout_path,
+        gt_vector_paths,
+        model,
+        processor,
+        device,
+        pos_bank,
+        neg_bank,
+        tuned,
+        ps,
+        tile_size,
+        stride,
+        feature_dir,
+        shape_dir,
+        plot_dir,
+        context_radius,
+        plot_with_metrics,
+        final_inference_phase,
+        save_plots,
+        xgb_guard_state,
+    ):
+        save_plot_flags.append(save_plots)
+        mask = np.ones((2, 2), dtype=bool)
+        return {
+            "gt_available": False,
+            "metrics": {},
+            "image_id": Path(holdout_path).stem,
+            "ref_path": holdout_path,
+            "masks": {"champion_shadow": mask},
+        }
+
+    monkeypatch.setattr(
+        "segedge.pipeline.inference_flow.infer_on_holdout",
+        _fake_infer_on_holdout,
+    )
+
+    processed = run_holdout_inference(
+        holdout_tiles=["tile_1.tif", "tile_2.tif", "tile_3.tif", "tile_4.tif"],
+        processed_tiles={"tile_1.tif"},
+        gt_vector_paths=None,
+        model=None,
+        processor=None,
+        device=None,
+        pos_bank=np.zeros((0, 0), dtype=np.float32),
+        neg_bank=None,
+        tuned={},
+        ps=16,
+        tile_size=64,
+        stride=32,
+        feature_dir=None,
+        shape_dir=str(tmp_path / "shapes"),
+        plot_dir=str(tmp_path / "plots"),
+        context_radius=0,
+        holdout_phase_metrics={},
+        append_union=lambda stream, variant, mask, ref_path, step: None,
+        processed_log_path=str(tmp_path / "processed.jsonl"),
+        write_checkpoint=lambda holdout_done: None,
+        logger=logging.getLogger("test_inference_flow_plot_every"),
+        plot_every=2,
+    )
+
+    assert processed == 4
+    assert save_plot_flags == [True, False, True]
