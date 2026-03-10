@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=segmentation
+#SBATCH --job-name=Erosion
 #SBATCH --output=segmentation_%j.out
 #SBATCH --error=segmentation_%j.err
 #SBATCH --mem=128G
 #SBATCH --partition=scc-gpu
 #SBATCH -G A100:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=06:00:00
+#SBATCH --time=14:00:00
 
 set -euo pipefail
 

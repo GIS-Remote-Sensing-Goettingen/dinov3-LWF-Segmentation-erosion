@@ -1,0 +1,51 @@
+"""Compatibility exports for runtime helper modules."""
+
+from __future__ import annotations
+
+from .runtime import (
+    _apply_roads_penalty,
+    _apply_shadow_filter,
+    _compute_component_shape_metrics,
+    _eval_crf_config,
+    _get_roads_mask,
+    _init_crf_parallel,
+    _log_phase,
+    _summarize_phase_metrics,
+    _update_phase_metrics,
+    _weighted_mean,
+    build_time_budget_status,
+    compute_budget_deadline,
+    deadline_ts_to_utc_iso,
+    filter_novel_proposals,
+    infer_on_holdout,
+    is_budget_exceeded,
+    load_b_tile_context,
+    parse_utc_iso_to_epoch,
+    remaining_budget_s,
+    summarize_phase_metrics_mean_std,
+    write_rolling_best_config,
+)
+
+__all__ = [
+    "_apply_roads_penalty",
+    "_apply_shadow_filter",
+    "_compute_component_shape_metrics",
+    "_eval_crf_config",
+    "_get_roads_mask",
+    "_init_crf_parallel",
+    "_log_phase",
+    "_summarize_phase_metrics",
+    "_update_phase_metrics",
+    "_weighted_mean",
+    "build_time_budget_status",
+    "compute_budget_deadline",
+    "deadline_ts_to_utc_iso",
+    "filter_novel_proposals",
+    "infer_on_holdout",
+    "is_budget_exceeded",
+    "load_b_tile_context",
+    "parse_utc_iso_to_epoch",
+    "remaining_budget_s",
+    "summarize_phase_metrics_mean_std",
+    "write_rolling_best_config",
+]

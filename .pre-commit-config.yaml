@@ -47,3 +47,8 @@ repos:
         entry: python scripts/check_file_length.py
         language: system
         pass_filenames: false
+      - id: function-length
+        name: function length limit (fail > 400)
+        entry: python scripts/check_function_length.py --limit 400
+        language: system
+        pass_filenames: false

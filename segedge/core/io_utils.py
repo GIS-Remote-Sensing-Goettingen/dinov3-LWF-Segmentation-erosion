@@ -11,6 +11,7 @@ import fiona
 import numpy as np
 import rasterio
 import rasterio.features as rfeatures
+import yaml
 from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.io import MemoryFile
@@ -22,8 +23,7 @@ from shapely.ops import transform as shp_transform
 from skimage.morphology import dilation, disk
 from skimage.transform import resize
 
-import config as cfg
-
+from .config_loader import cfg
 from .timing_utils import time_end, time_start
 
 logger = logging.getLogger(__name__)
@@ -614,6 +614,10 @@ def export_best_settings(
     buffer_m,
     pixel_size_m,
     shadow_cfg=None,
+    best_xgb_config: dict | None = None,
+    champion_source: str | None = None,
+    xgb_model_info: dict | None = None,
+    model_info: dict | None = None,
     extra_settings: dict | None = None,
     best_settings_path: str | None = None,
 ):
@@ -653,6 +657,10 @@ def export_best_settings(
         "best_raw_config": best_raw_config,
         "best_crf_config": best_crf_config,
         "best_shadow_config": shadow_cfg,
+        "best_xgb_config": best_xgb_config,
+        "champion_source": champion_source,
+        "xgb_model_info": xgb_model_info,
+        "model_info": model_info,
         "model_name": model_name,
         "img_a": img_path,
         "img_b": img2_path,
@@ -661,22 +669,26 @@ def export_best_settings(
     }
     if extra_settings:
         best_settings["extra"] = extra_settings
-    out_path = best_settings_path or cfg.BEST_SETTINGS_PATH
+    out_path = best_settings_path or cfg.io.paths.best_settings_path
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    def _normalize(value):
+        if isinstance(value, dict):
+            return {k: _normalize(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [_normalize(v) for v in value]
+        if isinstance(value, tuple):
+            return [_normalize(v) for v in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
     with open(out_path, "w", encoding="utf-8") as f:
-
-        def _write_yaml(d, indent=0):
-            """Write a minimal YAML mapping.
-
-            Examples:
-                >>> _write_yaml({"a": 1})  # doctest: +SKIP
-            """
-            for k, v in d.items():
-                if isinstance(v, dict):
-                    f.write("  " * indent + f"{k}:\n")
-                    _write_yaml(v, indent + 1)
-                else:
-                    f.write("  " * indent + f"{k}: {v}\n")
-
-        _write_yaml(best_settings)
+        yaml.safe_dump(
+            _normalize(best_settings),
+            f,
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=False,
+        )
     logger.info("best settings written to %s", out_path)
