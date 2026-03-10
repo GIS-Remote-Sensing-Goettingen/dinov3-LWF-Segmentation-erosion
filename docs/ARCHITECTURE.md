@@ -25,7 +25,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 
 ### Workflows
 - `workflows/inference_only.py`:
-  - loads a saved bundle
+  - loads a saved bundle, either from the explicit config path or the newest valid previous run bundle
   - validates runtime compatibility
   - writes inference settings
   - runs holdout inference with rolling checkpoints

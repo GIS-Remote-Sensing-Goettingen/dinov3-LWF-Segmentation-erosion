@@ -57,6 +57,7 @@ __all__ = [
     "_export_best_settings_dual",
     "_maybe_run_holdout_inference",
     "_novel_proposals_payload",
+    "_resolve_inference_model_bundle_dir",
     "main",
 ]
 
@@ -121,6 +122,67 @@ def _create_run_directories() -> dict[str, str]:
         "inference_plot_dir": inference_plot_dir,
         "shape_dir": shape_dir,
     }
+
+
+def _run_dir_sort_key(run_name: str) -> tuple[int, str]:
+    """Return a stable descending-sort key for `run_*` directories.
+
+    Examples:
+        >>> _run_dir_sort_key("run_007")
+        (7, 'run_007')
+    """
+    parts = run_name.split("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return (int(parts[1]), run_name)
+    return (-1, run_name)
+
+
+def _resolve_inference_model_bundle_dir(
+    model_bundle_dir: str | None,
+    *,
+    output_root: str,
+    current_run_dir: str,
+) -> str:
+    """Resolve the bundle directory for inference-only runs.
+
+    Examples:
+        >>> _resolve_inference_model_bundle_dir(
+        ...     "/tmp/bundle",
+        ...     output_root="/tmp/out",
+        ...     current_run_dir="/tmp/out/run_001",
+        ... )
+        '/tmp/bundle'
+    """
+    if model_bundle_dir:
+        return model_bundle_dir
+
+    current_run_dir_abs = os.path.abspath(current_run_dir)
+    candidate_names = sorted(
+        (
+            name
+            for name in os.listdir(output_root)
+            if name.startswith("run_")
+            and os.path.isdir(os.path.join(output_root, name))
+        ),
+        key=_run_dir_sort_key,
+        reverse=True,
+    )
+    for run_name in candidate_names:
+        run_dir = os.path.join(output_root, run_name)
+        if os.path.abspath(run_dir) == current_run_dir_abs:
+            continue
+        bundle_dir = os.path.join(run_dir, "model_bundle")
+        manifest_path = os.path.join(bundle_dir, "manifest.yml")
+        if os.path.exists(manifest_path):
+            logger.info(
+                "inference-only: model_bundle_dir unset, using previous run bundle %s",
+                bundle_dir,
+            )
+            return bundle_dir
+    raise ValueError(
+        "io.training=false and io.inference.model_bundle_dir is null, but no "
+        f"previous run bundle was found under {output_root}"
+    )
 
 
 def _load_processed_tiles(processed_log_path: str, resume_run: bool) -> set[str]:
@@ -549,6 +611,13 @@ def main():
             float(budget_state["clock_start_ts"]),
             float(budget_state["hours"]),
         )
+    resolved_model_bundle_dir = cfg.io.inference.model_bundle_dir
+    if not training_enabled:
+        resolved_model_bundle_dir = _resolve_inference_model_bundle_dir(
+            cfg.io.inference.model_bundle_dir,
+            output_root=cfg.io.paths.output_dir,
+            current_run_dir=run_dir,
+        )
 
     common = {
         "append_union": append_union,
@@ -567,7 +636,7 @@ def main():
         "holdout_phase_metrics": {},
         "inference_plot_dir": run_paths["inference_plot_dir"],
         "model": model,
-        "model_bundle_dir": cfg.io.inference.model_bundle_dir,
+        "model_bundle_dir": resolved_model_bundle_dir,
         "model_name": model_name,
         "plot_dir": run_paths["plot_dir"],
         "processed_log_path": processed_log_path,
@@ -591,10 +660,6 @@ def main():
     }
 
     if not training_enabled:
-        if not common["model_bundle_dir"]:
-            raise ValueError(
-                "io.training=false requires io.inference.model_bundle_dir to be set"
-            )
         run_inference_only(
             common,
             holdout_tiles=list(tile_sets["holdout_tiles"]),

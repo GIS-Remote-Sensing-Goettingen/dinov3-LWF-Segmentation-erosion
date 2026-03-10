@@ -18,7 +18,8 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 ## Run Modes
 ### Inference-only
 - Set `io.training=false`.
-- Requires `io.inference.model_bundle_dir`.
+- Uses `io.inference.model_bundle_dir` when set.
+- If `io.inference.model_bundle_dir` is `null`, the pipeline resolves the newest valid previous `output/run_*/model_bundle`.
 - Resolves inference tiles from `io.inference.*` or legacy inference config.
 - Skips training and goes directly to holdout inference.
 

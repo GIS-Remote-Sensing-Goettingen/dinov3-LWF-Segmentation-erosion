@@ -20,7 +20,9 @@ Function: `segedge.pipeline.workflows.run_inference_only`
 Use this when `io.training=false`.
 
 Execution order:
-1. Load `io.inference.model_bundle_dir`.
+1. Resolve the model bundle directory:
+   - use `io.inference.model_bundle_dir` when set
+   - otherwise use the newest valid previous `output/run_*/model_bundle`
 2. Validate that the bundle matches the current runtime assumptions:
    patch size, resample factor, tiling config, and feature-context radius.
 3. Write `rolling_best_setting.yml` with the bundle metadata.

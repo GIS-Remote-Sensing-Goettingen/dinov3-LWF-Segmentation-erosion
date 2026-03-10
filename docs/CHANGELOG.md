@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Allow inference-only runs with `io.inference.model_bundle_dir: null` to reuse the newest valid previous `output/run_*/model_bundle`.
+- Files touched: `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `docs/KB.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: Remove the need to manually copy the last bundle path into the config for every inference-only run.
+- Problems fixed: `io.training=false` no longer fails at config load when `model_bundle_dir` is unset, inference-only bootstrap now resolves the latest valid prior bundle automatically, explicit bundle paths still take precedence, and the fallback failure mode is now explicit when no previous bundle exists.
+
 - Description: Add structured `performance.jsonl` logging for inference internals, cache GT vector geometries by CRS, stream XGB cached features more lazily, and refactor novel-proposal evaluation onto local component crops.
 - Files touched: `segedge/core/timing_utils.py`, `segedge/core/io_utils.py`, `segedge/core/feature_ops/cache.py`, `segedge/core/feature_ops/extraction.py`, `segedge/core/xdboost.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/postprocess.py`, `segedge/pipeline/runtime/tile_context.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
 - Reason: Make long inference runs measurable at the function-internal level and reduce the dominant CPU overhead without adding new runtime knobs.

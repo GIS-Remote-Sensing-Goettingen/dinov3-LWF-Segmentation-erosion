@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 import yaml
 
 from segedge.core.config_loader import load_config
@@ -21,8 +20,8 @@ def _load_repo_config() -> dict:
     return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
 
-def test_inference_only_requires_bundle_dir(tmp_path):
-    """io.training=false must require io.inference.model_bundle_dir.
+def test_inference_only_allows_null_bundle_dir(tmp_path):
+    """io.training=false may defer bundle resolution to runtime.
 
     Examples:
         >>> True
@@ -35,8 +34,9 @@ def test_inference_only_requires_bundle_dir(tmp_path):
     raw["io"]["inference"]["tiles"] = ["tile_a.tif"]
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="io.inference.model_bundle_dir"):
-        load_config(cfg_path)
+    loaded = load_config(cfg_path)
+    assert loaded.io.training is False
+    assert loaded.io.inference.model_bundle_dir is None
 
 
 def test_inference_group_defaults_are_applied(tmp_path):
@@ -48,6 +48,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
     """
     raw = _load_repo_config()
     raw["io"].pop("inference", None)
+    raw["io"]["training"] = True
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     loaded = load_config(cfg_path)

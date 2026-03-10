@@ -955,10 +955,6 @@ def _validate_loaded_config(config: Config) -> None:
     if not (0.0 <= config.io.inference.score_prior.clip_max <= 1.0):
         raise ValueError("'io.inference.score_prior.clip_max' must be in [0, 1]")
     if not config.io.training:
-        if config.io.inference.model_bundle_dir is None:
-            raise ValueError(
-                "'io.inference.model_bundle_dir' must be set when io.training=false"
-            )
         has_inference_tiles = bool(
             config.io.inference.tiles_dir
             or config.io.inference.tiles
