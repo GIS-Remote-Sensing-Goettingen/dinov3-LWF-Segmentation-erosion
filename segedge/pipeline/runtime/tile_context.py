@@ -15,7 +15,7 @@ from ...core.io_utils import (
     rasterize_vector_labels,
     reproject_labels_to_image,
 )
-from ...core.timing_utils import time_end, time_start
+from ...core.timing_utils import perf_span, time_end, time_start
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +30,20 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
     logger.info("loading tile: %s", img_path)
     t0_data = time_start()
     ds = int(cfg.model.backbone.resample_factor or 1)
-    img_b = load_dop20_image(img_path, downsample_factor=ds)
-    labels_sh = reproject_labels_to_image(
-        img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
-    )
-    gt_mask = (
-        rasterize_vector_labels(gt_vector_paths, img_path, downsample_factor=ds)
-        if gt_vector_paths
-        else None
-    )
+    with perf_span("load_b_tile_context", substage="load_image"):
+        img_b = load_dop20_image(img_path, downsample_factor=ds)
+    with perf_span("load_b_tile_context", substage="reproject_source_labels"):
+        labels_sh = reproject_labels_to_image(
+            img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
+        )
+    gt_mask = None
+    if gt_vector_paths:
+        with perf_span("load_b_tile_context", substage="rasterize_gt_vectors"):
+            gt_mask = rasterize_vector_labels(
+                gt_vector_paths,
+                img_path,
+                downsample_factor=ds,
+            )
     time_end("data_loading_and_reprojection", t0_data)
     target_shape = img_b.shape[:2]
     if labels_sh.shape != target_shape:
@@ -85,7 +90,8 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         buffer_pixels,
     )
 
-    sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
+    with perf_span("load_b_tile_context", substage="build_sh_buffer_mask"):
+        sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
     if gt_mask is not None and cfg.model.priors.clip_gt_to_buffer:
         gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
         logger.info(

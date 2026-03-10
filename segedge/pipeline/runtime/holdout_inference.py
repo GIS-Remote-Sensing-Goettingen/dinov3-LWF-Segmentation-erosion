@@ -22,6 +22,7 @@ from ...core.plotting import (
     save_score_threshold_plot,
     save_unified_plot,
 )
+from ...core.timing_utils import perf_span
 from ...core.xdboost import xgb_score_image_b
 from .postprocess import _apply_shadow_filter, filter_novel_proposals
 from .roads import _apply_roads_penalty, _get_roads_mask
@@ -62,6 +63,8 @@ def _load_holdout_tile(
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
+    knn_enabled = bool(tuned.get("knn_enabled", cfg.search.knn.enabled))
+    xgb_enabled = bool(tuned.get("xgb_enabled", cfg.search.xgb.enabled))
     prefetched_b = prefetch_features_single_scale_image(
         img_b,
         model,
@@ -73,6 +76,7 @@ def _load_holdout_tile(
         None,
         feature_dir,
         image_id_b,
+        materialize_cached=bool(knn_enabled or not xgb_enabled),
     )
     ds = int(cfg.model.backbone.resample_factor or 1)
     return {
@@ -89,8 +93,8 @@ def _load_holdout_tile(
         "roads_mask": _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2]),
         "roads_penalty": float(tuned.get("roads_penalty", 1.0)),
         "xgb_feature_stats": tuned.get("xgb_feature_stats"),
-        "knn_enabled": bool(tuned.get("knn_enabled", cfg.search.knn.enabled)),
-        "xgb_enabled": bool(tuned.get("xgb_enabled", cfg.search.xgb.enabled)),
+        "knn_enabled": knn_enabled,
+        "xgb_enabled": xgb_enabled,
         "crf_enabled": bool(tuned.get("crf_enabled", cfg.search.crf.enabled)),
     }
 
@@ -694,44 +698,47 @@ def infer_on_holdout(
         True
     """
     logger.info("inference: holdout tile %s", holdout_path)
-    context = _load_holdout_tile(
-        holdout_path,
-        gt_vector_paths,
-        model,
-        processor,
-        device,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        tuned,
-    )
+    with perf_span("infer_on_holdout", substage="load_context"):
+        context = _load_holdout_tile(
+            holdout_path,
+            gt_vector_paths,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            tuned,
+        )
     if not (context["knn_enabled"] or context["xgb_enabled"]):
         raise ValueError("both kNN and XGB are disabled for inference")
-    knn_result = _compute_knn_stream(
-        context,
-        tuned,
-        model,
-        processor,
-        device,
-        pos_bank,
-        neg_bank,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        context_radius,
-    )
-    xgb_result = _compute_xgb_stream(
-        context,
-        tuned,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        context_radius,
-        final_inference_phase,
-    )
+    with perf_span("infer_on_holdout", substage="knn_stream"):
+        knn_result = _compute_knn_stream(
+            context,
+            tuned,
+            model,
+            processor,
+            device,
+            pos_bank,
+            neg_bank,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            context_radius,
+        )
+    with perf_span("infer_on_holdout", substage="xgb_stream"):
+        xgb_result = _compute_xgb_stream(
+            context,
+            tuned,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+            context_radius,
+            final_inference_phase,
+        )
     champion_source = _resolve_champion_stream(
         tuned,
         bool(context["knn_enabled"]),
@@ -743,26 +750,33 @@ def infer_on_holdout(
     champion_score = champion_result["score"]
     champion_thr = float(champion_result["threshold"])
     active_raw_mask = champion_result["mask"]
-    mask_crf_knn, mask_crf_xgb = _run_crf_stage(context, tuned, knn_result, xgb_result)
+    with perf_span("infer_on_holdout", substage="crf_stage"):
+        mask_crf_knn, mask_crf_xgb = _run_crf_stage(
+            context,
+            tuned,
+            knn_result,
+            xgb_result,
+        )
     active_crf_mask = mask_crf_knn if champion_source == "raw" else mask_crf_xgb
     shadow_cfg = tuned["shadow_cfg"]
-    active_shadow_mask = _apply_shadow_mask(
-        context["img_b"], active_crf_mask, shadow_cfg, champion_score
-    )
-    shadow_mask_knn = (
-        _apply_shadow_mask(
-            context["img_b"], mask_crf_knn, shadow_cfg, knn_result["score"]
+    with perf_span("infer_on_holdout", substage="shadow_stage"):
+        active_shadow_mask = _apply_shadow_mask(
+            context["img_b"], active_crf_mask, shadow_cfg, champion_score
         )
-        if context["knn_enabled"]
-        else np.zeros_like(context["sh_buffer_mask"], dtype=bool)
-    )
-    shadow_mask_xgb = (
-        _apply_shadow_mask(
-            context["img_b"], mask_crf_xgb, shadow_cfg, xgb_result["score"]
+        shadow_mask_knn = (
+            _apply_shadow_mask(
+                context["img_b"], mask_crf_knn, shadow_cfg, knn_result["score"]
+            )
+            if context["knn_enabled"]
+            else np.zeros_like(context["sh_buffer_mask"], dtype=bool)
         )
-        if context["xgb_enabled"]
-        else np.zeros_like(context["sh_buffer_mask"], dtype=bool)
-    )
+        shadow_mask_xgb = (
+            _apply_shadow_mask(
+                context["img_b"], mask_crf_xgb, shadow_cfg, xgb_result["score"]
+            )
+            if context["xgb_enabled"]
+            else np.zeros_like(context["sh_buffer_mask"], dtype=bool)
+        )
     metrics_map = _build_metrics_map(
         context["gt_mask_eval"],
         float(context["gt_weight"]),
@@ -789,50 +803,53 @@ def infer_on_holdout(
         if proposal_cfg.source == "champion_score"
         else active_shadow_mask
     )
-    proposal_bundle = filter_novel_proposals(
-        active_shadow_mask,
-        context["labels_sh"],
-        champion_score,
-        context["roads_mask"],
-        context["pixel_size_m"],
-        sh_buffer_mask=context["sh_buffer_mask"],
-        proposal_source_mask=proposal_source_mask,
-    )
+    with perf_span("infer_on_holdout", substage="novel_proposals"):
+        proposal_bundle = filter_novel_proposals(
+            active_shadow_mask,
+            context["labels_sh"],
+            champion_score,
+            context["roads_mask"],
+            context["pixel_size_m"],
+            sh_buffer_mask=context["sh_buffer_mask"],
+            proposal_source_mask=proposal_source_mask,
+        )
     proposal_masks = _build_proposal_masks(
         proposal_bundle,
         proposal_bundle["candidate_mask"],
     )
-    _export_proposal_artifacts(
-        proposal_bundle,
-        proposal_masks,
-        holdout_path,
-        context["image_id_b"],
-        shape_dir,
-    )
+    with perf_span("infer_on_holdout", substage="proposal_exports"):
+        _export_proposal_artifacts(
+            proposal_bundle,
+            proposal_masks,
+            holdout_path,
+            context["image_id_b"],
+            shape_dir,
+        )
     _, disagreement_map, entropy_map = _compute_probability_and_diagnostics(
         active_stream,
         champion_score,
         knn_result["score"],
         xgb_result["score"],
     )
-    _save_holdout_plots(
-        context=context,
-        plot_dir=plot_dir,
-        plot_with_metrics=plot_with_metrics,
-        active_stream=active_stream,
-        active_label=active_label,
-        champion_score=champion_score,
-        champion_thr=champion_thr,
-        active_raw_mask=active_raw_mask,
-        active_crf_mask=active_crf_mask,
-        active_shadow_mask=active_shadow_mask,
-        metrics_map=metrics_map,
-        proposal_masks=proposal_masks,
-        proposal_bundle=proposal_bundle,
-        score_knn_raw=knn_result["score_raw"],
-        disagreement_map=disagreement_map,
-        entropy_map=entropy_map,
-    )
+    with perf_span("infer_on_holdout", substage="plot_exports"):
+        _save_holdout_plots(
+            context=context,
+            plot_dir=plot_dir,
+            plot_with_metrics=plot_with_metrics,
+            active_stream=active_stream,
+            active_label=active_label,
+            champion_score=champion_score,
+            champion_thr=champion_thr,
+            active_raw_mask=active_raw_mask,
+            active_crf_mask=active_crf_mask,
+            active_shadow_mask=active_shadow_mask,
+            metrics_map=metrics_map,
+            proposal_masks=proposal_masks,
+            proposal_bundle=proposal_bundle,
+            score_knn_raw=knn_result["score_raw"],
+            disagreement_map=disagreement_map,
+            entropy_map=entropy_map,
+        )
 
     return {
         "ref_path": holdout_path,

@@ -51,9 +51,11 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `runtime/crf_eval.py`: CRF worker initialization and config evaluation.
 - `runtime/tile_context.py`: tile image/label/GT loading and SH-buffer preparation.
 - `runtime/phase_metrics.py`: phase logging and summary aggregation.
+  - inference now also writes structured timing spans into `performance.jsonl` so tile-level and function-internal bottlenecks can be analyzed separately from `run.log`.
 
 ### Feature Helpers
 - `feature_ops/extraction.py`: DINO feature extraction and batched tile prefetch.
+  - for XGB-only inference, cached feature tiles can stay lazy until the scorer actually needs each tile.
 - `feature_ops/tiling.py`: tile iteration, patch-size cropping, and patch-label mapping.
 - `feature_ops/fusion.py`: hybrid DINO + image-descriptor feature assembly and XGB feature-stat transforms.
 - `feature_ops/cache.py`: per-tile feature cache persistence and validation.
@@ -73,6 +75,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 
 ## Outputs
 - `output/run_*/run.log`: main runtime log.
+- `output/run_*/performance.jsonl`: structured per-span performance log with tile and phase context plus rolling summaries.
 - `output/run_*/rolling_best_setting.yml`: interruption-safe best-known config and progress state.
 - `output/run_*/processed_tiles.jsonl`: append-only holdout completion log.
 - `output/run_*/plots/validation/`: validation-stage plots.
@@ -94,4 +97,5 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - Keep the public CLI and config model stable.
 - Keep compatibility exports in `segedge/core/features.py` and `segedge/pipeline/runtime_utils.py` until downstream imports are fully migrated.
 - Keep per-tile holdout checkpointing behavior intact: append unions, append processed log, then write the rolling checkpoint.
+- Keep structured performance logging lightweight and append-only so resumed runs still produce one continuous `performance.jsonl`.
 - Prefer smaller modules with one responsibility over monolithic orchestration files.

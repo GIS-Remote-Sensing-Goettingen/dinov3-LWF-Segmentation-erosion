@@ -18,15 +18,17 @@ from rasterio.io import MemoryFile
 from rasterio.plot import reshape_as_image
 from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
-from shapely.geometry import mapping, shape
+from shapely.geometry import box, mapping, shape
 from shapely.ops import transform as shp_transform
+from shapely.strtree import STRtree
 from skimage.morphology import dilation, disk
 from skimage.transform import resize
 
 from .config_loader import cfg
-from .timing_utils import time_end, time_start
+from .timing_utils import perf_span, time_end, time_start
 
 logger = logging.getLogger(__name__)
+_VECTOR_GEOM_CACHE: dict[tuple[str, str], tuple[STRtree | None, list]] = {}
 try:
     import cv2
 
@@ -144,6 +146,56 @@ def reproject_labels_to_image(
     return labels_2d
 
 
+def _vector_cache_key(vector_path: str, raster_crs) -> tuple[str, str]:
+    """Build a stable cache key for vector reprojection reuse."""
+    crs_key = raster_crs.to_wkt() if raster_crs is not None else "<none>"
+    return (os.path.abspath(vector_path), crs_key)
+
+
+def _load_vector_geometries_for_raster(
+    vector_path: str,
+    raster_crs,
+) -> tuple[STRtree | None, list]:
+    """Load and cache vector geometries in the target raster CRS."""
+    cache_key = _vector_cache_key(vector_path, raster_crs)
+    cached = _VECTOR_GEOM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    with fiona.open(vector_path, "r") as shp:
+        vec_crs = shp.crs
+        if not vec_crs:
+            logger.warning(
+                "vector CRS missing for %s; assuming EPSG:4326 (WGS84)", vector_path
+            )
+            vec_crs = CRS.from_epsg(4326).to_dict()
+        transformer = None
+        if raster_crs and vec_crs and vec_crs != raster_crs.to_dict():
+            logger.info(
+                "reprojecting vector geometries from %s -> %s for %s",
+                vec_crs,
+                raster_crs.to_dict(),
+                vector_path,
+            )
+            transformer = Transformer.from_crs(
+                vec_crs, raster_crs.to_dict(), always_xy=True
+            )
+        geoms = []
+        for feat in shp:
+            geom = feat["geometry"]
+            if geom is None:
+                continue
+            geom_obj = shape(geom)
+            if transformer is not None:
+                geom_obj = shp_transform(transformer.transform, geom_obj)
+            geoms.append(geom_obj)
+
+    tree = STRtree(geoms) if geoms else None
+    cached_value = (tree, geoms)
+    _VECTOR_GEOM_CACHE[cache_key] = cached_value
+    return cached_value
+
+
 def rasterize_vector_labels(
     vector_path: str | list[str],
     ref_raster_path: str,
@@ -183,48 +235,58 @@ def rasterize_vector_labels(
             out_shape = (src.height, src.width)
             transform = src.transform
         raster_crs = src.crs
+        raster_bounds = src.bounds
     gt_mask = np.zeros(out_shape, dtype="uint8")
+    raster_box = box(
+        raster_bounds.left,
+        raster_bounds.bottom,
+        raster_bounds.right,
+        raster_bounds.top,
+    )
 
     for vp in vector_paths:
-        with fiona.open(vp, "r") as shp:
-            vec_crs = shp.crs
-            if not vec_crs:
-                logger.warning(
-                    "vector CRS missing for %s; assuming EPSG:4326 (WGS84)", vp
-                )
-                vec_crs = CRS.from_epsg(4326).to_dict()
-            transformer = None
-            if raster_crs and vec_crs and vec_crs != raster_crs.to_dict():
-                logger.info(
-                    "reprojecting vector geometries from %s -> %s for %s",
-                    vec_crs,
-                    raster_crs.to_dict(),
-                    vp,
-                )
-                transformer = Transformer.from_crs(
-                    vec_crs, raster_crs.to_dict(), always_xy=True
-                )
-            shapes = []
-            for feat in shp:
-                geom = feat["geometry"]
-                if transformer is not None:
-                    geom_obj = shape(geom)
-                    geom_obj = shp_transform(transformer.transform, geom_obj)
-                    geom = mapping(geom_obj)
-                shapes.append((geom, burn_value))
-
-        if not shapes:
+        with perf_span(
+            "rasterize_vector_labels",
+            substage="load_cached_geometries",
+            extra={"vector_path": vp},
+        ):
+            tree, geoms = _load_vector_geometries_for_raster(vp, raster_crs)
+        if tree is None or not geoms:
             logger.warning("no geometries found in %s", vp)
             continue
+        with perf_span(
+            "rasterize_vector_labels",
+            substage="query_tile_geometries",
+            extra={"vector_path": vp},
+        ):
+            hits = tree.query(raster_box)
+            if len(hits) == 0:
+                continue
+            if isinstance(hits[0], (int, np.integer)):
+                candidates = [geoms[int(idx)] for idx in hits]
+            else:
+                candidates = list(hits)
+            shapes = [
+                (mapping(geom), burn_value)
+                for geom in candidates
+                if geom.intersects(raster_box)
+            ]
+        if not shapes:
+            continue
 
-        mask_i = rfeatures.rasterize(
-            shapes=shapes,
-            out_shape=out_shape,
-            transform=transform,
-            fill=0,
-            all_touched=True,
-            dtype="uint8",
-        )
+        with perf_span(
+            "rasterize_vector_labels",
+            substage="rasterize_selected_geometries",
+            extra={"vector_path": vp, "shape_count": len(shapes)},
+        ):
+            mask_i = rfeatures.rasterize(
+                shapes=shapes,
+                out_shape=out_shape,
+                transform=transform,
+                fill=0,
+                all_touched=True,
+                dtype="uint8",
+            )
         gt_mask = np.maximum(gt_mask, mask_i)
     time_end("rasterize_vector_labels", t0)
     return gt_mask

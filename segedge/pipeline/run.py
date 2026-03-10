@@ -17,7 +17,12 @@ from ..core.io_utils import (
     count_shapefile_features,
 )
 from ..core.logging_utils import setup_logging
-from ..core.timing_utils import time_end, time_start
+from ..core.timing_utils import (
+    configure_performance_logging,
+    emit_performance_summary,
+    time_end,
+    time_start,
+)
 from .common import init_model, resolve_tiles_from_gt_presence
 from .inference_flow import resolve_inference_tiles
 from .runtime_utils import (
@@ -105,6 +110,10 @@ def _create_run_directories() -> dict[str, str]:
     cfg.io.paths.best_settings_path = os.path.join(run_dir, "best_settings.yml")
     cfg.io.paths.log_path = os.path.join(run_dir, "run.log")
     setup_logging(cfg.io.paths.log_path)
+    configure_performance_logging(
+        os.path.join(run_dir, "performance.jsonl"),
+        run_id=os.path.basename(run_dir),
+    )
     return {
         "run_dir": run_dir,
         "plot_dir": plot_dir,
@@ -626,6 +635,7 @@ def main():
             inference_tiles=list(common["consolidation_tiles"]),
         )
 
+    emit_performance_summary("run_complete")
     time_end("main (total)", t0_main)
 
 

@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Add structured `performance.jsonl` logging for inference internals, cache GT vector geometries by CRS, stream XGB cached features more lazily, and refactor novel-proposal evaluation onto local component crops.
+- Files touched: `segedge/core/timing_utils.py`, `segedge/core/io_utils.py`, `segedge/core/feature_ops/cache.py`, `segedge/core/feature_ops/extraction.py`, `segedge/core/xdboost.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/postprocess.py`, `segedge/pipeline/runtime/tile_context.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: Make long inference runs measurable at the function-internal level and reduce the dominant CPU overhead without adding new runtime knobs.
+- Problems fixed: Each run now writes machine-readable per-span performance data alongside `run.log`, holdout inference records tile/phase-aware timing summaries, GT vector reprojection work is reused across tiles, XGB-only inference no longer materializes every cached feature array up front, and novel-proposal analysis now evaluates components from local bounding boxes instead of rebuilding full-image masks for every candidate.
+
 - Description: Add a manual `io.inference.score_prior` that boosts XGB scores inside `SOURCE_LABEL_RASTER` pixels during the final holdout/inference phase only.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/workflows/shared.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Allow manual recall-oriented score adjustment inside known source-label regions without affecting validation metrics or threshold tuning.

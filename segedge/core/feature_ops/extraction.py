@@ -8,8 +8,12 @@ import numpy as np
 import torch
 
 from ..config_loader import cfg
-from ..timing_utils import time_end, time_start
-from .cache import load_tile_features_if_valid, save_tile_features
+from ..timing_utils import perf_span, time_end, time_start
+from .cache import (
+    inspect_tile_features_if_valid,
+    load_tile_features_if_valid,
+    save_tile_features,
+)
 from .fusion import l2_normalize
 from .spec import hybrid_feature_spec_hash
 from .tiling import crop_to_multiple_of_ps, tile_iterator
@@ -111,6 +115,7 @@ def prefetch_features_single_scale_image(
     aggregate_layers=None,
     feature_dir: str | None = None,
     image_id: str | None = None,
+    materialize_cached: bool = True,
 ):
     """Precompute and cache all tile features for an image.
 
@@ -134,14 +139,19 @@ def prefetch_features_single_scale_image(
             return
         if batch_size <= 1:
             for y_i, x_i, img_i, h_i, w_i in items:
-                feats_tile, hp_i, wp_i = extract_patch_features_single_scale(
-                    img_i,
-                    model,
-                    processor,
-                    device,
-                    ps=ps,
-                    aggregate_layers=aggregate_layers,
-                )
+                with perf_span(
+                    "prefetch_features_single_scale_image",
+                    substage="extract_single_tile_features",
+                    extra={"image_id": image_id, "y": y_i, "x": x_i},
+                ):
+                    feats_tile, hp_i, wp_i = extract_patch_features_single_scale(
+                        img_i,
+                        model,
+                        processor,
+                        device,
+                        ps=ps,
+                        aggregate_layers=aggregate_layers,
+                    )
                 computed_tiles += 1
                 if feature_dir is not None and image_id is not None:
                     meta = {
@@ -151,9 +161,14 @@ def prefetch_features_single_scale_image(
                         "w_eff": w_i,
                         "feature_spec_hash": hybrid_feature_spec_hash(),
                     }
-                    save_tile_features(
-                        feats_tile, feature_dir, image_id, y_i, x_i, meta=meta
-                    )
+                    with perf_span(
+                        "prefetch_features_single_scale_image",
+                        substage="save_computed_tile_features",
+                        extra={"image_id": image_id, "y": y_i, "x": x_i},
+                    ):
+                        save_tile_features(
+                            feats_tile, feature_dir, image_id, y_i, x_i, meta=meta
+                        )
                 cache[(y_i, x_i)] = {
                     "feats": feats_tile,
                     "h_eff": h_i,
@@ -167,24 +182,34 @@ def prefetch_features_single_scale_image(
             chunk = items[start : start + batch_size]
             imgs = [item[2] for item in chunk]
             if len(chunk) == 1:
-                feats_tile, hp_i, wp_i = extract_patch_features_single_scale(
-                    imgs[0],
-                    model,
-                    processor,
-                    device,
-                    ps=ps,
-                    aggregate_layers=aggregate_layers,
-                )
+                with perf_span(
+                    "prefetch_features_single_scale_image",
+                    substage="extract_single_tile_features",
+                    extra={"image_id": image_id, "batch_size": 1},
+                ):
+                    feats_tile, hp_i, wp_i = extract_patch_features_single_scale(
+                        imgs[0],
+                        model,
+                        processor,
+                        device,
+                        ps=ps,
+                        aggregate_layers=aggregate_layers,
+                    )
                 feats_list = [feats_tile]
             else:
-                feats_list, hp_i, wp_i = extract_patch_features_batch_single_scale(
-                    imgs,
-                    model,
-                    processor,
-                    device,
-                    ps=ps,
-                    aggregate_layers=aggregate_layers,
-                )
+                with perf_span(
+                    "prefetch_features_single_scale_image",
+                    substage="extract_batch_tile_features",
+                    extra={"image_id": image_id, "batch_size": len(chunk)},
+                ):
+                    feats_list, hp_i, wp_i = extract_patch_features_batch_single_scale(
+                        imgs,
+                        model,
+                        processor,
+                        device,
+                        ps=ps,
+                        aggregate_layers=aggregate_layers,
+                    )
             for (y_i, x_i, _img_i, h_i, w_i), feats_tile in zip(
                 chunk, feats_list, strict=True
             ):
@@ -197,9 +222,14 @@ def prefetch_features_single_scale_image(
                         "w_eff": w_i,
                         "feature_spec_hash": hybrid_feature_spec_hash(),
                     }
-                    save_tile_features(
-                        feats_tile, feature_dir, image_id, y_i, x_i, meta=meta
-                    )
+                    with perf_span(
+                        "prefetch_features_single_scale_image",
+                        substage="save_computed_tile_features",
+                        extra={"image_id": image_id, "y": y_i, "x": x_i},
+                    ):
+                        save_tile_features(
+                            feats_tile, feature_dir, image_id, y_i, x_i, meta=meta
+                        )
                 cache[(y_i, x_i)] = {
                     "feats": feats_tile,
                     "h_eff": h_i,
@@ -218,18 +248,46 @@ def prefetch_features_single_scale_image(
         if feature_dir is not None and image_id is not None:
             hp = h_eff // ps
             wp = w_eff // ps
-            feats_tile = load_tile_features_if_valid(
-                feature_dir,
-                image_id,
-                y,
-                x,
-                expected_hp=hp,
-                expected_wp=wp,
-                ps=ps,
-                resample_factor=resample_factor,
-            )
-            if feats_tile is not None:
-                cached_tiles += 1
+            with perf_span(
+                "prefetch_features_single_scale_image",
+                substage="validate_cached_tile",
+                extra={"image_id": image_id, "y": y, "x": x},
+            ):
+                if materialize_cached:
+                    feats_tile = load_tile_features_if_valid(
+                        feature_dir,
+                        image_id,
+                        y,
+                        x,
+                        expected_hp=hp,
+                        expected_wp=wp,
+                        ps=ps,
+                        resample_factor=resample_factor,
+                    )
+                    if feats_tile is not None:
+                        cached_tiles += 1
+                else:
+                    feature_path = inspect_tile_features_if_valid(
+                        feature_dir,
+                        image_id,
+                        y,
+                        x,
+                        expected_hp=hp,
+                        expected_wp=wp,
+                        ps=ps,
+                        resample_factor=resample_factor,
+                    )
+                    if feature_path is not None:
+                        cached_tiles += 1
+                        cache[(y, x)] = {
+                            "feats": None,
+                            "feature_path": feature_path,
+                            "h_eff": h_eff,
+                            "w_eff": w_eff,
+                            "hp": hp,
+                            "wp": wp,
+                        }
+                        continue
         if feats_tile is None:
             key = (h_eff, w_eff)
             pending.setdefault(key, []).append((y, x, img_c, h_eff, w_eff))

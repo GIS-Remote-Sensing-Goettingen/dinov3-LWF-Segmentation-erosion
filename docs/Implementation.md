@@ -32,6 +32,7 @@ Important behavior:
 - No training artifacts are built in this mode.
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
+- The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
 
 ### Manual training workflow
 Function: `segedge.pipeline.workflows.run_manual_training`
@@ -98,6 +99,7 @@ Its job is orchestration at the holdout-set level:
 - append new masks into rolling union shapefiles
 - append one processed record to `processed_tiles.jsonl`
 - write the rolling checkpoint after each completed tile
+- emit rolling summaries into `performance.jsonl` every 10 completed inference tiles
 
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 
@@ -136,6 +138,14 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
   - proposal exports and plots
   - per-tile metadata used by the outer holdout loop
 - Main value: all expensive per-tile inference happens in one place instead of being duplicated across workflows
+- Internal profiling now breaks this function down into:
+  - tile context load
+  - kNN/XGB streams
+  - CRF stage
+  - shadow stage
+  - novel proposals
+  - proposal export
+  - plot export
 
 ### `segedge.pipeline.runtime.checkpointing.write_rolling_best_config`
 - Inputs: stage name, tuned config, progress counts, optional fold and budget state
@@ -150,6 +160,7 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
 ## Feature and Runtime Packages
 ### `segedge/core/feature_ops`
 - `extraction.py`: DINO feature extraction and tile prefetch
+  - cached XGB-only inference tiles can now stay lazy and hand their `.npy` path to the scorer instead of loading the array up front
 - `tiling.py`: tile iteration and patch-grid alignment
 - `fusion.py`: hybrid feature assembly and XGB stat transforms
 - `cache.py`: on-disk feature cache format
@@ -160,7 +171,9 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
 - `roads.py`: cached road-mask rasterization and roads penalty application
 - `crf_eval.py`: CRF worker initialization and evaluation
 - `postprocess.py`: shadow filtering and proposal heuristics
+  - proposal filtering now works on connected-component bounding boxes and short-circuits expensive morphology for obvious failures
 - `tile_context.py`: per-tile image, label, GT, and SH-buffer loading
+  - GT vector geometries are cached per source path and target CRS before rasterization
 - `holdout_inference.py`: per-tile inference logic
 - `checkpointing.py`: rolling checkpoint persistence
 - `phase_metrics.py`: weighted summaries and phase log markers

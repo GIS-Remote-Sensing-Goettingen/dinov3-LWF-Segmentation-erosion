@@ -18,6 +18,7 @@ from .features import (
     tile_iterator,
 )
 from .metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
+from .timing_utils import perf_span
 
 logger = logging.getLogger(__name__)
 
@@ -596,69 +597,119 @@ def xgb_score_image_b(
         )
 
     for tile_entry in tile_iter:
-        if prefetched_tiles is not None:
-            y, x, feat_info = tile_entry
-            feats_tile = feat_info["feats"]
-            h_eff = feat_info["h_eff"]
-            w_eff = feat_info["w_eff"]
-            hp = feat_info["hp"]
-            wp = feat_info["wp"]
-            img_c = img_b[y : y + h_eff, x : x + w_eff]
-        else:
-            y, x, img_tile = tile_entry
-            img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
-            if h_eff < ps or w_eff < ps:
-                continue
-            hp = h_eff // ps
-            wp = w_eff // ps
-            feats_tile = load_tile_features_if_valid(
-                feature_dir,
-                image_id_b,
-                y,
-                x,
-                expected_hp=hp,
-                expected_wp=wp,
-                ps=ps,
-                resample_factor=int(cfg.model.backbone.resample_factor or 1),
-            )
-            if feats_tile is None:
-                continue
-            img_c = img_c[:h_eff, :w_eff]
+        with perf_span("xgb_score_image_b", substage="tile_loop"):
+            if prefetched_tiles is not None:
+                y, x, feat_info = tile_entry
+                feats_tile = feat_info["feats"]
+                h_eff = feat_info["h_eff"]
+                w_eff = feat_info["w_eff"]
+                hp = feat_info["hp"]
+                wp = feat_info["wp"]
+                img_c = img_b[y : y + h_eff, x : x + w_eff]
+                if feats_tile is None and feat_info.get("feature_path"):
+                    with perf_span(
+                        "xgb_score_image_b",
+                        substage="load_cached_feature_array",
+                        extra={"y": y, "x": x},
+                    ):
+                        feats_tile = np.load(
+                            feat_info["feature_path"], mmap_mode="r"
+                        ).astype(np.float32, copy=False)
+            else:
+                y, x, img_tile = tile_entry
+                img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
+                if h_eff < ps or w_eff < ps:
+                    continue
+                hp = h_eff // ps
+                wp = w_eff // ps
+                with perf_span(
+                    "xgb_score_image_b",
+                    substage="load_cached_feature_array",
+                    extra={"y": y, "x": x},
+                ):
+                    feats_tile = load_tile_features_if_valid(
+                        feature_dir,
+                        image_id_b,
+                        y,
+                        x,
+                        expected_hp=hp,
+                        expected_wp=wp,
+                        ps=ps,
+                        resample_factor=int(cfg.model.backbone.resample_factor or 1),
+                    )
+                if feats_tile is None:
+                    continue
+                img_c = img_c[:h_eff, :w_eff]
 
-        if context_radius and context_radius > 0:
-            feats_tile = add_local_context_mean(feats_tile, int(context_radius))
-        feats_tile, _ = fuse_patch_features(
-            feats_tile,
-            img_c,
-            ps,
-            mode="xgb",
-            xgb_feature_stats=xgb_feature_stats,
-            return_layout=False,
-        )
+            if context_radius and context_radius > 0:
+                with perf_span(
+                    "xgb_score_image_b",
+                    substage="local_context_mean",
+                    extra={"y": y, "x": x},
+                ):
+                    feats_tile = add_local_context_mean(feats_tile, int(context_radius))
+            with perf_span(
+                "xgb_score_image_b",
+                substage="feature_fusion",
+                extra={"y": y, "x": x},
+            ):
+                feats_tile, _ = fuse_patch_features(
+                    feats_tile,
+                    img_c,
+                    ps,
+                    mode="xgb",
+                    xgb_feature_stats=xgb_feature_stats,
+                    return_layout=False,
+                )
 
-        if hp is None or wp is None:
-            logger.warning(
-                "missing patch dimensions for tile y=%s x=%s; skipping", y, x
-            )
-            continue
-        flat_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(
-            np.float32, copy=False
-        )
-        try:
-            scores_flat = bst.inplace_predict(flat_feats)
-        except Exception:
-            dtest = xgb.DMatrix(flat_feats)
-            scores_flat = bst.predict(dtest)
-        scores_patch = np.asarray(scores_flat, dtype=np.float32).reshape(hp, wp)
-        scores_tile = resize(
-            scores_patch,
-            (h_eff, w_eff),
-            order=1,
-            preserve_range=True,
-            anti_aliasing=True,
-        ).astype(np.float32)
-        score_full[y : y + h_eff, x : x + w_eff] += scores_tile
-        weight_full[y : y + h_eff, x : x + w_eff] += 1.0
+            if hp is None or wp is None:
+                logger.warning(
+                    "missing patch dimensions for tile y=%s x=%s; skipping", y, x
+                )
+                continue
+            with perf_span(
+                "xgb_score_image_b",
+                substage="flatten_features",
+                extra={"y": y, "x": x},
+            ):
+                flat_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(
+                    np.float32, copy=False
+                )
+            try:
+                with perf_span(
+                    "xgb_score_image_b",
+                    substage="predict_inplace",
+                    extra={"y": y, "x": x},
+                ):
+                    scores_flat = bst.inplace_predict(flat_feats)
+            except Exception:
+                with perf_span(
+                    "xgb_score_image_b",
+                    substage="predict_dmatrix_fallback",
+                    extra={"y": y, "x": x},
+                ):
+                    dtest = xgb.DMatrix(flat_feats)
+                    scores_flat = bst.predict(dtest)
+            scores_patch = np.asarray(scores_flat, dtype=np.float32).reshape(hp, wp)
+            with perf_span(
+                "xgb_score_image_b",
+                substage="resize_patch_scores",
+                extra={"y": y, "x": x},
+            ):
+                scores_tile = resize(
+                    scores_patch,
+                    (h_eff, w_eff),
+                    order=1,
+                    preserve_range=True,
+                    anti_aliasing=True,
+                ).astype(np.float32)
+            with perf_span(
+                "xgb_score_image_b",
+                substage="accumulate_scores",
+                extra={"y": y, "x": x},
+            ):
+                score_full[y : y + h_eff, x : x + w_eff] += scores_tile
+                weight_full[y : y + h_eff, x : x + w_eff] += 1.0
 
     mask_nonzero = weight_full > 0
     score_full[mask_nonzero] /= weight_full[mask_nonzero]
