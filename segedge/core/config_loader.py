@@ -305,6 +305,8 @@ class NovelProposalsConfig:
     max_width_m: float
     min_skeleton_ratio: float
     min_pca_ratio: float
+    width_bonus_per_pca: float
+    hard_width_cap_m: float
     max_circularity: float
     min_mean_score: float
     max_road_overlap: float
@@ -840,6 +842,67 @@ def _load_postprocess_config(postprocess: dict[str, Any]) -> PostprocessConfig:
         "balanced",
     )
     heuristic_defaults = _novel_heuristic_defaults(heuristic_preset)
+    novel_proposals = NovelProposalsConfig(
+        enabled=bool(post_novel.get("enabled", False)),
+        heuristic_preset=heuristic_preset,
+        search_scope=_as_enum(
+            post_novel.get("search_scope", "sh_buffer"),
+            "postprocess.novel_proposals.search_scope",
+            {"sh_buffer", "whole_tile"},
+            "sh_buffer",
+        ),
+        source=_as_enum(
+            post_novel.get("source", "champion_mask"),
+            "postprocess.novel_proposals.source",
+            {"champion_mask", "champion_score"},
+            "champion_mask",
+        ),
+        score_threshold=(
+            None
+            if post_novel.get("score_threshold") is None
+            else float(post_novel.get("score_threshold"))
+        ),
+        min_area_px=int(
+            post_novel.get("min_area_px", heuristic_defaults["min_area_px"])
+        ),
+        min_length_m=float(
+            post_novel.get("min_length_m", heuristic_defaults["min_length_m"])
+        ),
+        max_width_m=float(
+            post_novel.get("max_width_m", heuristic_defaults["max_width_m"])
+        ),
+        min_skeleton_ratio=float(
+            post_novel.get(
+                "min_skeleton_ratio", heuristic_defaults["min_skeleton_ratio"]
+            )
+        ),
+        min_pca_ratio=float(
+            post_novel.get("min_pca_ratio", heuristic_defaults["min_pca_ratio"])
+        ),
+        width_bonus_per_pca=float(post_novel.get("width_bonus_per_pca", 1.0)),
+        hard_width_cap_m=float(
+            post_novel.get(
+                "hard_width_cap_m",
+                max(20.0, heuristic_defaults["max_width_m"]),
+            )
+        ),
+        max_circularity=float(
+            post_novel.get("max_circularity", heuristic_defaults["max_circularity"])
+        ),
+        min_mean_score=float(
+            post_novel.get("min_mean_score", heuristic_defaults["min_mean_score"])
+        ),
+        max_road_overlap=float(
+            post_novel.get("max_road_overlap", heuristic_defaults["max_road_overlap"])
+        ),
+        connectivity=int(post_novel.get("connectivity", 2)),
+    )
+    if novel_proposals.width_bonus_per_pca < 0.0:
+        raise ValueError("postprocess.novel_proposals.width_bonus_per_pca must be >= 0")
+    if novel_proposals.hard_width_cap_m < novel_proposals.max_width_m:
+        raise ValueError(
+            "postprocess.novel_proposals.hard_width_cap_m must be >= max_width_m"
+        )
     return PostprocessConfig(
         fill_holes_xgb=bool(postprocess.get("fill_holes_xgb", False)),
         shadow=ShadowConfig(
@@ -856,56 +919,7 @@ def _load_postprocess_config(postprocess: dict[str, Any]) -> PostprocessConfig:
                 post_roads["penalty_values"], "postprocess.roads.penalty_values"
             )
         ),
-        novel_proposals=NovelProposalsConfig(
-            enabled=bool(post_novel.get("enabled", False)),
-            heuristic_preset=heuristic_preset,
-            search_scope=_as_enum(
-                post_novel.get("search_scope", "sh_buffer"),
-                "postprocess.novel_proposals.search_scope",
-                {"sh_buffer", "whole_tile"},
-                "sh_buffer",
-            ),
-            source=_as_enum(
-                post_novel.get("source", "champion_mask"),
-                "postprocess.novel_proposals.source",
-                {"champion_mask", "champion_score"},
-                "champion_mask",
-            ),
-            score_threshold=(
-                None
-                if post_novel.get("score_threshold") is None
-                else float(post_novel.get("score_threshold"))
-            ),
-            min_area_px=int(
-                post_novel.get("min_area_px", heuristic_defaults["min_area_px"])
-            ),
-            min_length_m=float(
-                post_novel.get("min_length_m", heuristic_defaults["min_length_m"])
-            ),
-            max_width_m=float(
-                post_novel.get("max_width_m", heuristic_defaults["max_width_m"])
-            ),
-            min_skeleton_ratio=float(
-                post_novel.get(
-                    "min_skeleton_ratio", heuristic_defaults["min_skeleton_ratio"]
-                )
-            ),
-            min_pca_ratio=float(
-                post_novel.get("min_pca_ratio", heuristic_defaults["min_pca_ratio"])
-            ),
-            max_circularity=float(
-                post_novel.get("max_circularity", heuristic_defaults["max_circularity"])
-            ),
-            min_mean_score=float(
-                post_novel.get("min_mean_score", heuristic_defaults["min_mean_score"])
-            ),
-            max_road_overlap=float(
-                post_novel.get(
-                    "max_road_overlap", heuristic_defaults["max_road_overlap"]
-                )
-            ),
-            connectivity=int(post_novel.get("connectivity", 2)),
-        ),
+        novel_proposals=novel_proposals,
     )
 
 

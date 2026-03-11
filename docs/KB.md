@@ -52,9 +52,11 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `io.inference.plots` can disable individual inference plot files without changing masks, checkpoints, or `plot_every` cadence.
 - The unified inference plot uses plot-only XGB raw/CRF preview masks so it can show activity outside the SH/source-label buffer without changing runtime masks, metrics, or shapefile outputs.
 - The unified inference plot now merges accepted and rejected proposals into one overlay panel: accepted regions are light blue and rejected regions are light red.
+- The unified inference plot labels the source-label panel as `Administrative buffered labels` and no longer includes separate RGB or GT panels.
 - Each `output/run_*/` directory now contains a copy of the active `config.yml`.
 - `search.crf.trimap_band_pixels_values` controls how far XGB CRF is allowed to expand/shrink the coarse XGB mask boundary when filling holes against RGB edges.
 - `postprocess.fill_holes_xgb` fills enclosed holes in the thresholded XGB mask before XGB trimap CRF builds its boundary band.
+- Outside-buffer novel proposals can now grant extra allowed width to strongly elongated shapes through `postprocess.novel_proposals.width_bonus_per_pca`, while `hard_width_cap_m` still blocks very wide blobs.
 - `io.inference.plot_every` samples holdout plot rendering over pending tiles without changing inference masks or checkpoint cadence.
 - Inference PNG exports use a higher DPI than before, so the saved plots are less pixelated.
 - Holdout inference is interruption-safe at tile granularity.

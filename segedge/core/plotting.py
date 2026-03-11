@@ -8,6 +8,7 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from scipy.ndimage import binary_dilation, binary_erosion
 
@@ -72,6 +73,37 @@ def _proposal_unified_overlay(
     overlay = _overlay_mask(img_rgb, accepted_mask, (140, 235, 255), alpha=0.45)
     overlay = _overlay_mask(overlay, rejected_mask, (255, 170, 170), alpha=0.45)
     return overlay
+
+
+def _add_proposal_legend(
+    ax, legend_items: list[tuple[str, tuple[int, int, int]]]
+) -> None:
+    """Add a compact legend for proposal overlays.
+
+    Examples:
+        >>> fig, ax = plt.subplots()
+        >>> _add_proposal_legend(ax, [("Accepted", (140, 235, 255))])
+        >>> len(ax.get_legend().texts)
+        1
+        >>> plt.close(fig)
+    """
+    handles = [
+        Patch(
+            facecolor=np.array(rgb, dtype=np.float32) / 255.0,
+            edgecolor="none",
+            alpha=0.55,
+            label=label,
+        )
+        for label, rgb in legend_items
+    ]
+    ax.legend(
+        handles=handles,
+        loc="lower left",
+        fontsize=9,
+        frameon=True,
+        facecolor="white",
+        framealpha=0.85,
+    )
 
 
 def save_core_qualitative_plot(
@@ -288,6 +320,14 @@ def save_proposal_overlay_plot(
         )
     )
     ax.axis("off")
+    _add_proposal_legend(
+        ax,
+        [
+            ("Inside auto", inside_auto_rgb),
+            ("Accepted", accept_rgb),
+            ("Rejected", reject_rgb),
+        ],
+    )
     if proposal_records:
         for rec in proposal_records:
             row = rec.get("centroid_row")
@@ -442,7 +482,7 @@ def save_plot(
 
     if show_labels:
         axs[0, 2].imshow(labels_sh > 0, cmap="gray")
-        axs[0, 2].set_title("SOURCE_LABEL_RASTER (reprojected)")
+        axs[0, 2].set_title("Administrative buffered labels (reprojected)")
         axs[0, 2].axis("off")
 
     overlay_raw = img_b.copy()
@@ -648,11 +688,8 @@ def save_unified_plot(
         return f"{base} IoU={m['iou']:.3f}, F1={m['f1']:.3f}"
 
     panels = []
-    panels.append(("RGB", img_b, None))
     if labels_sh is not None:
-        panels.append(("Source labels", labels_sh > 0, "gray"))
-    if gt_available:
-        panels.append(("GT" if show_metrics else "GT", gt_mask > 0, "gray"))
+        panels.append(("Administrative buffered labels", labels_sh > 0, "gray"))
     if similarity_map is not None:
         panels.append(
             ("DINO similarity", _normalize_heatmap(similarity_map), "coolwarm")
@@ -728,6 +765,14 @@ def save_unified_plot(
         else:
             axs[r, c].imshow(img, cmap=cmap)
         axs[r, c].set_title(title)
+        if title == "Proposals":
+            _add_proposal_legend(
+                axs[r, c],
+                [
+                    ("Accepted", (140, 235, 255)),
+                    ("Rejected", (255, 170, 170)),
+                ],
+            )
         axs[r, c].axis("off")
         if (
             skeleton is not None

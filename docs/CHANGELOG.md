@@ -15,10 +15,15 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Let outside-buffer novel proposals trade some extra width for stronger elongation while keeping an absolute width cap.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/postprocess.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Allow obviously elongated candidates to survive moderate thickness without opening the door to arbitrary wide blobs.
+- Problems fixed: Outside-buffer proposals no longer fail on width alone when `pca_ratio` is strong enough, new `width_bonus_per_pca` and `hard_width_cap_m` settings make that tradeoff explicit, and the old hard-width behavior remains available by setting `width_bonus_per_pca` to `0`.
+
 - Description: Improve inference plot readability and consolidate proposal visualization in the unified plot.
 - Files touched: `segedge/core/plotting.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Make the unified plot show more of the XGB behavior outside the label buffer, reduce proposal-panel clutter, and export less pixelated images for review.
-- Problems fixed: Unified inference plots can now show plot-only XGB raw/CRF preview masks outside the SH/source-label buffer without changing saved masks or metrics, accepted and rejected proposals are merged into one overlay panel with clearer colors, and inference plot PNGs are saved at a higher DPI.
+- Problems fixed: Unified inference plots can now show plot-only XGB raw/CRF preview masks outside the SH/source-label buffer without changing saved masks or metrics, accepted and rejected proposals are merged into one overlay panel with clearer colors, proposal plots now include an in-plot legend for the overlay colors, source-label panels are labeled `Administrative buffered labels`, standalone RGB/GT panels are removed from the unified inference layout, and inference plot PNGs are saved at a higher DPI.
 
 - Description: Add per-plot inference toggles under `io.inference.plots` and copy the active `config.yml` into each run directory.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`

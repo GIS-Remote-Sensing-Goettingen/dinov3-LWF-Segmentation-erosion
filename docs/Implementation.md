@@ -113,7 +113,8 @@ That ordering is deliberate: if the job stops after a tile finishes, the union s
 
 When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply manual XGB score multipliers separately inside and outside `SOURCE_LABEL_RASTER` pixels. This prior is not used during validation inference or tuning.
 `io.inference.plots` can disable individual inference plot types while leaving `plot_every` as the outer cadence control.
-The unified inference plot now renders accepted and rejected proposals in one combined subplot, with accepted regions shown as a light-blue transparent overlay and rejected regions shown as a light-red transparent overlay. Plot exports also use a higher DPI so the saved PNGs are less pixelated.
+The unified inference plot now renders accepted and rejected proposals in one combined subplot, with accepted regions shown as a light-blue transparent overlay and rejected regions shown as a light-red transparent overlay. It also labels the source-label panel as `Administrative buffered labels`, omits the standalone RGB and GT panels, and uses a higher DPI so the saved PNGs are less pixelated.
+Outside-buffer novel proposals can also relax their width limit when `pca_ratio` is well above `min_pca_ratio`: `width_bonus_per_pca` increases the allowed width for highly elongated components, while `hard_width_cap_m` still enforces an absolute maximum width.
 When the optimized XGB scorer is active, the first 3 pending holdout tiles are also compared against the legacy scorer. If the optimized and legacy score maps differ meaningfully, the run logs the mismatch and automatically falls back to the legacy scorer for the rest of that holdout phase.
 
 ## Major Functions

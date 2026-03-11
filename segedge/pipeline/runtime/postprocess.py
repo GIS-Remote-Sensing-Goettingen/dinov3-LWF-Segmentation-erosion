@@ -292,19 +292,44 @@ def _evaluate_outside_component(
         col_offset=col_offset,
         basic_metrics=basic_metrics,
     )
+    allowed_width_m = _allowed_component_width_m(
+        pca_ratio=full_metrics["pca_ratio"],
+        proposal_cfg=proposal_cfg,
+    )
     checks.update(
         {
             "min_length_m": full_metrics["length_m"]
             >= float(proposal_cfg.min_length_m),
-            "max_width_m": full_metrics["mean_width_m"]
-            <= float(proposal_cfg.max_width_m),
+            "max_width_m": full_metrics["mean_width_m"] <= allowed_width_m,
             "min_skeleton_ratio": full_metrics["skeleton_ratio"]
             >= float(proposal_cfg.min_skeleton_ratio),
             "max_circularity": full_metrics["circularity"]
             <= float(proposal_cfg.max_circularity),
         }
     )
+    full_metrics["allowed_width_m"] = float(allowed_width_m)
     return local_id, bbox_slice, comp_local, full_metrics, checks
+
+
+def _allowed_component_width_m(*, pca_ratio: float, proposal_cfg) -> float:
+    """Return the elongation-adjusted width allowance for one proposal.
+
+    Examples:
+        >>> class P:
+        ...     max_width_m = 10.0
+        ...     min_pca_ratio = 3.0
+        ...     width_bonus_per_pca = 1.0
+        ...     hard_width_cap_m = 20.0
+        >>> _allowed_component_width_m(pca_ratio=3.0, proposal_cfg=P())
+        10.0
+        >>> _allowed_component_width_m(pca_ratio=8.0, proposal_cfg=P())
+        15.0
+    """
+    base_width_m = float(proposal_cfg.max_width_m)
+    hard_cap_m = float(proposal_cfg.hard_width_cap_m)
+    bonus_per_pca = float(proposal_cfg.width_bonus_per_pca)
+    pca_bonus = max(float(pca_ratio) - float(proposal_cfg.min_pca_ratio), 0.0)
+    return min(hard_cap_m, base_width_m + bonus_per_pca * pca_bonus)
 
 
 def _component_map(

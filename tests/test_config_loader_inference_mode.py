@@ -205,3 +205,42 @@ def test_postprocess_fill_holes_xgb_parses_from_config(tmp_path):
     loaded = load_config(cfg_path)
 
     assert loaded.postprocess.fill_holes_xgb is True
+
+
+def test_novel_proposals_width_bonus_and_hard_cap_parse_from_config(tmp_path):
+    """Novel proposal width compensation settings should parse explicitly.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["postprocess"]["novel_proposals"]["width_bonus_per_pca"] = 1.25
+    raw["postprocess"]["novel_proposals"]["hard_width_cap_m"] = 18.0
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.postprocess.novel_proposals.width_bonus_per_pca == 1.25
+    assert loaded.postprocess.novel_proposals.hard_width_cap_m == 18.0
+
+
+def test_novel_proposals_hard_width_cap_must_cover_base_width(tmp_path):
+    """Hard width cap must be at least the base width allowance.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["postprocess"]["novel_proposals"]["max_width_m"] = 12.0
+    raw["postprocess"]["novel_proposals"]["hard_width_cap_m"] = 10.0
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    try:
+        load_config(cfg_path)
+    except ValueError as exc:
+        assert "hard_width_cap_m" in str(exc)
+    else:
+        raise AssertionError("expected hard_width_cap_m validation error")

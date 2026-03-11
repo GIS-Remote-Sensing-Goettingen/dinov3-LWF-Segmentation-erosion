@@ -21,6 +21,7 @@ from segedge.pipeline.inference_flow import (
     run_holdout_inference,
 )
 from segedge.pipeline.run import _maybe_run_holdout_inference
+from segedge.pipeline.runtime import postprocess as postprocess_module
 from segedge.pipeline.runtime.checkpointing import write_rolling_best_config
 from segedge.pipeline.runtime.holdout_inference import (
     _apply_inference_score_prior,
@@ -28,6 +29,10 @@ from segedge.pipeline.runtime.holdout_inference import (
     _compute_xgb_stream,
     _postprocess_stream_mask,
     _save_holdout_plots,
+)
+from segedge.pipeline.runtime.postprocess import (
+    _allowed_component_width_m,
+    _evaluate_outside_component,
 )
 
 
@@ -489,6 +494,116 @@ def test_build_xgb_plot_preview_masks_show_unclipped_regions(monkeypatch):
 
     assert out["xgb_raw_plot"][0, 1]
     assert out["xgb_crf_plot"][0, 1]
+
+
+def test_allowed_component_width_m_grows_with_pca_ratio():
+    """Stronger elongation should permit a wider proposal up to the hard cap.
+
+    Examples:
+        >>> True
+        True
+    """
+
+    class _ProposalCfg:
+        max_width_m = 10.0
+        min_pca_ratio = 3.0
+        width_bonus_per_pca = 1.0
+        hard_width_cap_m = 20.0
+
+    assert (
+        _allowed_component_width_m(pca_ratio=3.0, proposal_cfg=_ProposalCfg()) == 10.0
+    )
+    assert (
+        _allowed_component_width_m(pca_ratio=8.0, proposal_cfg=_ProposalCfg()) == 15.0
+    )
+    assert (
+        _allowed_component_width_m(pca_ratio=30.0, proposal_cfg=_ProposalCfg()) == 20.0
+    )
+
+
+def test_evaluate_outside_component_allows_extra_width_for_strong_elongation(
+    monkeypatch,
+):
+    """Highly elongated outside proposals may offset moderate thickness.
+
+    Examples:
+        >>> True
+        True
+    """
+
+    class _ProposalCfg:
+        min_area_px = 5
+        min_length_m = 15.0
+        max_width_m = 10.0
+        min_skeleton_ratio = 8.0
+        min_pca_ratio = 3.0
+        width_bonus_per_pca = 1.0
+        hard_width_cap_m = 20.0
+        max_circularity = 0.3
+        min_mean_score = 0.2
+        max_road_overlap = 0.8
+
+    labels = np.array(
+        [
+            [1, 1, 1],
+            [1, 1, 1],
+            [0, 0, 0],
+        ],
+        dtype=np.int32,
+    )
+    score_map = np.full(labels.shape, 0.9, dtype=np.float32)
+    basic_metrics = {
+        "area_px": 6.0,
+        "length_px": 0.0,
+        "length_m": 0.0,
+        "mean_width_px": 0.0,
+        "mean_width_m": 0.0,
+        "skeleton_ratio": 0.0,
+        "pca_ratio": 8.0,
+        "circularity": 1.0,
+        "mean_score": 0.9,
+        "road_overlap": 0.0,
+        "centroid_row": 0.5,
+        "centroid_col": 1.0,
+    }
+    full_metrics = {
+        **basic_metrics,
+        "length_px": 18.0,
+        "length_m": 18.0,
+        "mean_width_px": 0.0,
+        "mean_width_m": 12.0,
+        "skeleton_ratio": 9.0,
+        "circularity": 0.2,
+    }
+
+    def _fake_basic(*args, **kwargs):
+        return dict(basic_metrics)
+
+    def _fake_full(*args, **kwargs):
+        return dict(full_metrics)
+
+    monkeypatch.setattr(
+        postprocess_module,
+        "_compute_component_basic_metrics",
+        _fake_basic,
+    )
+    monkeypatch.setattr(
+        postprocess_module,
+        "_compute_component_shape_metrics",
+        _fake_full,
+    )
+    _, _, _, metrics, checks = _evaluate_outside_component(
+        1,
+        (slice(0, 2), slice(0, 3)),
+        labels,
+        score_map,
+        None,
+        1.0,
+        _ProposalCfg(),
+    )
+
+    assert metrics["allowed_width_m"] == 15.0
+    assert checks["max_width_m"] is True
 
 
 def test_write_rolling_best_config_exports_inside_and_outside_score_prior(
