@@ -3,7 +3,7 @@
 
 io:
   # true: train+tune then infer; false: load bundle and run inference only.
-  training: true
+  training: false
 
   inference:
     # In inference-only mode, load a previously saved model bundle from here.
