@@ -10,6 +10,7 @@ import rasterio
 from rasterio.transform import from_origin
 
 from segedge.core.config_loader import cfg
+from segedge.pipeline import common as common_module
 from segedge.pipeline.common import (
     filter_tiles_by_source_label_presence,
     resolve_tiles_from_gt_presence,
@@ -171,6 +172,88 @@ def test_filter_tiles_by_source_label_presence_keeps_all_when_unset(
 
     assert filtered_tiles == [str(tile_a), str(tile_b)]
     assert excluded_count == 0
+
+
+def test_filter_tiles_by_source_label_presence_reuses_cache_without_reopening_tiles(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """Repeated runs should reuse cached tile decisions when inputs are unchanged.
+
+    Examples:
+        >>> True
+        True
+    """
+    labels_path = tmp_path / "labels.tif"
+    tile_keep = tmp_path / "tile_keep.tif"
+    tile_drop = tmp_path / "tile_drop.tif"
+    labels = np.zeros((10, 20), dtype=np.uint8)
+    labels[:, :10] = 1
+    _write_test_raster(labels_path, left=0, top=10, width=20, data=labels)
+    _write_test_raster(tile_keep, left=0, top=10)
+    _write_test_raster(tile_drop, left=10, top=10)
+    monkeypatch.setattr(cfg.io.paths, "source_label_raster", str(labels_path))
+    monkeypatch.setattr(cfg.io.paths, "output_dir", str(tmp_path / "output"))
+
+    filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
+        [str(tile_keep), str(tile_drop)]
+    )
+
+    assert filtered_tiles == [str(tile_keep)]
+    assert excluded_count == 1
+
+    original_rio_open = common_module.rio_open
+
+    def _cached_only_open(path, *args, **kwargs):
+        if Path(path) in {tile_keep, tile_drop}:
+            raise AssertionError("tile raster should not be reopened on cache hit")
+        return original_rio_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(common_module, "rio_open", _cached_only_open)
+    with caplog.at_level(logging.INFO):
+        cached_tiles, cached_excluded = filter_tiles_by_source_label_presence(
+            [str(tile_keep), str(tile_drop)]
+        )
+
+    assert cached_tiles == [str(tile_keep)]
+    assert cached_excluded == 1
+    assert "source-label filter cache: reused 2/2 tile decisions" in caplog.text
+
+
+def test_filter_tiles_by_source_label_presence_invalidates_cache_for_changed_tile(
+    tmp_path,
+    monkeypatch,
+):
+    """Changing a tile should invalidate its cached source-label decision.
+
+    Examples:
+        >>> True
+        True
+    """
+    labels_path = tmp_path / "labels.tif"
+    tile_path = tmp_path / "tile.tif"
+    labels = np.zeros((10, 20), dtype=np.uint8)
+    labels[:, :10] = 1
+    _write_test_raster(labels_path, left=0, top=10, width=20, data=labels)
+    _write_test_raster(tile_path, left=0, top=10)
+    monkeypatch.setattr(cfg.io.paths, "source_label_raster", str(labels_path))
+    monkeypatch.setattr(cfg.io.paths, "output_dir", str(tmp_path / "output"))
+
+    filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
+        [str(tile_path)]
+    )
+    assert filtered_tiles == [str(tile_path)]
+    assert excluded_count == 0
+
+    _write_test_raster(tile_path, left=10, top=10)
+
+    filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
+        [str(tile_path)]
+    )
+
+    assert filtered_tiles == []
+    assert excluded_count == 1
 
 
 def test_resolve_tiles_from_gt_presence_prefilters_by_source_label_presence(

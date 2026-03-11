@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -40,6 +41,84 @@ logger = logging.getLogger(__name__)
 
 _GT_INDEX_CACHE: dict[tuple[tuple[str, ...], str], tuple[STRtree | None, list]] = {}
 _GT_CRS_LOGGED: set[str] = set()
+_SOURCE_LABEL_FILTER_CACHE_VERSION = 1
+
+
+def _source_label_filter_cache_path() -> str:
+    """Return the persisted cache path for source-label tile filtering.
+
+    Examples:
+        >>> _source_label_filter_cache_path().endswith(".json")
+        True
+    """
+    cache_dir = os.path.join(cfg.io.paths.output_dir, ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "source_label_tile_presence_cache.json")
+
+
+def _stat_signature(path: str) -> dict[str, int | str]:
+    """Return a compact metadata signature for cache invalidation.
+
+    Examples:
+        >>> callable(_stat_signature)
+        True
+    """
+    st = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "mtime_ns": int(st.st_mtime_ns),
+        "size": int(st.st_size),
+    }
+
+
+def _load_source_label_filter_cache(
+    raster_path: str,
+) -> tuple[dict[str, dict], dict[str, int | str], str]:
+    """Load the persisted tile-presence cache for the current raster.
+
+    Returns:
+        tuple[dict[str, dict], dict[str, int], str]: cached entries, raster
+        signature, and cache file path.
+    """
+    cache_path = _source_label_filter_cache_path()
+    raster_signature = _stat_signature(raster_path)
+    if not os.path.exists(cache_path):
+        return {}, raster_signature, cache_path
+    try:
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}, raster_signature, cache_path
+    if payload.get("version") != _SOURCE_LABEL_FILTER_CACHE_VERSION:
+        return {}, raster_signature, cache_path
+    if payload.get("raster_signature") != raster_signature:
+        return {}, raster_signature, cache_path
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}, raster_signature, cache_path
+    return entries, raster_signature, cache_path
+
+
+def _save_source_label_filter_cache(
+    cache_path: str,
+    raster_signature: dict[str, int | str],
+    entries: dict[str, dict],
+) -> None:
+    """Persist the source-label tile-presence cache atomically.
+
+    Examples:
+        >>> callable(_save_source_label_filter_cache)
+        True
+    """
+    payload = {
+        "version": _SOURCE_LABEL_FILTER_CACHE_VERSION,
+        "raster_signature": raster_signature,
+        "entries": entries,
+    }
+    tmp_path = f"{cache_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, sort_keys=True)
+    os.replace(tmp_path, cache_path)
 
 
 def _tile_has_gt(
@@ -222,6 +301,16 @@ def filter_tiles_by_source_label_presence(
     if not raster_path:
         return list(tile_paths), 0
 
+    try:
+        cached_entries, raster_signature, cache_path = _load_source_label_filter_cache(
+            raster_path
+        )
+    except OSError:
+        cached_entries, raster_signature, cache_path = {}, {}, ""
+    cache_entries = dict(cached_entries)
+    cache_hits = 0
+    cache_dirty = False
+
     with rio_open(raster_path) as src:
         raster_crs = src.crs
         raster_bounds = src.bounds
@@ -230,6 +319,18 @@ def filter_tiles_by_source_label_presence(
         filtered_paths = []
         excluded_count = 0
         for tile_path in tile_paths:
+            tile_signature = _stat_signature(tile_path)
+            cache_entry = cache_entries.get(tile_path)
+            if (
+                cache_entry is not None
+                and cache_entry.get("tile_signature") == tile_signature
+            ):
+                cache_hits += 1
+                if cache_entry.get("has_labels", False):
+                    filtered_paths.append(tile_path)
+                else:
+                    excluded_count += 1
+                continue
             with rio_open(tile_path) as tile_src:
                 tile_bounds = tile_src.bounds
                 tile_crs = tile_src.crs
@@ -267,10 +368,31 @@ def filter_tiles_by_source_label_presence(
             )
             if nodata is not None:
                 positive_mask &= np.asarray(label_data) != nodata
-            if np.any(positive_mask):
+            has_labels = bool(np.any(positive_mask))
+            cache_entries[tile_path] = {
+                "tile_signature": tile_signature,
+                "has_labels": has_labels,
+            }
+            cache_dirty = True
+            if has_labels:
                 filtered_paths.append(tile_path)
             else:
                 excluded_count += 1
+    if cache_path and cache_dirty:
+        try:
+            _save_source_label_filter_cache(cache_path, raster_signature, cache_entries)
+        except OSError:
+            logger.debug(
+                "source-label filter cache save failed: %s",
+                cache_path,
+                exc_info=True,
+            )
+    if cache_hits:
+        logger.info(
+            "source-label filter cache: reused %s/%s tile decisions",
+            cache_hits,
+            len(tile_paths),
+        )
     return filtered_paths, excluded_count
 
 

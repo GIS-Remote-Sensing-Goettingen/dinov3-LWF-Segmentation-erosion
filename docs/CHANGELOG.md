@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Cache per-tile `SOURCE_LABEL_RASTER` label-presence decisions under `output/.cache` so repeated folder/list inference runs stop reopening every candidate tile during startup filtering.
+- Files touched: `segedge/pipeline/common.py`, `tests/test_inference_flow.py`, `docs/CHANGELOG.md`
+- Reason: The inference bootstrap was spending several minutes rescanning thousands of candidate tiles before holdout processing even started.
+- Problems fixed: Repeated runs now reuse cached tile inclusion/exclusion decisions when the tile file and source-label raster metadata are unchanged, while changed tiles still invalidate and recheck safely.
+
 - Description: Speed up final inference with batched XGB prediction, per-image feature-cache manifests, deeper performance spans, a first-3-tiles XGB legacy guard, and `io.inference.plot_every` plot sampling.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/feature_ops/cache.py`, `segedge/core/feature_ops/extraction.py`, `segedge/core/feature_ops/fusion.py`, `segedge/core/xdboost.py`, `segedge/core/crf_utils.py`, `segedge/core/timing_utils.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/crf_eval.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/postprocess.py`, `segedge/pipeline/runtime/tile_context.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/workflows/shared.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_crf_utils.py`, `tests/test_inference_flow.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Reduce XGB/cache overhead in the holdout hot path while keeping an automatic correctness barrier and better profiling visibility for the next optimization pass.
