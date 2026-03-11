@@ -22,6 +22,8 @@ from .metrics_utils import compute_metrics_batch_cpu, compute_metrics_batch_gpu
 from .timing_utils import perf_span
 
 logger = logging.getLogger(__name__)
+_XGB_BATCH_ROW_BUDGET_PER_UNIT = 1024
+_XGB_BATCH_TILE_MULTIPLIER = 32
 
 
 def _gpu_error_message(exc: Exception) -> str:
@@ -564,10 +566,13 @@ def xgb_score_image_b(
 ):
     """Apply a trained XGBoost model to Image B and return a score map."""
     batch_tile_limit = max(1, int(cfg.runtime.feature_batch_size or 1))
+    batch_row_limit = max(1, batch_tile_limit * _XGB_BATCH_ROW_BUDGET_PER_UNIT)
+    pending_tile_limit = max(1, batch_tile_limit * _XGB_BATCH_TILE_MULTIPLIER)
     h_full, w_full = img_b.shape[:2]
     score_full = np.zeros((h_full, w_full), dtype=np.float32)
     weight_full = np.zeros((h_full, w_full), dtype=np.float32)
     pending_tiles: list[dict[str, np.ndarray | int]] = []
+    pending_rows = 0
 
     for tile_info in _iter_xgb_tile_payloads(
         img_b,
@@ -580,10 +585,16 @@ def xgb_score_image_b(
         context_radius=context_radius,
         xgb_feature_stats=xgb_feature_stats,
     ):
-        pending_tiles.append(tile_info)
-        if len(pending_tiles) >= batch_tile_limit:
+        tile_rows = int(tile_info["row_count"])
+        if pending_tiles and (
+            pending_rows + tile_rows > batch_row_limit
+            or len(pending_tiles) >= pending_tile_limit
+        ):
             _flush_xgb_prediction_batch(pending_tiles, bst, score_full, weight_full)
             pending_tiles.clear()
+            pending_rows = 0
+        pending_tiles.append(tile_info)
+        pending_rows += tile_rows
 
     if pending_tiles:
         _flush_xgb_prediction_batch(pending_tiles, bst, score_full, weight_full)
@@ -665,7 +676,8 @@ def _iter_xgb_tile_payloads(
 
             if feats_tile is None:
                 continue
-            feats_tile = np.asarray(feats_tile, dtype=np.float32)
+            if feats_tile.dtype != np.float32:
+                feats_tile = feats_tile.astype(np.float32, copy=False)
             if feats_tile.shape[:2] != (hp, wp):
                 logger.warning(
                     (
@@ -711,9 +723,7 @@ def _iter_xgb_tile_payloads(
                 substage="flatten_features",
                 extra={"y": y, "x": x},
             ):
-                flat_feats = feats_tile.reshape(-1, feats_tile.shape[-1]).astype(
-                    np.float32, copy=False
-                )
+                flat_feats = feats_tile.reshape(-1, feats_tile.shape[-1])
             yield {
                 "y": y,
                 "x": x,
@@ -721,6 +731,7 @@ def _iter_xgb_tile_payloads(
                 "w_eff": w_eff,
                 "hp": hp,
                 "wp": wp,
+                "row_count": int(hp * wp),
                 "flat_feats": flat_feats,
             }
 
@@ -735,27 +746,26 @@ def _flush_xgb_prediction_batch(
     if not tile_payloads:
         return
     batch_rows = [payload["flat_feats"] for payload in tile_payloads]
+    total_rows = int(sum(int(payload["row_count"]) for payload in tile_payloads))
     if len(batch_rows) == 1:
-        flat_feats = np.asarray(batch_rows[0], dtype=np.float32)
+        flat_feats = batch_rows[0]
     else:
         with perf_span(
             "xgb_score_image_b",
             substage="concat_predict_batch",
             extra={
                 "tile_count": len(tile_payloads),
-                "row_count": int(sum(rows.shape[0] for rows in batch_rows)),
+                "row_count": total_rows,
             },
         ):
-            flat_feats = np.concatenate(batch_rows, axis=0).astype(
-                np.float32, copy=False
-            )
+            flat_feats = np.concatenate(batch_rows, axis=0)
     try:
         with perf_span(
             "xgb_score_image_b",
             substage="predict_inplace",
             extra={
                 "tile_count": len(tile_payloads),
-                "row_count": int(flat_feats.shape[0]),
+                "row_count": total_rows,
             },
         ):
             scores_batch = bst.inplace_predict(flat_feats)
@@ -765,7 +775,7 @@ def _flush_xgb_prediction_batch(
             substage="predict_dmatrix_fallback",
             extra={
                 "tile_count": len(tile_payloads),
-                "row_count": int(flat_feats.shape[0]),
+                "row_count": total_rows,
             },
         ):
             dtest = xgb.DMatrix(flat_feats)

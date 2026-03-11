@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from segedge.core.config_loader import cfg
 from segedge.core.feature_ops.cache import (
     image_feature_manifest_path,
     load_feature_manifest_if_valid,
@@ -14,6 +15,7 @@ from segedge.core.feature_ops.cache import (
     tile_feature_path,
 )
 from segedge.core.feature_ops.extraction import prefetch_features_single_scale_image
+from segedge.core.feature_ops.fusion import fuse_patch_features
 from segedge.core.feature_ops.spec import hybrid_feature_spec_hash
 from segedge.core.timing_utils import (
     configure_performance_logging,
@@ -330,3 +332,83 @@ def test_xgb_tile_payloads_are_streamed_lazily(monkeypatch):
         assert "second tile reached" in str(exc)
     else:
         raise AssertionError("expected lazy second-tile evaluation to raise")
+
+
+def test_fuse_patch_features_fast_xgb_matches_generic_path():
+    """The fast XGB fusion path should match the generic layout-producing path.
+
+    Examples:
+        >>> True
+        True
+    """
+    rng = np.random.default_rng(1)
+    dino = rng.normal(size=(2, 2, 4)).astype(np.float32)
+    img = rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8)
+
+    fused_fast, layout_fast = fuse_patch_features(
+        dino,
+        img,
+        16,
+        mode="xgb",
+        return_layout=False,
+    )
+    fused_generic, layout_generic = fuse_patch_features(
+        dino,
+        img,
+        16,
+        mode="xgb",
+        return_layout=True,
+    )
+
+    assert layout_fast is None
+    assert layout_generic is not None
+    np.testing.assert_allclose(fused_fast, fused_generic, rtol=1e-6, atol=1e-6)
+
+
+def test_xgb_score_image_batches_multiple_small_tiles_into_one_predict(
+    tmp_path,
+    monkeypatch,
+):
+    """Small tiles should be combined into fewer XGB predict calls.
+
+    Examples:
+        >>> True
+        True
+    """
+    feature_dir = tmp_path / "features"
+    image_id = "tile_batch"
+    image = np.zeros((64, 16, 3), dtype=np.uint8)
+    prefetched = {}
+    for y in range(0, 64, 16):
+        prefetched[(y, 0)] = {
+            "feats": np.ones((1, 1, 4), dtype=np.float32),
+            "h_eff": 16,
+            "w_eff": 16,
+            "hp": 1,
+            "wp": 1,
+        }
+
+    class _Booster:
+        def __init__(self):
+            self.calls = []
+
+        def inplace_predict(self, feats):
+            self.calls.append(int(feats.shape[0]))
+            return np.full((feats.shape[0],), 0.25, dtype=np.float32)
+
+    booster = _Booster()
+    monkeypatch.setattr(cfg.runtime, "feature_batch_size", 1)
+
+    score = xgb_score_image_b(
+        image,
+        booster,
+        16,
+        16,
+        16,
+        str(feature_dir),
+        image_id,
+        prefetched_tiles=prefetched,
+    )
+
+    assert score.shape == (64, 16)
+    assert booster.calls == [4]
