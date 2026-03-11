@@ -79,6 +79,68 @@ def _postprocess_stream_mask(
     return filled_mask
 
 
+def _build_xgb_plot_preview_masks(
+    *,
+    context: dict[str, object],
+    champion_score: np.ndarray,
+    champion_thr: float,
+    active_crf_mask: np.ndarray,
+    tuned: dict | None,
+) -> dict[str, np.ndarray]:
+    """Build plot-only XGB preview masks without SH clipping.
+
+    Examples:
+        >>> context = {
+        ...     "sh_buffer_mask": np.ones((1, 1), dtype=bool),
+        ...     "img_b": np.zeros((1, 1, 3), dtype=np.uint8),
+        ... }
+        >>> out = _build_xgb_plot_preview_masks(
+        ...     context=context,
+        ...     champion_score=np.array([[0.9]], dtype=np.float32),
+        ...     champion_thr=0.5,
+        ...     active_crf_mask=np.array([[True]]),
+        ...     tuned={},
+        ... )
+        >>> sorted(out.keys())
+        ['xgb_crf_plot', 'xgb_raw_plot']
+    """
+    full_mask = np.ones_like(context["sh_buffer_mask"], dtype=bool)
+    raw_plot_mask = _postprocess_stream_mask(
+        champion_score >= champion_thr,
+        full_mask,
+        fill_holes=bool(cfg.postprocess.fill_holes_xgb),
+        image_id=context.get("image_id_b"),
+        stream_name="xgb_raw_plot",
+    )
+    crf_cfg = dict((tuned or {}).get("best_crf_config") or {})
+    required_crf_keys = {
+        "prob_softness",
+        "pos_w",
+        "pos_xy_std",
+        "bilateral_w",
+        "bilateral_xy_std",
+        "bilateral_rgb_std",
+    }
+    if (not bool(crf_cfg.get("enabled", True))) or (
+        required_crf_keys - set(crf_cfg.keys())
+    ):
+        crf_plot_mask = active_crf_mask
+    else:
+        crf_plot_mask = _apply_crf_to_stream(
+            context["img_b"],
+            champion_score,
+            champion_thr,
+            full_mask,
+            crf_cfg,
+            use_trimap_band=True,
+            base_mask_override=raw_plot_mask,
+        )
+    return {
+        "xgb_raw_plot": raw_plot_mask,
+        "xgb_crf_plot": crf_plot_mask,
+    }
+
+
 def _load_holdout_tile(
     holdout_path: str,
     gt_vector_paths: list[str] | None,
@@ -824,6 +886,7 @@ def _save_holdout_plots(
     active_raw_mask: np.ndarray,
     active_crf_mask: np.ndarray,
     active_shadow_mask: np.ndarray,
+    crf_cfg: dict,
     metrics_map: dict[str, dict[str, float]],
     proposal_masks: dict[str, np.ndarray],
     proposal_bundle: dict,
@@ -840,16 +903,27 @@ def _save_holdout_plots(
     image_id_b = context["image_id_b"]
     plot_cfg = cfg.io.inference.plots
     if plot_cfg.unified:
+        plot_masks = {
+            f"{active_stream}_raw": active_raw_mask,
+            f"{active_stream}_crf": active_crf_mask,
+            f"{active_stream}_shadow": active_shadow_mask,
+        }
+        if active_stream == "xgb":
+            plot_masks.update(
+                _build_xgb_plot_preview_masks(
+                    context=context,
+                    champion_score=champion_score,
+                    champion_thr=champion_thr,
+                    active_crf_mask=active_crf_mask,
+                    tuned={"best_crf_config": crf_cfg},
+                )
+            )
         with perf_span("save_holdout_plots", substage="unified"):
             save_unified_plot(
                 img_b=context["img_b"],
                 gt_mask=context["gt_mask_eval"],
                 labels_sh=context["labels_sh"],
-                masks={
-                    f"{active_stream}_raw": active_raw_mask,
-                    f"{active_stream}_crf": active_crf_mask,
-                    f"{active_stream}_shadow": active_shadow_mask,
-                },
+                masks=plot_masks,
                 metrics=metrics_map,
                 plot_dir=plot_dir,
                 image_id_b=image_id_b,
@@ -858,7 +932,6 @@ def _save_holdout_plots(
                 similarity_map=score_knn_raw if active_stream == "knn" else None,
                 score_maps={active_stream: champion_score},
                 proposal_masks={
-                    "candidate": proposal_masks["candidate_mask"],
                     "accepted": proposal_masks["accepted_mask"],
                     "rejected": proposal_masks["rejected_mask"],
                 },
@@ -1092,6 +1165,7 @@ def infer_on_holdout(
                 active_raw_mask=active_raw_mask,
                 active_crf_mask=active_crf_mask,
                 active_shadow_mask=active_shadow_mask,
+                crf_cfg=dict(tuned.get("best_crf_config") or {}),
                 metrics_map=metrics_map,
                 proposal_masks=proposal_masks,
                 proposal_bundle=proposal_bundle,

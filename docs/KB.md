@@ -50,10 +50,13 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - Inference tile filtering respects `io.paths.source_label_raster` and keeps only tiles that contain at least one positive source-label pixel.
 - `io.inference.score_prior` can manually scale XGB scores separately inside and outside `SOURCE_LABEL_RASTER` pixels during the final inference phase.
 - `io.inference.plots` can disable individual inference plot files without changing masks, checkpoints, or `plot_every` cadence.
+- The unified inference plot uses plot-only XGB raw/CRF preview masks so it can show activity outside the SH/source-label buffer without changing runtime masks, metrics, or shapefile outputs.
+- The unified inference plot now merges accepted and rejected proposals into one overlay panel: accepted regions are light blue and rejected regions are light red.
 - Each `output/run_*/` directory now contains a copy of the active `config.yml`.
 - `search.crf.trimap_band_pixels_values` controls how far XGB CRF is allowed to expand/shrink the coarse XGB mask boundary when filling holes against RGB edges.
 - `postprocess.fill_holes_xgb` fills enclosed holes in the thresholded XGB mask before XGB trimap CRF builds its boundary band.
 - `io.inference.plot_every` samples holdout plot rendering over pending tiles without changing inference masks or checkpoint cadence.
+- Inference PNG exports use a higher DPI than before, so the saved plots are less pixelated.
 - Holdout inference is interruption-safe at tile granularity.
 - The optimized XGB scorer checks the first 3 pending holdout tiles against the legacy scorer and auto-falls back if the difference is meaningful.
 - CRF tuning is guarded against unsafe CUDA multiprocessing.

@@ -24,6 +24,7 @@ from segedge.pipeline.run import _maybe_run_holdout_inference
 from segedge.pipeline.runtime.checkpointing import write_rolling_best_config
 from segedge.pipeline.runtime.holdout_inference import (
     _apply_inference_score_prior,
+    _build_xgb_plot_preview_masks,
     _compute_xgb_stream,
     _postprocess_stream_mask,
     _save_holdout_plots,
@@ -431,6 +432,63 @@ def test_compute_xgb_stream_fills_holes_when_enabled(monkeypatch):
     )
 
     assert result["mask"][3, 3]
+
+
+def test_build_xgb_plot_preview_masks_show_unclipped_regions(monkeypatch):
+    """Plot-only XGB previews should show regions outside the SH buffer.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(cfg.postprocess, "fill_holes_xgb", False)
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._apply_crf_to_stream",
+        lambda img_b, score_map, threshold, sh_buffer_mask, crf_cfg, **kwargs: score_map
+        >= threshold,
+    )
+    context = {
+        "image_id_b": "tile_a",
+        "img_b": np.zeros((3, 3, 3), dtype=np.uint8),
+        "sh_buffer_mask": np.array(
+            [
+                [1, 0, 0],
+                [1, 0, 0],
+                [1, 0, 0],
+            ],
+            dtype=bool,
+        ),
+    }
+    champion_score = np.array(
+        [
+            [0.9, 0.9, 0.1],
+            [0.9, 0.9, 0.1],
+            [0.1, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+
+    out = _build_xgb_plot_preview_masks(
+        context=context,
+        champion_score=champion_score,
+        champion_thr=0.5,
+        active_crf_mask=np.zeros((3, 3), dtype=bool),
+        tuned={
+            "best_crf_config": {
+                "enabled": True,
+                "prob_softness": 0.1,
+                "pos_w": 1.0,
+                "pos_xy_std": 3.0,
+                "bilateral_w": 12.0,
+                "bilateral_xy_std": 40.0,
+                "bilateral_rgb_std": 4.0,
+                "trimap_band_pixels": 16,
+            }
+        },
+    )
+
+    assert out["xgb_raw_plot"][0, 1]
+    assert out["xgb_crf_plot"][0, 1]
 
 
 def test_write_rolling_best_config_exports_inside_and_outside_score_prior(
@@ -896,6 +954,7 @@ def test_save_holdout_plots_respects_individual_plot_toggles(monkeypatch, tmp_pa
         active_raw_mask=np.zeros((2, 2), dtype=bool),
         active_crf_mask=np.zeros((2, 2), dtype=bool),
         active_shadow_mask=np.zeros((2, 2), dtype=bool),
+        crf_cfg={},
         metrics_map={},
         proposal_masks={
             "candidate_mask": np.zeros((2, 2), dtype=bool),
@@ -913,3 +972,77 @@ def test_save_holdout_plots_respects_individual_plot_toggles(monkeypatch, tmp_pa
     )
 
     assert calls == ["qualitative_core", "disagreement_entropy"]
+
+
+def test_save_holdout_plots_passes_xgb_preview_masks_and_merged_proposals(
+    monkeypatch,
+    tmp_path,
+):
+    """Unified plot should receive outside-label XGB previews and merged proposal masks.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(cfg.io.inference.plots, "unified", True)
+    monkeypatch.setattr(cfg.io.inference.plots, "qualitative_core", False)
+    monkeypatch.setattr(cfg.io.inference.plots, "score_threshold", False)
+    monkeypatch.setattr(cfg.io.inference.plots, "disagreement_entropy", False)
+    monkeypatch.setattr(cfg.io.inference.plots, "proposal_overlay", False)
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._build_xgb_plot_preview_masks",
+        lambda **kwargs: {
+            "xgb_raw_plot": np.array([[1, 1], [0, 0]], dtype=bool),
+            "xgb_crf_plot": np.array([[1, 0], [1, 0]], dtype=bool),
+        },
+    )
+    captured = {}
+
+    def _capture_unified(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.save_unified_plot",
+        _capture_unified,
+    )
+
+    _save_holdout_plots(
+        context={
+            "image_id_b": "tile_plot",
+            "img_b": np.zeros((2, 2, 3), dtype=np.uint8),
+            "gt_mask_eval": np.zeros((2, 2), dtype=bool),
+            "labels_sh": np.zeros((2, 2), dtype=np.uint8),
+            "gt_available": False,
+            "sh_buffer_mask": np.ones((2, 2), dtype=bool),
+        },
+        plot_dir=str(tmp_path),
+        plot_with_metrics=False,
+        active_stream="xgb",
+        active_label="XGB",
+        champion_score=np.zeros((2, 2), dtype=np.float32),
+        champion_thr=0.5,
+        active_raw_mask=np.zeros((2, 2), dtype=bool),
+        active_crf_mask=np.zeros((2, 2), dtype=bool),
+        active_shadow_mask=np.zeros((2, 2), dtype=bool),
+        crf_cfg={"enabled": True, "trimap_band_pixels": 16},
+        metrics_map={},
+        proposal_masks={
+            "candidate_mask": np.ones((2, 2), dtype=bool),
+            "candidate_inside_mask": np.zeros((2, 2), dtype=bool),
+            "evaluated_outside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_mask": np.array([[1, 0], [0, 0]], dtype=bool),
+            "accepted_inside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_outside_mask": np.zeros((2, 2), dtype=bool),
+            "rejected_mask": np.array([[0, 1], [0, 0]], dtype=bool),
+        },
+        proposal_bundle={},
+        score_knn_raw=None,
+        disagreement_map=np.zeros((2, 2), dtype=np.float32),
+        entropy_map=np.zeros((2, 2), dtype=np.float32),
+    )
+
+    assert "xgb_raw_plot" in captured["masks"]
+    assert "xgb_crf_plot" in captured["masks"]
+    assert "candidate" not in captured["proposal_masks"]
+    assert "accepted" in captured["proposal_masks"]
+    assert "rejected" in captured["proposal_masks"]

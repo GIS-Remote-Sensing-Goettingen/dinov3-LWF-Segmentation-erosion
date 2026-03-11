@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Improve inference plot readability and consolidate proposal visualization in the unified plot.
+- Files touched: `segedge/core/plotting.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Make the unified plot show more of the XGB behavior outside the label buffer, reduce proposal-panel clutter, and export less pixelated images for review.
+- Problems fixed: Unified inference plots can now show plot-only XGB raw/CRF preview masks outside the SH/source-label buffer without changing saved masks or metrics, accepted and rejected proposals are merged into one overlay panel with clearer colors, and inference plot PNGs are saved at a higher DPI.
+
 - Description: Add per-plot inference toggles under `io.inference.plots` and copy the active `config.yml` into each run directory.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Reduce inference artifact overhead without disabling plotting globally, and keep each `run_*` output self-contained with the exact settings that produced it.
