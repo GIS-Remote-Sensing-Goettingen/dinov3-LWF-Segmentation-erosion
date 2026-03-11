@@ -24,7 +24,7 @@ io:
       apply_to: xgb
       target: source_labels
       mode: multiply
-      factor: 1.4
+      factor: 3.0
       clip_max: 1.0
 
   paths:
