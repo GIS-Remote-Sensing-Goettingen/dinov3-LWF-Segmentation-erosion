@@ -229,6 +229,7 @@ class CRFConfig:
 
     enabled: bool
     prob_softness_values: list[float]
+    trimap_band_pixels_values: list[int]
     pos_w_values: list[float]
     pos_xy_std_values: list[float]
     bilateral_w_values: list[float]
@@ -740,6 +741,10 @@ def _load_search_config(search: dict[str, Any]) -> SearchConfig:
             enabled=bool(search_crf.get("enabled", True)),
             prob_softness_values=_as_list_float(
                 search_crf["prob_softness_values"], "search.crf.prob_softness_values"
+            ),
+            trimap_band_pixels_values=_as_list_int(
+                search_crf.get("trimap_band_pixels_values", [16]),
+                "search.crf.trimap_band_pixels_values",
             ),
             pos_w_values=_as_list_float(
                 search_crf["pos_w_values"], "search.crf.pos_w_values"

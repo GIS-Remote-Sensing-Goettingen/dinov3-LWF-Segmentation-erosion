@@ -36,6 +36,7 @@ Important behavior:
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
 - The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
 - Source-label reprojection is optimized in the shared I/O layer: repeated tiles reuse the same source-label raster handle, aligned same-CRS grids prefer direct window reads, and the performance log now splits source-label work into open/grid/reproject/finalize substages.
+- XGB CRF refinement can use a trimap-band unary: the current XGB mask is treated as strong interior foreground, a dilated ring is treated as uncertain, and CRF uses RGB edges to fill holes and expand/shrink that boundary band. The single tuning knob for this is `search.crf.trimap_band_pixels_values`.
 - `io.inference.plot_every` can sample inference plots over pending tiles without changing mask generation, processed-tile logging, or union shapefile updates.
 
 ### Manual training workflow

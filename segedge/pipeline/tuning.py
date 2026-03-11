@@ -571,6 +571,7 @@ def _rebuild_champion_scores(
     """
     for ctx in val_contexts:
         _maybe_stop(should_stop, "champion_score_rebuild")
+        ctx["crf_use_trimap"] = champion_source == "xgb"
         if champion_source == "raw":
             score_full, _ = zero_shot_knn_single_scale_B_with_saliency(
                 img_b=ctx["img_b"],
@@ -622,13 +623,17 @@ def _tune_crf_config(
         >>> callable(_tune_crf_config)
         True
     """
-    best_crf_cfg = {"enabled": bool(CRF_ENABLED)}
+    best_crf_cfg = {"enabled": bool(CRF_ENABLED), "trimap_band_pixels": 0}
     if not CRF_ENABLED:
         return best_crf_cfg
 
+    use_trimap = any(bool(ctx.get("crf_use_trimap", False)) for ctx in val_contexts)
     crf_candidates = [
-        (psf, pw, pxy, bw, bxy, brgb)
+        (psf, trimap_band, pw, pxy, bw, bxy, brgb)
         for psf in cfg.search.crf.prob_softness_values
+        for trimap_band in (
+            cfg.search.crf.trimap_band_pixels_values if use_trimap else [0]
+        )
         for pw in cfg.search.crf.pos_w_values
         for pxy in cfg.search.crf.pos_xy_std_values
         for bw in cfg.search.crf.bilateral_w_values
@@ -652,11 +657,12 @@ def _tune_crf_config(
             best_crf_cfg = {
                 "enabled": True,
                 "prob_softness": cand[0],
-                "pos_w": cand[1],
-                "pos_xy_std": cand[2],
-                "bilateral_w": cand[3],
-                "bilateral_xy_std": cand[4],
-                "bilateral_rgb_std": cand[5],
+                "trimap_band_pixels": int(cand[1]),
+                "pos_w": cand[2],
+                "pos_xy_std": cand[3],
+                "bilateral_w": cand[4],
+                "bilateral_xy_std": cand[5],
+                "bilateral_rgb_std": cand[6],
             }
 
     try:
@@ -718,6 +724,11 @@ def _tune_shadow_config(
                     bilateral_w=best_crf_cfg["bilateral_w"],
                     bilateral_xy_std=best_crf_cfg["bilateral_xy_std"],
                     bilateral_rgb_std=best_crf_cfg["bilateral_rgb_std"],
+                    trimap_band_pixels=(
+                        int(best_crf_cfg.get("trimap_band_pixels", 0))
+                        if bool(ctx.get("crf_use_trimap", False))
+                        else None
+                    ),
                 )
             else:
                 mask_base = (score_full >= ctx["thr_center"]) & ctx["sh_buffer_mask"]

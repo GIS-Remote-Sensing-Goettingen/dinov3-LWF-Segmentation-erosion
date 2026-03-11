@@ -180,6 +180,7 @@ search:
   crf:
       enabled: true
       prob_softness_values: [0.15]      # HIGH: Softens the XGB mask so it's allowed to grow
+      trimap_band_pixels_values: [16]   # Boundary band where CRF can expand/shrink the coarse XGB mask
       pos_w_values: [1.0]               # LOW: Prevents blind, blob-like spreading that ignores edges
       pos_xy_std_values: [3.0]          # LOW: Keeps blind spatial smoothing minimal
       bilateral_w_values: [20.0]        # VERY HIGH: Forces the mask to trust RGB colors over XGB predictions

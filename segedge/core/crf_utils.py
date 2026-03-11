@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Literal, overload
 
 import numpy as np
+from skimage.morphology import dilation, disk
 from skimage.transform import resize
 
 from .metrics_utils import compute_metrics
@@ -23,6 +24,87 @@ except ImportError:  # pragma: no cover - optional dependency
 
 dcrf_any: Any = dcrf
 unary_from_softmax_any: Any = unary_from_softmax
+_TRIMAP_FG_CONFIDENCE = 0.98
+_TRIMAP_BG_CONFIDENCE = 0.98
+_TRIMAP_UNCERTAIN_PROB = 0.5
+
+try:
+    import cv2
+
+    _HAS_CV2 = True
+except ImportError:  # pragma: no cover - optional dependency
+    cv2 = None
+    _HAS_CV2 = False
+
+
+def _dilate_binary_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Dilate a binary mask efficiently.
+
+    Examples:
+        >>> _dilate_binary_mask(np.array([[0, 1], [0, 0]], dtype=bool), 0).astype(int).tolist()
+        [[0, 1], [0, 0]]
+    """
+    base = mask.astype(bool, copy=False)
+    if radius <= 0:
+        return base
+    if _HAS_CV2 and cv2 is not None:
+        ksize = 2 * radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        return cv2.dilate(base.astype(np.uint8), kernel).astype(bool)
+    return dilation(base, disk(radius))
+
+
+def _build_unary_probabilities(
+    score_map: np.ndarray,
+    threshold_center: float,
+    sh_mask: np.ndarray | None,
+    prob_softness: float,
+    trimap_band_pixels: int | None = None,
+) -> tuple[np.ndarray, dict[str, int | float]]:
+    """Build CRF unary probabilities from a score map.
+
+    Examples:
+        >>> probs, info = _build_unary_probabilities(
+        ...     np.array([[0.7]], dtype=np.float32), 0.5, None, 0.1, None
+        ... )
+        >>> probs.shape, info["trimap_band_pixels"]
+        ((2, 1, 1), 0)
+    """
+    eps = 1e-6
+    if trimap_band_pixels is not None and trimap_band_pixels > 0:
+        base_mask = score_map >= threshold_center
+        if sh_mask is not None:
+            base_mask = np.logical_and(base_mask, sh_mask.astype(bool))
+        dilated_mask = _dilate_binary_mask(base_mask, int(trimap_band_pixels))
+        uncertain_mask = np.logical_and(dilated_mask, ~base_mask)
+        p_fg = np.full(score_map.shape, _TRIMAP_UNCERTAIN_PROB, dtype=np.float32)
+        p_fg[base_mask] = _TRIMAP_FG_CONFIDENCE
+        p_fg[~dilated_mask] = 1.0 - _TRIMAP_BG_CONFIDENCE
+        if sh_mask is not None:
+            p_fg[~sh_mask.astype(bool)] = eps
+        p_fg = np.clip(p_fg, eps, 1.0 - eps)
+        info = {
+            "base_mask_pixels": int(base_mask.sum()),
+            "fg_seed_pixels": int(base_mask.sum()),
+            "uncertain_pixels": int(uncertain_mask.sum()),
+            "trimap_band_pixels": int(trimap_band_pixels),
+        }
+    else:
+        s = score_map.astype(np.float32)
+        logits_fg = (s - threshold_center) / prob_softness
+        p_fg = 1.0 / (1.0 + np.exp(-logits_fg))
+        p_fg = np.clip(p_fg, eps, 1.0 - eps)
+        if sh_mask is not None:
+            sh_mask = sh_mask.astype(bool)
+            p_fg[~sh_mask] = eps
+        info = {
+            "base_mask_pixels": int((score_map >= threshold_center).sum()),
+            "fg_seed_pixels": 0,
+            "uncertain_pixels": 0,
+            "trimap_band_pixels": 0,
+        }
+    p_bg = 1.0 - p_fg
+    return np.stack([p_bg, p_fg], axis=0), info
 
 
 @overload
@@ -38,6 +120,7 @@ def refine_with_densecrf(
     bilateral_w: float = 5.0,
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
+    trimap_band_pixels: int | None = None,
     *,
     return_prob: Literal[False] = False,
 ) -> np.ndarray: ...
@@ -56,6 +139,7 @@ def refine_with_densecrf(
     bilateral_w: float = 5.0,
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
+    trimap_band_pixels: int | None = None,
     *,
     return_prob: Literal[True],
 ) -> tuple[np.ndarray, np.ndarray]: ...
@@ -73,6 +157,7 @@ def refine_with_densecrf(
     bilateral_w: float = 5.0,
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
+    trimap_band_pixels: int | None = None,
     *,
     return_prob: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
@@ -90,6 +175,8 @@ def refine_with_densecrf(
         bilateral_w (float): Bilateral pairwise weight.
         bilateral_xy_std (float): Bilateral spatial std.
         bilateral_rgb_std (float): Bilateral color std.
+        trimap_band_pixels (int | None): Optional mask-boundary band for
+            XGB-style trimap CRF expansion.
 
     Returns:
         np.ndarray | tuple[np.ndarray, np.ndarray]: Refined mask, and optionally
@@ -105,16 +192,14 @@ def refine_with_densecrf(
     h, w, _ = img_rgb.shape
     assert score_map.shape == (h, w), "score_map must have shape (H, W)"
     with perf_span("refine_with_densecrf", substage="build_unary"):
-        s = score_map.astype(np.float32)
-        logits_fg = (s - threshold_center) / prob_softness
-        p_fg = 1.0 / (1.0 + np.exp(-logits_fg))
+        probs, unary_info = _build_unary_probabilities(
+            score_map,
+            threshold_center,
+            sh_mask,
+            prob_softness,
+            trimap_band_pixels=trimap_band_pixels,
+        )
         eps = 1e-6
-        p_fg = np.clip(p_fg, eps, 1.0 - eps)
-        if sh_mask is not None:
-            sh_mask = sh_mask.astype(bool)
-            p_fg[~sh_mask] = eps
-        p_bg = 1.0 - p_fg
-        probs = np.stack([p_bg, p_fg], axis=0)
 
     with perf_span("refine_with_densecrf", substage="setup_densecrf"):
         d = dcrf_any.DenseCRF2D(w, h, 2)
@@ -149,6 +234,16 @@ def refine_with_densecrf(
         if sh_mask is not None:
             refined_mask = np.logical_and(refined_mask, sh_mask)
             p_fg_crf[~sh_mask] = eps
+    info_payload = {
+        **unary_info,
+        "trimap_mode": bool(trimap_band_pixels and trimap_band_pixels > 0),
+    }
+    with perf_span(
+        "refine_with_densecrf",
+        substage="unary_metadata",
+        extra=info_payload,
+    ):
+        _ = 0
     time_end("refine_with_densecrf", t0)
     if return_prob:
         return refined_mask, p_fg_crf
@@ -171,7 +266,11 @@ def _crf_eval_worker(args):
     img_rgb_ds, score_map_ds, sh_mask_ds, gt_mask_ds, threshold_center, n_iters, cfg = (
         args
     )
-    prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+    if len(cfg) == 7:
+        prob_soft, trimap_band, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+    else:
+        prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+        trimap_band = 0
     mask_crf_local = refine_with_densecrf(
         img_rgb_ds,
         score_map_ds,
@@ -184,10 +283,12 @@ def _crf_eval_worker(args):
         bilateral_w=bi_w,
         bilateral_xy_std=bi_xy,
         bilateral_rgb_std=bi_rgb,
+        trimap_band_pixels=int(trimap_band) or None,
     )
     metrics_local = compute_metrics(mask_crf_local, gt_mask_ds)
     return metrics_local, {
         "prob_softness": prob_soft,
+        "trimap_band_pixels": int(trimap_band),
         "pos_w": pos_w,
         "pos_xy_std": pos_xy,
         "bilateral_w": bi_w,
@@ -209,6 +310,7 @@ def crf_grid_search(
     bilateral_w_vals,
     bilateral_xy_std_vals,
     bilateral_rgb_std_vals,
+    trimap_band_pixels_vals=None,
     n_iters: int = 5,
     max_configs: int | None = None,
     downsample_factor: int = 1,
@@ -224,6 +326,8 @@ def crf_grid_search(
         sh_mask (np.ndarray): SH buffer mask.
         gt_mask (np.ndarray): Ground-truth mask.
         prob_softness_vals (Iterable[float]): Softness values to sweep.
+        trimap_band_pixels_vals (Iterable[int] | None): Optional trimap band
+            sizes. ``None`` keeps the legacy logistic unary.
         pos_w_vals (Iterable[float]): Gaussian weights to sweep.
         pos_xy_std_vals (Iterable[float]): Gaussian std values to sweep.
         bilateral_w_vals (Iterable[float]): Bilateral weights to sweep.
@@ -301,15 +405,27 @@ def crf_grid_search(
         gt_mask_ds = gt_mask
 
     cfg_list = []
+    trimap_band_values = (
+        [0] if trimap_band_pixels_vals is None else trimap_band_pixels_vals
+    )
     for prob_soft in prob_softness_vals:
-        for pos_w in pos_w_vals:
-            for pos_xy in pos_xy_std_vals:
-                for bi_w in bilateral_w_vals:
-                    for bi_xy in bilateral_xy_std_vals:
-                        for bi_rgb in bilateral_rgb_std_vals:
-                            cfg_list.append(
-                                (prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb)
-                            )
+        for trimap_band in trimap_band_values:
+            for pos_w in pos_w_vals:
+                for pos_xy in pos_xy_std_vals:
+                    for bi_w in bilateral_w_vals:
+                        for bi_xy in bilateral_xy_std_vals:
+                            for bi_rgb in bilateral_rgb_std_vals:
+                                cfg_list.append(
+                                    (
+                                        prob_soft,
+                                        int(trimap_band),
+                                        pos_w,
+                                        pos_xy,
+                                        bi_w,
+                                        bi_xy,
+                                        bi_rgb,
+                                    )
+                                )
     if max_configs is not None:
         cfg_list = cfg_list[:max_configs]
 
@@ -333,7 +449,15 @@ def crf_grid_search(
                     best_cfg = cfg_full
     else:
         for cfg in cfg_list:
-            prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+            (
+                prob_soft,
+                trimap_band,
+                pos_w,
+                pos_xy,
+                bi_w,
+                bi_xy,
+                bi_rgb,
+            ) = cfg
             t_cfg = time_start()
             mask_crf_local = refine_with_densecrf(
                 img_rgb=img_rgb_ds,
@@ -347,6 +471,7 @@ def crf_grid_search(
                 bilateral_w=bi_w,
                 bilateral_xy_std=bi_xy,
                 bilateral_rgb_std=bi_rgb,
+                trimap_band_pixels=int(trimap_band) or None,
             )
             time_end("crf_single_config", t_cfg)
             metrics_local = compute_metrics(mask_crf_local, gt_mask_ds)
@@ -354,6 +479,7 @@ def crf_grid_search(
                 best_iou = metrics_local["iou"]
                 best_cfg = {
                     "prob_softness": prob_soft,
+                    "trimap_band_pixels": int(trimap_band),
                     "pos_w": pos_w,
                     "pos_xy_std": pos_xy,
                     "bilateral_w": bi_w,
@@ -376,6 +502,7 @@ def crf_grid_search(
             bilateral_w=best_cfg["bilateral_w"],
             bilateral_xy_std=best_cfg["bilateral_xy_std"],
             bilateral_rgb_std=best_cfg["bilateral_rgb_std"],
+            trimap_band_pixels=int(best_cfg.get("trimap_band_pixels", 0)) or None,
         )
     time_end("crf_grid_search", t0)
     return best_cfg, best_mask

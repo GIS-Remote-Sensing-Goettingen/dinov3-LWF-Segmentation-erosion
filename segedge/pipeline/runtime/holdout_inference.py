@@ -451,6 +451,8 @@ def _apply_crf_to_stream(
     threshold: float | None,
     sh_buffer_mask: np.ndarray,
     crf_cfg: dict,
+    *,
+    use_trimap_band: bool = False,
 ) -> np.ndarray:
     """Return CRF-refined mask when inputs are available.
 
@@ -472,6 +474,9 @@ def _apply_crf_to_stream(
         bilateral_w=crf_cfg["bilateral_w"],
         bilateral_xy_std=crf_cfg["bilateral_xy_std"],
         bilateral_rgb_std=crf_cfg["bilateral_rgb_std"],
+        trimap_band_pixels=(
+            int(crf_cfg.get("trimap_band_pixels", 0)) if use_trimap_band else None
+        ),
     )
 
 
@@ -499,6 +504,7 @@ def _run_crf_stage(
             knn_result["threshold"],
             context["sh_buffer_mask"],
             crf_cfg,
+            use_trimap_band=False,
         )
         if context["knn_enabled"]
         else knn_result["mask"]
@@ -510,6 +516,7 @@ def _run_crf_stage(
             xgb_result["threshold"],
             context["sh_buffer_mask"],
             crf_cfg,
+            use_trimap_band=True,
         )
         if context["xgb_enabled"]
         else xgb_result["mask"]

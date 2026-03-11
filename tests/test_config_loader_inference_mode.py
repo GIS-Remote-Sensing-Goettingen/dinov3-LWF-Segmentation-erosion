@@ -64,6 +64,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
     assert loaded.io.inference.score_prior.mode == "multiply"
     assert loaded.io.inference.score_prior.factor == 1.15
     assert loaded.io.inference.score_prior.clip_max == 1.0
+    assert loaded.search.crf.trimap_band_pixels_values == [16]
 
 
 def test_inference_score_prior_parses_from_config(tmp_path):
@@ -109,3 +110,19 @@ def test_inference_plot_every_must_be_positive(tmp_path):
         assert "io.inference.plot_every" in str(exc)
     else:
         raise AssertionError("expected plot_every validation error")
+
+
+def test_crf_trimap_band_pixels_parse_from_config(tmp_path):
+    """search.crf.trimap_band_pixels_values should parse when explicitly configured.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["search"]["crf"]["trimap_band_pixels_values"] = [8, 16, 24]
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.search.crf.trimap_band_pixels_values == [8, 16, 24]
