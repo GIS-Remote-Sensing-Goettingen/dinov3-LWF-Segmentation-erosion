@@ -27,6 +27,7 @@ Execution order:
    patch size, resample factor, tiling config, and feature-context radius.
 3. Write `rolling_best_setting.yml` with the bundle metadata.
 4. Export `inference_best_setting.yml` and the legacy `best_setting.yml`.
+5. Copy the current `config.yml` into the run directory.
 5. Run holdout inference on the resolved inference tile set.
 6. Summarize phase metrics and consolidate disk features if enabled.
 
@@ -37,6 +38,7 @@ Important behavior:
 - The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
 - Source-label reprojection is optimized in the shared I/O layer: repeated tiles reuse the same source-label raster handle, aligned same-CRS grids prefer direct window reads, and the performance log now splits source-label work into open/grid/reproject/finalize substages.
 - XGB CRF refinement can use a trimap-band unary: the current XGB mask is treated as strong interior foreground, a dilated ring is treated as uncertain, and CRF uses RGB edges to fill holes and expand/shrink that boundary band. The single tuning knob for this is `search.crf.trimap_band_pixels_values`.
+- `postprocess.fill_holes_xgb` can fill enclosed holes in the thresholded XGB raw mask before trimap CRF, so CRF expands from the filled coarse mask instead of the original holey threshold mask.
 - `io.inference.plot_every` can sample inference plots over pending tiles without changing mask generation, processed-tile logging, or union shapefile updates.
 
 ### Manual training workflow
@@ -109,6 +111,7 @@ Its job is orchestration at the holdout-set level:
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 
 When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply manual XGB score multipliers separately inside and outside `SOURCE_LABEL_RASTER` pixels. This prior is not used during validation inference or tuning.
+`io.inference.plots` can disable individual inference plot types while leaving `plot_every` as the outer cadence control.
 When the optimized XGB scorer is active, the first 3 pending holdout tiles are also compared against the legacy scorer. If the optimized and legacy score maps differ meaningfully, the run logs the mismatch and automatically falls back to the legacy scorer for the rest of that holdout phase.
 
 ## Major Functions

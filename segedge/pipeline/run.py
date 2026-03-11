@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from typing import Callable
 
@@ -115,6 +116,12 @@ def _create_run_directories() -> dict[str, str]:
         os.path.join(run_dir, "performance.jsonl"),
         run_id=os.path.basename(run_dir),
     )
+    config_snapshot_src = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.yml"
+    )
+    config_snapshot_dst = os.path.join(run_dir, "config.yml")
+    if os.path.exists(config_snapshot_src):
+        shutil.copyfile(config_snapshot_src, config_snapshot_dst)
     return {
         "run_dir": run_dir,
         "plot_dir": plot_dir,

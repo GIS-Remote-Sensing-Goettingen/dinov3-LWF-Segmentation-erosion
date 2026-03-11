@@ -25,6 +25,8 @@ from segedge.pipeline.runtime.checkpointing import write_rolling_best_config
 from segedge.pipeline.runtime.holdout_inference import (
     _apply_inference_score_prior,
     _compute_xgb_stream,
+    _postprocess_stream_mask,
+    _save_holdout_plots,
 )
 
 
@@ -353,6 +355,82 @@ def test_apply_inference_score_prior_is_disabled_outside_final_inference(
     )
 
     assert np.allclose(boosted, score_map)
+
+
+def test_postprocess_stream_mask_can_fill_enclosed_holes():
+    """XGB raw-mask postprocessing should fill enclosed holes when enabled.
+
+    Examples:
+        >>> True
+        True
+    """
+    base_mask = np.ones((7, 7), dtype=bool)
+    base_mask[2:5, 2:5] = False
+    sh_buffer_mask = np.ones((7, 7), dtype=bool)
+
+    out = _postprocess_stream_mask(base_mask, sh_buffer_mask, fill_holes=True)
+
+    assert out[3, 3]
+
+
+def test_compute_xgb_stream_fills_holes_when_enabled(monkeypatch):
+    """XGB raw masks should fill enclosed holes before CRF when configured.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(cfg.postprocess, "fill_holes_xgb", True)
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._score_xgb_with_guard",
+        lambda **kwargs: np.array(
+            [
+                [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+                [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+                [0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.9],
+                [0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.9],
+                [0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.9],
+                [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+                [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._apply_roads_penalty",
+        lambda score_map, roads_mask, roads_penalty: score_map,
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._apply_inference_score_prior",
+        lambda score_map, labels_sh, image_id_b, final_inference_phase: score_map,
+    )
+    context = {
+        "sh_buffer_mask": np.ones((7, 7), dtype=bool),
+        "gt_mask_eval": np.zeros((7, 7), dtype=bool),
+        "xgb_enabled": True,
+        "img_b": np.zeros((7, 7, 3), dtype=np.uint8),
+        "image_id_b": "tile_a",
+        "roads_mask": np.zeros((7, 7), dtype=bool),
+        "roads_penalty": 1.0,
+        "labels_sh": np.zeros((7, 7), dtype=np.uint8),
+        "prefetched_b": {},
+        "xgb_feature_stats": None,
+    }
+    tuned = {"bst": object(), "best_xgb_config": {"threshold": 0.5}}
+
+    result = _compute_xgb_stream(
+        context,
+        tuned,
+        ps=16,
+        tile_size=16,
+        stride=16,
+        feature_dir=None,
+        context_radius=0,
+        final_inference_phase=False,
+        xgb_guard_state=None,
+    )
+
+    assert result["mask"][3, 3]
 
 
 def test_write_rolling_best_config_exports_inside_and_outside_score_prior(
@@ -757,3 +835,81 @@ def test_run_holdout_inference_plots_every_pending_n_tiles(
 
     assert processed == 4
     assert save_plot_flags == [True, False, True]
+
+
+def test_save_holdout_plots_respects_individual_plot_toggles(monkeypatch, tmp_path):
+    """Disabled inference plot types should not be rendered.
+
+    Examples:
+        >>> True
+        True
+    """
+    calls = []
+
+    def _record(name):
+        def _inner(*args, **kwargs):
+            calls.append(name)
+
+        return _inner
+
+    monkeypatch.setattr(cfg.io.inference.plots, "unified", False)
+    monkeypatch.setattr(cfg.io.inference.plots, "qualitative_core", True)
+    monkeypatch.setattr(cfg.io.inference.plots, "score_threshold", False)
+    monkeypatch.setattr(cfg.io.inference.plots, "disagreement_entropy", True)
+    monkeypatch.setattr(cfg.io.inference.plots, "proposal_overlay", False)
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.save_unified_plot",
+        _record("unified"),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.save_core_qualitative_plot",
+        _record("qualitative_core"),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.save_score_threshold_plot",
+        _record("score_threshold"),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.save_disagreement_entropy_plot",
+        _record("disagreement_entropy"),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.save_proposal_overlay_plot",
+        _record("proposal_overlay"),
+    )
+
+    _save_holdout_plots(
+        context={
+            "image_id_b": "tile_plot",
+            "img_b": np.zeros((2, 2, 3), dtype=np.uint8),
+            "gt_mask_eval": np.zeros((2, 2), dtype=bool),
+            "labels_sh": np.zeros((2, 2), dtype=np.uint8),
+            "gt_available": False,
+            "sh_buffer_mask": np.ones((2, 2), dtype=bool),
+        },
+        plot_dir=str(tmp_path),
+        plot_with_metrics=False,
+        active_stream="xgb",
+        active_label="XGB",
+        champion_score=np.zeros((2, 2), dtype=np.float32),
+        champion_thr=0.5,
+        active_raw_mask=np.zeros((2, 2), dtype=bool),
+        active_crf_mask=np.zeros((2, 2), dtype=bool),
+        active_shadow_mask=np.zeros((2, 2), dtype=bool),
+        metrics_map={},
+        proposal_masks={
+            "candidate_mask": np.zeros((2, 2), dtype=bool),
+            "candidate_inside_mask": np.zeros((2, 2), dtype=bool),
+            "evaluated_outside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_inside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_outside_mask": np.zeros((2, 2), dtype=bool),
+            "rejected_mask": np.zeros((2, 2), dtype=bool),
+        },
+        proposal_bundle={},
+        score_knn_raw=None,
+        disagreement_map=np.zeros((2, 2), dtype=np.float32),
+        entropy_map=np.zeros((2, 2), dtype=np.float32),
+    )
+
+    assert calls == ["qualitative_core", "disagreement_entropy"]

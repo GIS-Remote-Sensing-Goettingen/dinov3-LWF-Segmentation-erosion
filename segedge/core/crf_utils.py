@@ -60,6 +60,7 @@ def _build_unary_probabilities(
     sh_mask: np.ndarray | None,
     prob_softness: float,
     trimap_band_pixels: int | None = None,
+    base_mask_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, int | float]]:
     """Build CRF unary probabilities from a score map.
 
@@ -71,8 +72,14 @@ def _build_unary_probabilities(
         ((2, 1, 1), 0)
     """
     eps = 1e-6
+    if base_mask_override is not None:
+        assert base_mask_override.shape == score_map.shape
     if trimap_band_pixels is not None and trimap_band_pixels > 0:
-        base_mask = score_map >= threshold_center
+        base_mask = (
+            base_mask_override.astype(bool, copy=False)
+            if base_mask_override is not None
+            else score_map >= threshold_center
+        )
         if sh_mask is not None:
             base_mask = np.logical_and(base_mask, sh_mask.astype(bool))
         dilated_mask = _dilate_binary_mask(base_mask, int(trimap_band_pixels))
@@ -121,6 +128,7 @@ def refine_with_densecrf(
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
     trimap_band_pixels: int | None = None,
+    base_mask_override: np.ndarray | None = None,
     *,
     return_prob: Literal[False] = False,
 ) -> np.ndarray: ...
@@ -140,6 +148,7 @@ def refine_with_densecrf(
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
     trimap_band_pixels: int | None = None,
+    base_mask_override: np.ndarray | None = None,
     *,
     return_prob: Literal[True],
 ) -> tuple[np.ndarray, np.ndarray]: ...
@@ -158,6 +167,7 @@ def refine_with_densecrf(
     bilateral_xy_std: float = 50.0,
     bilateral_rgb_std: float = 5.0,
     trimap_band_pixels: int | None = None,
+    base_mask_override: np.ndarray | None = None,
     *,
     return_prob: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
@@ -177,6 +187,8 @@ def refine_with_densecrf(
         bilateral_rgb_std (float): Bilateral color std.
         trimap_band_pixels (int | None): Optional mask-boundary band for
             XGB-style trimap CRF expansion.
+        base_mask_override (np.ndarray | None): Optional binary mask used as the
+            trimap interior instead of thresholding the score map.
 
     Returns:
         np.ndarray | tuple[np.ndarray, np.ndarray]: Refined mask, and optionally
@@ -198,6 +210,7 @@ def refine_with_densecrf(
             sh_mask,
             prob_softness,
             trimap_band_pixels=trimap_band_pixels,
+            base_mask_override=base_mask_override,
         )
         eps = 1e-6
 

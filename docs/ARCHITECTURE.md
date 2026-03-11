@@ -50,6 +50,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `runtime/postprocess.py`: shadow filtering and novel-proposal heuristics.
 - `runtime/crf_eval.py`: CRF worker initialization and config evaluation.
   - XGB CRF can now use a trimap-band unary that treats the current XGB mask as strong interior foreground, a boundary ring as uncertain, and the far exterior as background.
+  - Optional `postprocess.fill_holes_xgb` fills enclosed holes in the thresholded XGB mask before trimap CRF builds that boundary ring.
 - `runtime/tile_context.py`: tile image/label/GT loading and SH-buffer preparation.
   - source-label loading now reuses cached raster handles and prefers aligned window reads over full temporary-dataset reprojection when the tile grid matches the label grid.
 - `runtime/phase_metrics.py`: phase logging and summary aggregation.

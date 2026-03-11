@@ -48,6 +48,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
     """
     raw = _load_repo_config()
     expected_trimap = list(raw["search"]["crf"]["trimap_band_pixels_values"])
+    expected_fill_holes_xgb = bool(raw["postprocess"].get("fill_holes_xgb", False))
     raw["io"].pop("inference", None)
     raw["io"]["training"] = True
     cfg_path = tmp_path / "config.yml"
@@ -58,6 +59,11 @@ def test_inference_group_defaults_are_applied(tmp_path):
     assert loaded.io.inference.tile_glob == "*.tif"
     assert loaded.io.inference.tiles == []
     assert loaded.io.inference.plot_every == 1
+    assert loaded.io.inference.plots.unified is True
+    assert loaded.io.inference.plots.qualitative_core is True
+    assert loaded.io.inference.plots.score_threshold is True
+    assert loaded.io.inference.plots.disagreement_entropy is True
+    assert loaded.io.inference.plots.proposal_overlay is True
     assert loaded.io.inference.save_bundle is True
     assert loaded.io.inference.score_prior.enabled is False
     assert loaded.io.inference.score_prior.apply_to == "xgb"
@@ -66,6 +72,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
     assert loaded.io.inference.score_prior.inside_factor == 1.15
     assert loaded.io.inference.score_prior.outside_factor == 1.0
     assert loaded.io.inference.score_prior.clip_max == 1.0
+    assert loaded.postprocess.fill_holes_xgb is expected_fill_holes_xgb
     assert loaded.search.crf.trimap_band_pixels_values == expected_trimap
 
 
@@ -142,6 +149,32 @@ def test_inference_plot_every_must_be_positive(tmp_path):
         raise AssertionError("expected plot_every validation error")
 
 
+def test_inference_plot_toggles_parse_from_config(tmp_path):
+    """io.inference.plots should parse individual plot toggles.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["io"].setdefault("inference", {})
+    raw["io"]["inference"]["plots"] = {
+        "unified": False,
+        "qualitative_core": True,
+        "score_threshold": False,
+        "disagreement_entropy": False,
+        "proposal_overlay": True,
+    }
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+    assert loaded.io.inference.plots.unified is False
+    assert loaded.io.inference.plots.qualitative_core is True
+    assert loaded.io.inference.plots.score_threshold is False
+    assert loaded.io.inference.plots.disagreement_entropy is False
+    assert loaded.io.inference.plots.proposal_overlay is True
+
+
 def test_crf_trimap_band_pixels_parse_from_config(tmp_path):
     """search.crf.trimap_band_pixels_values should parse when explicitly configured.
 
@@ -156,3 +189,19 @@ def test_crf_trimap_band_pixels_parse_from_config(tmp_path):
     loaded = load_config(cfg_path)
 
     assert loaded.search.crf.trimap_band_pixels_values == [8, 16, 24]
+
+
+def test_postprocess_fill_holes_xgb_parses_from_config(tmp_path):
+    """postprocess.fill_holes_xgb should parse when explicitly configured.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["postprocess"]["fill_holes_xgb"] = True
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.postprocess.fill_holes_xgb is True

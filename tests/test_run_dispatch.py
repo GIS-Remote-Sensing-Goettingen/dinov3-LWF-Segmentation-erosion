@@ -5,6 +5,30 @@ from __future__ import annotations
 import segedge.pipeline.run as run
 
 
+def test_create_run_directories_copies_config_snapshot(tmp_path, monkeypatch):
+    """New run directories should include a copy of the active config file.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(run.cfg.io.paths, "output_dir", str(tmp_path / "output"))
+    monkeypatch.setattr(run.cfg.runtime, "resume_run", False)
+    monkeypatch.setattr(run.cfg.runtime, "resume_run_dir", None)
+    monkeypatch.setattr(run, "setup_logging", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "configure_performance_logging",
+        lambda *_args, **_kwargs: None,
+    )
+
+    run_paths = run._create_run_directories()
+
+    snapshot_path = tmp_path / "output" / "run_001" / "config.yml"
+    assert run_paths["run_dir"] == str(tmp_path / "output" / "run_001")
+    assert snapshot_path.exists()
+
+
 def test_main_dispatches_to_expected_workflow(monkeypatch):
     """`run.main()` should choose inference-only, manual, or LOO workflows.
 

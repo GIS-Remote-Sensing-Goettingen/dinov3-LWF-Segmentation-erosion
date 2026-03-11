@@ -78,6 +78,17 @@ class IOInferenceScorePriorConfig:
 
 
 @dataclass
+class IOInferencePlotsConfig:
+    """Per-plot toggles for holdout inference artifacts."""
+
+    unified: bool
+    qualitative_core: bool
+    score_threshold: bool
+    disagreement_entropy: bool
+    proposal_overlay: bool
+
+
+@dataclass
 class IOConfig:
     """I/O config group."""
 
@@ -96,6 +107,7 @@ class IOInferenceConfig:
     tile_glob: str
     tiles: list[str]
     plot_every: int
+    plots: IOInferencePlotsConfig
     save_bundle: bool
     score_prior: IOInferenceScorePriorConfig
 
@@ -303,6 +315,7 @@ class NovelProposalsConfig:
 class PostprocessConfig:
     """Postprocess config group."""
 
+    fill_holes_xgb: bool
     shadow: ShadowConfig
     roads: RoadsConfig
     novel_proposals: NovelProposalsConfig
@@ -486,6 +499,10 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
     io_paths = _require_mapping(io["paths"], "io.paths")
     io_auto_split = _require_mapping(io["auto_split"], "io.auto_split")
     io_inference = _require_mapping(io.get("inference", {}), "io.inference")
+    io_inference_plots = _require_mapping(
+        io_inference.get("plots", {}),
+        "io.inference.plots",
+    )
     io_inference_score_prior = _require_mapping(
         io_inference.get("score_prior", {}),
         "io.inference.score_prior",
@@ -506,6 +523,15 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
             tile_glob=str(io_inference.get("tile_glob", "*.tif")),
             tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
             plot_every=int(io_inference.get("plot_every", 1)),
+            plots=IOInferencePlotsConfig(
+                unified=bool(io_inference_plots.get("unified", True)),
+                qualitative_core=bool(io_inference_plots.get("qualitative_core", True)),
+                score_threshold=bool(io_inference_plots.get("score_threshold", True)),
+                disagreement_entropy=bool(
+                    io_inference_plots.get("disagreement_entropy", True)
+                ),
+                proposal_overlay=bool(io_inference_plots.get("proposal_overlay", True)),
+            ),
             save_bundle=bool(io_inference.get("save_bundle", True)),
             score_prior=IOInferenceScorePriorConfig(
                 enabled=bool(io_inference_score_prior.get("enabled", False)),
@@ -815,6 +841,7 @@ def _load_postprocess_config(postprocess: dict[str, Any]) -> PostprocessConfig:
     )
     heuristic_defaults = _novel_heuristic_defaults(heuristic_preset)
     return PostprocessConfig(
+        fill_holes_xgb=bool(postprocess.get("fill_holes_xgb", False)),
         shadow=ShadowConfig(
             weight_sets=[tuple(float(x) for x in row) for row in weight_sets_raw],
             thresholds=_as_list_float(

@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Add per-plot inference toggles under `io.inference.plots` and copy the active `config.yml` into each run directory.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Reduce inference artifact overhead without disabling plotting globally, and keep each `run_*` output self-contained with the exact settings that produced it.
+- Problems fixed: Individual inference plot types can now be disabled independently while `plot_every` still controls cadence, and every run directory now includes a config snapshot for later inspection or reruns.
+
 - Description: Split the final-inference XGB score prior into separate inside/outside multipliers for `SOURCE_LABEL_RASTER`, while keeping the old single `factor` config backward compatible.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Allow the user to bias XGB scores differently inside and outside the source-label raster without changing validation or tuning behavior.
@@ -34,6 +39,11 @@
 - Files touched: `scripts/analyze_performance_log.py`, `tests/test_analyze_performance_log.py`, `scripts/check_file_length.py`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Make the new structured performance log usable for iterative bottleneck analysis without hand-parsing JSONL.
 - Problems fixed: The repository now has a repeatable EDA entrypoint that reports average durations per process, per sub-process, per tile, can export CSV summaries for deeper comparison across runs, defaults mixed logs to inference-only rows instead of contaminating summaries with `phase=null`/`tile=null` training spans, highlights excluded records and `load_context` outliers explicitly, pre-commit no longer fails on large generated profiling logs, and the file-length hook no longer pays for a full recursive scan of the workspace on every run.
+
+- Description: Add `postprocess.fill_holes_xgb` so XGB raw masks can fill enclosed holes before trimap CRF in validation and final inference.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/crf_utils.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/crf_eval.py`, `segedge/pipeline/tuning.py`, `tests/test_crf_utils.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Let CRF expand from the filled coarse XGB mask instead of the original holey threshold mask produced from patch-resolution scores.
+- Problems fixed: Hole filling now affects both exported XGB raw masks and the XGB trimap CRF base mask, keeping validation/tuning and holdout inference aligned.
 
 - Description: Allow inference-only runs with `io.inference.model_bundle_dir: null` to reuse the newest valid previous `output/run_*/model_bundle`.
 - Files touched: `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `docs/KB.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`

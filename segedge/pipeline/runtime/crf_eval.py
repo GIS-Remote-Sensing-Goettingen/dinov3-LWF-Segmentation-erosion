@@ -47,6 +47,11 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
             trimap_band_pixels=(
                 int(trimap_band) if bool(ctx.get("crf_use_trimap", False)) else None
             ),
+            base_mask_override=(
+                ctx.get("trimap_base_mask")
+                if bool(ctx.get("crf_use_trimap", False))
+                else None
+            ),
         )
         ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
         weights.append(float(ctx["gt_weight"]))

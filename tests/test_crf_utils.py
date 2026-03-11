@@ -70,6 +70,35 @@ def test_build_unary_probabilities_trimap_respects_sh_mask():
     assert probs[1, 1, 1] > 0.9
 
 
+def test_build_unary_probabilities_trimap_uses_base_mask_override():
+    """Trimap unary should use an explicit base mask when provided.
+
+    Examples:
+        >>> True
+        True
+    """
+    score_map = np.zeros((3, 3), dtype=np.float32)
+    base_mask_override = np.array(
+        [
+            [0, 1, 0],
+            [1, 1, 1],
+            [0, 1, 0],
+        ],
+        dtype=bool,
+    )
+    probs, info = _build_unary_probabilities(
+        score_map,
+        threshold_center=0.5,
+        sh_mask=None,
+        prob_softness=0.15,
+        trimap_band_pixels=1,
+        base_mask_override=base_mask_override,
+    )
+
+    assert probs[1, 1, 1] > 0.9
+    assert info["base_mask_pixels"] == int(base_mask_override.sum())
+
+
 def test_run_crf_stage_uses_trimap_band_for_xgb_only(monkeypatch):
     """Holdout CRF should keep kNN on logistic mode and XGB on trimap mode.
 
@@ -92,9 +121,12 @@ def test_run_crf_stage_uses_trimap_band_for_xgb_only(monkeypatch):
         bilateral_xy_std=50.0,
         bilateral_rgb_std=5.0,
         trimap_band_pixels=None,
+        base_mask_override=None,
         return_prob=False,
     ):
         calls.append(trimap_band_pixels)
+        if trimap_band_pixels is not None:
+            assert base_mask_override is xgb_result["mask"]
         return np.ones_like(score_map, dtype=bool)
 
     monkeypatch.setattr(

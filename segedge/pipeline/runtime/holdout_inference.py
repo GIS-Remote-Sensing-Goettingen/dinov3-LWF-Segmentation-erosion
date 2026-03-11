@@ -7,7 +7,7 @@ import logging
 import os
 
 import numpy as np
-from scipy.ndimage import median_filter
+from scipy.ndimage import binary_fill_holes, median_filter
 
 from ...core.config_loader import cfg
 from ...core.crf_utils import refine_with_densecrf
@@ -29,6 +29,54 @@ from .roads import _apply_roads_penalty, _get_roads_mask
 from .tile_context import load_b_tile_context
 
 logger = logging.getLogger(__name__)
+
+
+def _postprocess_stream_mask(
+    mask: np.ndarray,
+    sh_buffer_mask: np.ndarray,
+    *,
+    fill_holes: bool = False,
+    image_id: str | None = None,
+    stream_name: str | None = None,
+) -> np.ndarray:
+    """Finalize a thresholded stream mask before metrics and CRF.
+
+    Examples:
+        >>> base = np.ones((7, 7), dtype=bool)
+        >>> base[2:5, 2:5] = False
+        >>> out = _postprocess_stream_mask(base, np.ones((7, 7), dtype=bool), fill_holes=True)
+        >>> int(out[3, 3])
+        1
+    """
+    filtered_mask = median_filter(mask.astype(np.uint8), size=3) > 0
+    filtered_mask = np.logical_and(filtered_mask, sh_buffer_mask)
+    if not fill_holes:
+        return filtered_mask
+    with perf_span("postprocess_stream_mask", substage="fill_holes"):
+        filled_mask = binary_fill_holes(filtered_mask)
+    filled_mask = np.logical_and(filled_mask, sh_buffer_mask)
+    filled_hole_pixels = max(0, int(filled_mask.sum()) - int(filtered_mask.sum()))
+    with perf_span(
+        "postprocess_stream_mask",
+        substage="fill_holes_metadata",
+        extra={
+            "image_id": image_id or "",
+            "stream": stream_name or "",
+            "raw_mask_pixels_before_fill": int(filtered_mask.sum()),
+            "raw_mask_pixels_after_fill": int(filled_mask.sum()),
+            "filled_hole_pixels": filled_hole_pixels,
+        },
+    ):
+        _ = 0
+    logger.info(
+        "hole fill: tile=%s stream=%s before=%s after=%s filled=%s",
+        image_id or "<unknown>",
+        stream_name or "<unknown>",
+        int(filtered_mask.sum()),
+        int(filled_mask.sum()),
+        filled_hole_pixels,
+    )
+    return filled_mask
 
 
 def _load_holdout_tile(
@@ -156,8 +204,12 @@ def _compute_knn_stream(
         context["roads_mask"],
         context["roads_penalty"],
     )
-    mask = (score_penalized >= threshold) & sh_buffer_mask
-    mask = median_filter(mask.astype(np.uint8), size=3) > 0
+    mask = _postprocess_stream_mask(
+        score_penalized >= threshold,
+        sh_buffer_mask,
+        image_id=context["image_id_b"],
+        stream_name="knn_raw",
+    )
     output.update(
         {
             "score_raw": score_map,
@@ -223,8 +275,13 @@ def _compute_xgb_stream(
         context["image_id_b"],
         final_inference_phase=final_inference_phase,
     )
-    mask = (score_penalized >= threshold) & sh_buffer_mask
-    mask = median_filter(mask.astype(np.uint8), size=3) > 0
+    mask = _postprocess_stream_mask(
+        score_penalized >= threshold,
+        sh_buffer_mask,
+        fill_holes=bool(cfg.postprocess.fill_holes_xgb),
+        image_id=context["image_id_b"],
+        stream_name="xgb_raw",
+    )
     output.update(
         {
             "score": score_penalized,
@@ -471,6 +528,7 @@ def _apply_crf_to_stream(
     crf_cfg: dict,
     *,
     use_trimap_band: bool = False,
+    base_mask_override: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return CRF-refined mask when inputs are available.
 
@@ -495,6 +553,7 @@ def _apply_crf_to_stream(
         trimap_band_pixels=(
             int(crf_cfg.get("trimap_band_pixels", 0)) if use_trimap_band else None
         ),
+        base_mask_override=base_mask_override if use_trimap_band else None,
     )
 
 
@@ -535,6 +594,7 @@ def _run_crf_stage(
             context["sh_buffer_mask"],
             crf_cfg,
             use_trimap_band=True,
+            base_mask_override=xgb_result["mask"],
         )
         if context["xgb_enabled"]
         else xgb_result["mask"]
@@ -778,77 +838,83 @@ def _save_holdout_plots(
         True
     """
     image_id_b = context["image_id_b"]
-    with perf_span("save_holdout_plots", substage="unified"):
-        save_unified_plot(
-            img_b=context["img_b"],
-            gt_mask=context["gt_mask_eval"],
-            labels_sh=context["labels_sh"],
-            masks={
-                f"{active_stream}_raw": active_raw_mask,
-                f"{active_stream}_crf": active_crf_mask,
-                f"{active_stream}_shadow": active_shadow_mask,
-            },
-            metrics=metrics_map,
-            plot_dir=plot_dir,
-            image_id_b=image_id_b,
-            show_metrics=plot_with_metrics and context["gt_available"],
-            gt_available=context["gt_available"],
-            similarity_map=score_knn_raw if active_stream == "knn" else None,
-            score_maps={active_stream: champion_score},
-            proposal_masks={
-                "candidate": proposal_masks["candidate_mask"],
-                "accepted": proposal_masks["accepted_mask"],
-                "rejected": proposal_masks["rejected_mask"],
-            },
-        )
-    with perf_span("save_holdout_plots", substage="qualitative_core"):
-        save_core_qualitative_plot(
-            img_b=context["img_b"],
-            gt_mask=context["gt_mask_eval"],
-            pred_mask=active_shadow_mask,
-            plot_dir=plot_dir,
-            image_id_b=image_id_b,
-            gt_available=context["gt_available"],
-            model_label=active_label,
-            boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
-        )
-    with perf_span("save_holdout_plots", substage="score_threshold"):
-        save_score_threshold_plot(
-            score_map=champion_score,
-            threshold=champion_thr,
-            sh_buffer_mask=context["sh_buffer_mask"],
-            plot_dir=plot_dir,
-            image_id_b=image_id_b,
-            model_label=active_label,
-        )
-    with perf_span("save_holdout_plots", substage="disagreement_entropy"):
-        save_disagreement_entropy_plot(
-            disagreement_map=disagreement_map,
-            entropy_map=entropy_map,
-            candidate_mask=proposal_masks["candidate_mask"],
-            plot_dir=plot_dir,
-            image_id_b=image_id_b,
-            model_label=active_label,
-        )
-    with perf_span("save_holdout_plots", substage="proposal_overlay"):
-        save_proposal_overlay_plot(
-            img_b=context["img_b"],
-            prediction_mask=active_shadow_mask,
-            candidate_mask=proposal_masks["candidate_mask"],
-            candidate_inside_mask=proposal_masks["candidate_inside_mask"],
-            evaluated_outside_mask=proposal_masks["evaluated_outside_mask"],
-            accepted_mask=proposal_masks["accepted_mask"],
-            accepted_inside_mask=proposal_masks["accepted_inside_mask"],
-            accepted_outside_mask=proposal_masks["accepted_outside_mask"],
-            rejected_mask=proposal_masks["rejected_mask"],
-            proposal_records=proposal_bundle.get("records"),
-            plot_dir=plot_dir,
-            image_id_b=image_id_b,
-            model_label=active_label,
-            accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
-            reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
-            candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
-        )
+    plot_cfg = cfg.io.inference.plots
+    if plot_cfg.unified:
+        with perf_span("save_holdout_plots", substage="unified"):
+            save_unified_plot(
+                img_b=context["img_b"],
+                gt_mask=context["gt_mask_eval"],
+                labels_sh=context["labels_sh"],
+                masks={
+                    f"{active_stream}_raw": active_raw_mask,
+                    f"{active_stream}_crf": active_crf_mask,
+                    f"{active_stream}_shadow": active_shadow_mask,
+                },
+                metrics=metrics_map,
+                plot_dir=plot_dir,
+                image_id_b=image_id_b,
+                show_metrics=plot_with_metrics and context["gt_available"],
+                gt_available=context["gt_available"],
+                similarity_map=score_knn_raw if active_stream == "knn" else None,
+                score_maps={active_stream: champion_score},
+                proposal_masks={
+                    "candidate": proposal_masks["candidate_mask"],
+                    "accepted": proposal_masks["accepted_mask"],
+                    "rejected": proposal_masks["rejected_mask"],
+                },
+            )
+    if plot_cfg.qualitative_core:
+        with perf_span("save_holdout_plots", substage="qualitative_core"):
+            save_core_qualitative_plot(
+                img_b=context["img_b"],
+                gt_mask=context["gt_mask_eval"],
+                pred_mask=active_shadow_mask,
+                plot_dir=plot_dir,
+                image_id_b=image_id_b,
+                gt_available=context["gt_available"],
+                model_label=active_label,
+                boundary_band_px=int(cfg.runtime.plotting.boundary_band_px),
+            )
+    if plot_cfg.score_threshold:
+        with perf_span("save_holdout_plots", substage="score_threshold"):
+            save_score_threshold_plot(
+                score_map=champion_score,
+                threshold=champion_thr,
+                sh_buffer_mask=context["sh_buffer_mask"],
+                plot_dir=plot_dir,
+                image_id_b=image_id_b,
+                model_label=active_label,
+            )
+    if plot_cfg.disagreement_entropy:
+        with perf_span("save_holdout_plots", substage="disagreement_entropy"):
+            save_disagreement_entropy_plot(
+                disagreement_map=disagreement_map,
+                entropy_map=entropy_map,
+                candidate_mask=proposal_masks["candidate_mask"],
+                plot_dir=plot_dir,
+                image_id_b=image_id_b,
+                model_label=active_label,
+            )
+    if plot_cfg.proposal_overlay:
+        with perf_span("save_holdout_plots", substage="proposal_overlay"):
+            save_proposal_overlay_plot(
+                img_b=context["img_b"],
+                prediction_mask=active_shadow_mask,
+                candidate_mask=proposal_masks["candidate_mask"],
+                candidate_inside_mask=proposal_masks["candidate_inside_mask"],
+                evaluated_outside_mask=proposal_masks["evaluated_outside_mask"],
+                accepted_mask=proposal_masks["accepted_mask"],
+                accepted_inside_mask=proposal_masks["accepted_inside_mask"],
+                accepted_outside_mask=proposal_masks["accepted_outside_mask"],
+                rejected_mask=proposal_masks["rejected_mask"],
+                proposal_records=proposal_bundle.get("records"),
+                plot_dir=plot_dir,
+                image_id_b=image_id_b,
+                model_label=active_label,
+                accept_rgb=tuple(cfg.runtime.plotting.proposal_accept_rgb),
+                reject_rgb=tuple(cfg.runtime.plotting.proposal_reject_rgb),
+                candidate_rgb=tuple(cfg.runtime.plotting.proposal_candidate_rgb),
+            )
 
 
 def infer_on_holdout(

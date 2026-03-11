@@ -10,6 +10,7 @@ from typing import Callable
 
 import numpy as np
 import torch
+from scipy.ndimage import binary_fill_holes, median_filter
 
 from ..core.config_loader import cfg
 from ..core.crf_utils import refine_with_densecrf
@@ -45,6 +46,19 @@ logger = logging.getLogger(__name__)
 
 class TimeBudgetExceededError(RuntimeError):
     """Raised when runtime budget is exceeded during tuning checkpoints."""
+
+
+def _build_xgb_trimap_base_mask(
+    score_map: np.ndarray,
+    threshold: float,
+    sh_buffer_mask: np.ndarray,
+) -> np.ndarray:
+    """Build the XGB trimap base mask used by validation-time CRF/shadow stages."""
+    mask = median_filter((score_map >= threshold).astype(np.uint8), size=3) > 0
+    mask = np.logical_and(mask, sh_buffer_mask)
+    if not bool(cfg.postprocess.fill_holes_xgb):
+        return mask
+    return np.logical_and(binary_fill_holes(mask), sh_buffer_mask)
 
 
 def _resolve_crf_workers(
@@ -610,6 +624,15 @@ def _rebuild_champion_scores(
             score_full, ctx["roads_mask"], roads_penalty
         )
         ctx["thr_center"] = float(thr_center)
+        ctx["trimap_base_mask"] = (
+            _build_xgb_trimap_base_mask(
+                ctx["score_full"],
+                float(thr_center),
+                ctx["sh_buffer_mask"],
+            )
+            if champion_source == "xgb"
+            else None
+        )
 
 
 def _tune_crf_config(
@@ -729,9 +752,22 @@ def _tune_shadow_config(
                         if bool(ctx.get("crf_use_trimap", False))
                         else None
                     ),
+                    base_mask_override=(
+                        ctx.get("trimap_base_mask")
+                        if bool(ctx.get("crf_use_trimap", False))
+                        else None
+                    ),
                 )
             else:
-                mask_base = (score_full >= ctx["thr_center"]) & ctx["sh_buffer_mask"]
+                mask_base = (
+                    ctx.get("trimap_base_mask")
+                    if bool(ctx.get("crf_use_trimap", False))
+                    else None
+                )
+                if mask_base is None:
+                    mask_base = (score_full >= ctx["thr_center"]) & ctx[
+                        "sh_buffer_mask"
+                    ]
             img_float = ctx["img_b"].astype(np.float32)
             vals = (
                 (img_float * np.array(weights, dtype=np.float32).reshape(1, 1, 3))
