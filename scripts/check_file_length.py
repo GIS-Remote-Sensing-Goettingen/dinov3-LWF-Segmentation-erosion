@@ -14,6 +14,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -69,6 +70,46 @@ def iter_repo_files(root: Path) -> Iterable[Path]:
         yield path
 
 
+def _iter_git_tracked_files(root: Path) -> Iterable[Path]:
+    """Yield git-tracked files rooted at `root`, or nothing if unavailable.
+
+    Examples:
+        >>> isinstance(list(_iter_git_tracked_files(Path(".")))[:1], list)
+        True
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=False,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return
+    for raw_path in proc.stdout.split(b"\x00"):
+        if not raw_path:
+            continue
+        path = root / raw_path.decode("utf-8")
+        if path.name == "performance.jsonl":
+            continue
+        yield path
+
+
+def iter_known_repo_files(root: Path) -> Iterable[Path]:
+    """Prefer tracked files, falling back to filesystem traversal.
+
+    Examples:
+        >>> any(path.name == "main.py" for path in iter_known_repo_files(Path(".")))
+        True
+    """
+    tracked = list(_iter_git_tracked_files(root))
+    if tracked:
+        yield from tracked
+        return
+    yield from iter_repo_files(root)
+
+
 def count_lines(path: Path) -> int:
     """Count lines in a text file, returning 0 on read errors.
 
@@ -77,8 +118,14 @@ def count_lines(path: Path) -> int:
         True
     """
     try:
-        return path.read_text(encoding="utf-8").count("\n") + 1
-    except (OSError, UnicodeDecodeError):
+        with path.open("rb") as fh:
+            line_count = 0
+            saw_bytes = False
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                saw_bytes = True
+                line_count += chunk.count(b"\n")
+            return line_count + 1 if saw_bytes else 0
+    except OSError:
         return 0
 
 
@@ -91,7 +138,7 @@ def collect_lengths(root: Path) -> List[FileLength]:
         True
     """
     results: List[FileLength] = []
-    for path in iter_repo_files(root):
+    for path in iter_known_repo_files(root):
         results.append(FileLength(path=path, lines=count_lines(path)))
     return results
 

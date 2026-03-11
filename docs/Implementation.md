@@ -35,6 +35,7 @@ Important behavior:
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
 - The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
+- Source-label reprojection is optimized in the shared I/O layer: repeated tiles reuse the same source-label raster handle, aligned same-CRS grids prefer direct window reads, and the performance log now splits source-label work into open/grid/reproject/finalize substages.
 - `io.inference.plot_every` can sample inference plots over pending tiles without changing mask generation, processed-tile logging, or union shapefile updates.
 
 ### Manual training workflow

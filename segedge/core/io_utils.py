@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import shutil
+from dataclasses import dataclass
 
 import fiona
 import numpy as np
@@ -14,10 +15,10 @@ import rasterio.features as rfeatures
 import yaml
 from pyproj import Transformer
 from rasterio.crs import CRS
-from rasterio.io import MemoryFile
 from rasterio.plot import reshape_as_image
 from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
+from rasterio.windows import from_bounds
 from shapely.geometry import box, mapping, shape
 from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
@@ -29,6 +30,7 @@ from .timing_utils import perf_span, time_end, time_start
 
 logger = logging.getLogger(__name__)
 _VECTOR_GEOM_CACHE: dict[tuple[str, str], tuple[STRtree | None, list]] = {}
+_SOURCE_LABEL_CACHE: dict[str, "_CachedRasterSource"] = {}
 try:
     import cv2
 
@@ -36,6 +38,159 @@ try:
 except ImportError:
     cv2 = None
     _HAS_CV2 = False
+
+
+@dataclass
+class _CachedRasterSource:
+    """Cached source-label raster handle and static metadata."""
+
+    dataset: rasterio.io.DatasetReader
+    dtype: np.dtype
+    nodata: float | int | None
+    path: str
+
+
+def _clear_source_label_cache() -> None:
+    """Clear cached source-label raster handles.
+
+    Examples:
+        >>> _clear_source_label_cache()
+    """
+    for cached in _SOURCE_LABEL_CACHE.values():
+        try:
+            cached.dataset.close()
+        except Exception:
+            continue
+    _SOURCE_LABEL_CACHE.clear()
+
+
+def _get_cached_source_label(labels_path: str) -> tuple[_CachedRasterSource, bool]:
+    """Return a cached source-label raster handle and whether it was reused.
+
+    Examples:
+        >>> callable(_get_cached_source_label)
+        True
+    """
+    abs_path = os.path.abspath(labels_path)
+    cached = _SOURCE_LABEL_CACHE.get(abs_path)
+    if cached is not None and not cached.dataset.closed:
+        return cached, True
+    dataset = rasterio.open(abs_path)
+    cached = _CachedRasterSource(
+        dataset=dataset,
+        dtype=np.dtype(dataset.dtypes[0]),
+        nodata=dataset.nodata,
+        path=abs_path,
+    )
+    _SOURCE_LABEL_CACHE[abs_path] = cached
+    return cached, False
+
+
+def _target_grid_from_reference(
+    ref: rasterio.io.DatasetReader, downsample_factor: int
+) -> tuple[int, int, rasterio.Affine]:
+    """Build the destination grid for label reprojection.
+
+    Examples:
+        >>> callable(_target_grid_from_reference)
+        True
+    """
+    if downsample_factor > 1:
+        dst_width = ref.width // downsample_factor
+        dst_height = ref.height // downsample_factor
+        dst_transform = ref.transform * ref.transform.scale(
+            ref.width / dst_width,
+            ref.height / dst_height,
+        )
+    else:
+        dst_width = ref.width
+        dst_height = ref.height
+        dst_transform = ref.transform
+    return dst_height, dst_width, dst_transform
+
+
+def _transforms_are_axis_aligned(src_transform, dst_transform) -> bool:
+    """Return whether both transforms are north-up / non-rotated.
+
+    Examples:
+        >>> _transforms_are_axis_aligned(from_origin(0, 1, 1, 1), from_origin(0, 1, 2, 2))
+        True
+    """
+    return (
+        math.isclose(src_transform.b, 0.0, abs_tol=1e-9)
+        and math.isclose(src_transform.d, 0.0, abs_tol=1e-9)
+        and math.isclose(dst_transform.b, 0.0, abs_tol=1e-9)
+        and math.isclose(dst_transform.d, 0.0, abs_tol=1e-9)
+    )
+
+
+def _is_close_to_int(value: float) -> bool:
+    """Return whether a floating value is effectively integral.
+
+    Examples:
+        >>> _is_close_to_int(2.0000001)
+        True
+    """
+    return math.isclose(value, round(value), abs_tol=1e-6)
+
+
+def _can_use_windowed_label_read(
+    src: rasterio.io.DatasetReader,
+    ref: rasterio.io.DatasetReader,
+    dst_transform,
+) -> bool:
+    """Return whether labels can be read by aligned window instead of reprojection.
+
+    Examples:
+        >>> callable(_can_use_windowed_label_read)
+        True
+    """
+    if src.crs != ref.crs:
+        return False
+    if not _transforms_are_axis_aligned(src.transform, dst_transform):
+        return False
+    if src.transform.a == 0 or src.transform.e == 0:
+        return False
+    x_scale = dst_transform.a / src.transform.a
+    y_scale = dst_transform.e / src.transform.e
+    x_offset = (dst_transform.c - src.transform.c) / src.transform.a
+    y_offset = (dst_transform.f - src.transform.f) / src.transform.e
+    return (
+        x_scale > 0
+        and y_scale > 0
+        and _is_close_to_int(x_scale)
+        and _is_close_to_int(y_scale)
+        and _is_close_to_int(x_offset)
+        and _is_close_to_int(y_offset)
+    )
+
+
+def _read_labels_by_window(
+    src: rasterio.io.DatasetReader,
+    dst_height: int,
+    dst_width: int,
+    dst_transform,
+    fill_value: float | int,
+) -> np.ndarray:
+    """Read aligned label data directly from the source raster window.
+
+    Examples:
+        >>> callable(_read_labels_by_window)
+        True
+    """
+    left, bottom, right, top = rasterio.transform.array_bounds(
+        dst_height, dst_width, dst_transform
+    )
+    window = from_bounds(left, bottom, right, top, transform=src.transform)
+    window = window.round_offsets().round_lengths()
+    return src.read(
+        1,
+        window=window,
+        out_shape=(dst_height, dst_width),
+        resampling=Resampling.nearest,
+        boundless=True,
+        fill_value=fill_value,
+    )
 
 
 def load_dop20_image(path: str, downsample_factor: int = 1) -> np.ndarray:
@@ -88,57 +243,104 @@ def reproject_labels_to_image(
         True
     """
     t0 = time_start()
-    with rasterio.open(ref_img_path) as ref, rasterio.open(labels_path) as src:
-        if downsample_factor > 1:
-            dst_width = ref.width // downsample_factor
-            dst_height = ref.height // downsample_factor
-            dst_transform = ref.transform * ref.transform.scale(
-                ref.width / dst_width,
-                ref.height / dst_height,
+    with perf_span(
+        "reproject_labels_to_image",
+        substage="open_ref_image",
+        extra={"ref_img_path": ref_img_path},
+    ):
+        ref = rasterio.open(ref_img_path)
+    try:
+        with perf_span(
+            "reproject_labels_to_image",
+            substage="open_source_labels",
+            extra={"labels_path": labels_path},
+        ):
+            src_cached, cache_hit = _get_cached_source_label(labels_path)
+            src = src_cached.dataset
+        with perf_span(
+            "reproject_labels_to_image",
+            substage="build_destination_grid",
+            extra={"downsample_factor": downsample_factor},
+        ):
+            dst_height, dst_width, dst_transform = _target_grid_from_reference(
+                ref, downsample_factor
             )
+        fill_value = src_cached.nodata if src_cached.nodata is not None else 0
+        if _can_use_windowed_label_read(src, ref, dst_transform):
+            with perf_span(
+                "reproject_labels_to_image",
+                substage="direct_window_read",
+                extra={
+                    "cache_hit": cache_hit,
+                    "downsample_factor": downsample_factor,
+                    "labels_path": labels_path,
+                },
+            ):
+                labels_2d = _read_labels_by_window(
+                    src,
+                    dst_height,
+                    dst_width,
+                    dst_transform,
+                    fill_value,
+                )
         else:
-            dst_width = ref.width
-            dst_height = ref.height
-            dst_transform = ref.transform
-        dst_meta = ref.meta.copy()
-        dst_meta.update(
-            dtype=src.dtypes[0],
-            count=src.count,
-            width=dst_width,
-            height=dst_height,
-            transform=dst_transform,
-        )
-        memfile = MemoryFile()
-        with memfile.open(**dst_meta) as dst:
-            for i in range(1, src.count + 1):
+            destination = np.full(
+                (dst_height, dst_width),
+                fill_value,
+                dtype=src_cached.dtype,
+            )
+            with perf_span(
+                "reproject_labels_to_image",
+                substage="reproject",
+                extra={
+                    "cache_hit": cache_hit,
+                    "downsample_factor": downsample_factor,
+                    "labels_path": labels_path,
+                    "src_crs": src.crs.to_string() if src.crs is not None else None,
+                    "dst_crs": ref.crs.to_string() if ref.crs is not None else None,
+                },
+            ):
                 reproject(
-                    source=rasterio.band(src, i),
-                    destination=rasterio.band(dst, i),
+                    source=rasterio.band(src, 1),
+                    destination=destination,
                     src_transform=src.transform,
                     src_crs=src.crs,
                     dst_transform=dst_transform,
                     dst_crs=ref.crs,
                     dst_width=dst_width,
                     dst_height=dst_height,
+                    src_nodata=src_cached.nodata,
+                    dst_nodata=fill_value,
                     resampling=Resampling.nearest,
                 )
-            labels_arr = dst.read()
-    labels_2d = labels_arr[0]
+            labels_2d = destination
+    finally:
+        ref.close()
     expected_shape = (dst_height, dst_width)
-    if labels_2d.shape != expected_shape:
-        logger.warning(
-            "labels raster shape %s != expected %s for %s; resizing to match",
-            labels_2d.shape,
-            expected_shape,
-            labels_path,
-        )
-        labels_2d = resize(
-            labels_2d,
-            expected_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype(labels_2d.dtype)
+    with perf_span(
+        "reproject_labels_to_image",
+        substage="finalize_array",
+        extra={
+            "cache_hit": cache_hit,
+            "coverage_ratio": float((labels_2d > 0).mean()) if labels_2d.size else 0.0,
+            "output_shape": expected_shape,
+            "positive_pixels": int((labels_2d > 0).sum()),
+        },
+    ):
+        if labels_2d.shape != expected_shape:
+            logger.warning(
+                "labels raster shape %s != expected %s for %s; resizing to match",
+                labels_2d.shape,
+                expected_shape,
+                labels_path,
+            )
+            labels_2d = resize(
+                labels_2d,
+                expected_shape,
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            ).astype(labels_2d.dtype)
     time_end(
         f"reproject_labels_to_image[{os.path.basename(labels_path)} -> {os.path.basename(ref_img_path)}]",
         t0,

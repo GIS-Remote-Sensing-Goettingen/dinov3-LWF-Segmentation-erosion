@@ -84,4 +84,5 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `pytest --doctest-modules`: doctests plus pytest suite
 - `scripts/check_file_length.py`: file-size guard
 - `scripts/check_function_length.py`: function-size guard that ignores leading docstrings and doctests by excluding the full docstring block from the count
-- `python scripts/analyze_performance_log.py performance.jsonl --top 10 --tile-limit 5`: summarize average stage/substage timings and the hottest traced tiles from a structured performance log
+- `python scripts/analyze_performance_log.py performance.jsonl --top 10 --tile-limit 5`: summarize inference-only stage/substage timings and the hottest traced tiles from a structured performance log; mixed train+infer logs default to `phase=holdout_inference` and exclude `tile=null` rows
+- `python scripts/analyze_performance_log.py performance.jsonl --phase all --include-tile-null --top 10`: inspect the full mixed log, including training/setup spans and tile-null records

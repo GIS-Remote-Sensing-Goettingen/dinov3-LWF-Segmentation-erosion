@@ -3,6 +3,8 @@
 Examples:
     >>> parse_kind_filter("span")
     {'span'}
+    >>> parse_phase_filter(None)
+    'holdout_inference'
     >>> summarize_durations([1.0, 2.0, 3.0])["median_s"]
     2.0
 """
@@ -12,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -48,6 +51,21 @@ def parse_kind_filter(kind: str) -> set[str]:
     if normalized not in {"span", "timer"}:
         raise ValueError(f"unsupported kind filter: {kind}")
     return {normalized}
+
+
+def parse_phase_filter(phase: str | None) -> str | None:
+    """Normalize the phase filter used by the CLI.
+
+    Examples:
+        >>> parse_phase_filter("all") is None
+        True
+    """
+    if phase is None:
+        return "holdout_inference"
+    normalized = phase.strip()
+    if normalized.lower() == "all":
+        return None
+    return normalized
 
 
 def load_performance_records(path: Path) -> list[PerformanceRecord]:
@@ -94,6 +112,7 @@ def filter_records(
     *,
     kinds: set[str],
     phase: str | None,
+    include_tile_null: bool = True,
 ) -> list[PerformanceRecord]:
     """Filter out summary rows and keep only the requested kinds.
 
@@ -108,8 +127,19 @@ def filter_records(
             continue
         if phase is not None and record.phase != phase:
             continue
+        if not include_tile_null and not record.tile:
+            continue
         out.append(record)
     return out
+
+
+def _nearest_rank(values: list[float], percentile: float) -> float:
+    """Return a nearest-rank percentile from a list of numeric values."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[rank - 1]
 
 
 def summarize_durations(values: list[float]) -> dict[str, float | int]:
@@ -126,6 +156,7 @@ def summarize_durations(values: list[float]) -> dict[str, float | int]:
             "mean_s": 0.0,
             "median_s": 0.0,
             "min_s": 0.0,
+            "p90_s": 0.0,
             "total_s": 0.0,
         }
     return {
@@ -134,6 +165,7 @@ def summarize_durations(values: list[float]) -> dict[str, float | int]:
         "mean_s": sum(values) / len(values),
         "median_s": statistics.median(values),
         "min_s": min(values),
+        "p90_s": _nearest_rank(values, 0.9),
         "total_s": sum(values),
     }
 
@@ -221,10 +253,77 @@ def overview(records: list[PerformanceRecord]) -> dict[str, object]:
     return {
         "kind_counts": dict(kinds),
         "phase_counts": dict(phases),
+        "null_phase_count": sum(1 for record in records if record.phase is None),
+        "null_tile_count": sum(1 for record in records if not record.tile),
         "row_count": len(records),
         "run_ids": run_ids,
         "tile_count": len(tiles),
     }
+
+
+def build_exclusion_summary(
+    records: list[PerformanceRecord],
+    selected: list[PerformanceRecord],
+    *,
+    selected_phase: str | None,
+    include_tile_null: bool,
+) -> dict[str, int]:
+    """Summarize how many rows were excluded by the active filters."""
+    selected_ids = {id(record) for record in selected}
+    excluded = [record for record in records if id(record) not in selected_ids]
+    selected_kinds = Counter(record.kind for record in selected)
+    excluded_phase_null = sum(1 for record in excluded if record.phase is None)
+    excluded_other_phase = 0
+    if selected_phase is not None:
+        excluded_other_phase = sum(
+            1
+            for record in excluded
+            if record.phase is not None and record.phase != selected_phase
+        )
+    excluded_tile_null = 0
+    if not include_tile_null:
+        excluded_tile_null = sum(
+            1
+            for record in excluded
+            if not record.tile
+            and (selected_phase is None or record.phase == selected_phase)
+        )
+    return {
+        "excluded_rows": len(excluded),
+        "excluded_phase_null": excluded_phase_null,
+        "excluded_other_phase": excluded_other_phase,
+        "excluded_tile_null": excluded_tile_null,
+        "selected_rows": len(selected),
+        "selected_timer_rows": selected_kinds.get("timer", 0),
+        "selected_span_rows": selected_kinds.get("span", 0),
+    }
+
+
+def build_outlier_rows(
+    records: Iterable[PerformanceRecord],
+    *,
+    stage: str,
+    substage: str,
+) -> list[dict[str, object]]:
+    """Return rows for tiles with the largest cumulative duration for a stage/substage."""
+    grouped: dict[str, list[float]] = defaultdict(list)
+    for record in records:
+        if not record.tile:
+            continue
+        if record.stage != stage or (record.substage or "<none>") != substage:
+            continue
+        grouped[record.tile].append(record.duration_s)
+    rows: list[dict[str, object]] = []
+    for tile, durations in grouped.items():
+        rows.append({"tile": tile, **summarize_durations(durations)})
+    return sorted(rows, key=lambda row: float(row["total_s"]), reverse=True)
+
+
+def build_non_inference_summary(
+    records: Iterable[PerformanceRecord],
+) -> list[dict[str, object]]:
+    """Summarize excluded non-inference rows by stage."""
+    return build_stage_summary(list(records))
 
 
 def format_table(
@@ -280,8 +379,15 @@ def build_summary_text(
 
     Examples:
         >>> build_summary_text(
-        ...     [{"stage": "x", "mean_s": 1.0}],
-        ...     [{"stage": "x", "substage": "y", "mean_s": 0.5}],
+        ...     [{"stage": "x", "mean_s": 1.0, "total_s": 1.0}],
+        ...     [{
+        ...         "stage": "x",
+        ...         "substage": "y",
+        ...         "mean_s": 0.5,
+        ...         "median_s": 0.5,
+        ...         "max_s": 0.5,
+        ...         "total_s": 0.5,
+        ...     }],
         ... ).startswith("Interpretation")
         True
     """
@@ -292,12 +398,29 @@ def build_summary_text(
         (f"{row['stage']}::{row['substage']}" f" ({float(row['mean_s']):.2f}s avg)")
         for row in substage_rows[:3]
     )
+    top_targets = ", ".join(
+        f"{row['stage']}::{row['substage']} ({float(row['total_s']):.1f}s total)"
+        for row in substage_rows[:5]
+    )
+    outlier_warning = "No major stage-outlier spread detected."
+    for row in substage_rows:
+        median = float(row["median_s"])
+        max_s = float(row["max_s"])
+        if max_s >= max(60.0, median * 5.0):
+            outlier_warning = (
+                "Outlier warning: "
+                f"{row['stage']}::{row['substage']} peaks at {max_s:.2f}s "
+                f"vs median {median:.2f}s."
+            )
+            break
     return "\n".join(
         [
             "Interpretation",
             "--------------",
             f"Top stage bottlenecks: {top_stages or 'n/a'}",
             f"Top substage bottlenecks: {top_substages or 'n/a'}",
+            f"Primary optimization targets: {top_targets or 'n/a'}",
+            outlier_warning,
             (
                 "Nested spans are reported separately; do not add parent and child "
                 "totals directly when comparing stages."
@@ -319,7 +442,15 @@ def main() -> int:
     parser.add_argument(
         "--phase",
         default=None,
-        help="Optional phase filter, e.g. holdout_inference.",
+        help=(
+            "Phase filter. Defaults to holdout_inference for mixed train+infer logs. "
+            "Use 'all' to include every phase."
+        ),
+    )
+    parser.add_argument(
+        "--include-tile-null",
+        action="store_true",
+        help="Include records with tile=null in the stage summaries.",
     )
     parser.add_argument(
         "--top",
@@ -343,10 +474,37 @@ def main() -> int:
 
     records = load_performance_records(args.log_path)
     kinds = parse_kind_filter(args.kind)
-    filtered = filter_records(records, kinds=kinds, phase=args.phase)
+    phase_filter = parse_phase_filter(args.phase)
+    filtered = filter_records(
+        records,
+        kinds=kinds,
+        phase=phase_filter,
+        include_tile_null=args.include_tile_null,
+    )
     stage_rows = build_stage_summary(filtered)
     substage_rows = build_substage_summary(filtered)
     tile_rows, contributors = build_tile_summary(filtered)
+    exclusions = build_exclusion_summary(
+        records,
+        filtered,
+        selected_phase=phase_filter,
+        include_tile_null=args.include_tile_null,
+    )
+    excluded_rows = [
+        record
+        for record in records
+        if record.kind in kinds
+        and (
+            (phase_filter is not None and record.phase != phase_filter)
+            or (not args.include_tile_null and not record.tile)
+        )
+    ]
+    excluded_stage_rows = build_non_inference_summary(excluded_rows)
+    outlier_rows = build_outlier_rows(
+        filtered,
+        stage="infer_on_holdout",
+        substage="load_context",
+    )
 
     meta = overview(records)
     filtered_meta = overview(filtered)
@@ -360,6 +518,16 @@ def main() -> int:
     print(f"selected_kind_counts: {filtered_meta['kind_counts']}")
     print(f"phase_counts: {meta['phase_counts']}")
     print(f"tile_count: {filtered_meta['tile_count']}")
+    if phase_filter == "holdout_inference" and not args.include_tile_null:
+        print("selection: inference-only spans (phase=holdout_inference, tile!=null)")
+    print()
+
+    print("Excluded Records")
+    print("----------------")
+    print(f"excluded_rows: {exclusions['excluded_rows']}")
+    print(f"excluded_phase_null: {exclusions['excluded_phase_null']}")
+    print(f"excluded_other_phase: {exclusions['excluded_other_phase']}")
+    print(f"excluded_tile_null: {exclusions['excluded_tile_null']}")
     print()
 
     print("Average Time By Stage")
@@ -372,6 +540,7 @@ def main() -> int:
                 ("count", "count"),
                 ("mean_s", "mean_s"),
                 ("median_s", "median_s"),
+                ("p90_s", "p90_s"),
                 ("total_s", "total_s"),
                 ("max_s", "max_s"),
             ],
@@ -390,6 +559,7 @@ def main() -> int:
                 ("count", "count"),
                 ("mean_s", "mean_s"),
                 ("median_s", "median_s"),
+                ("p90_s", "p90_s"),
                 ("total_s", "total_s"),
                 ("max_s", "max_s"),
             ],
@@ -397,6 +567,26 @@ def main() -> int:
         )
     )
     print()
+
+    if excluded_stage_rows:
+        print("Non-Selected Stage Overview")
+        print("---------------------------")
+        print(
+            format_table(
+                excluded_stage_rows,
+                [
+                    ("stage", "stage"),
+                    ("count", "count"),
+                    ("mean_s", "mean_s"),
+                    ("median_s", "median_s"),
+                    ("p90_s", "p90_s"),
+                    ("total_s", "total_s"),
+                    ("max_s", "max_s"),
+                ],
+                limit=min(5, args.top),
+            )
+        )
+        print()
 
     if tile_rows:
         tile_totals = [float(row["total_s"]) for row in tile_rows]
@@ -425,13 +615,42 @@ def main() -> int:
                 print(f"  {key}: {duration:.3f}s")
             print()
 
+    if outlier_rows:
+        print("Outlier Tiles By load_context")
+        print("-----------------------------")
+        print(
+            format_table(
+                outlier_rows,
+                [
+                    ("tile", "tile"),
+                    ("count", "count"),
+                    ("mean_s", "mean_s"),
+                    ("median_s", "median_s"),
+                    ("p90_s", "p90_s"),
+                    ("total_s", "total_s"),
+                    ("max_s", "max_s"),
+                ],
+                limit=min(5, args.tile_limit),
+            )
+        )
+        print()
+
     print(build_summary_text(stage_rows, substage_rows))
 
     if args.out_dir is not None:
         write_csv(
             args.out_dir / "stage_summary.csv",
             stage_rows,
-            ["stage", "count", "mean_s", "median_s", "min_s", "max_s", "total_s"],
+            [
+                "stage",
+                "count",
+                "mean_s",
+                "median_s",
+                "p90_s",
+                "min_s",
+                "max_s",
+                "total_s",
+            ],
         )
         write_csv(
             args.out_dir / "substage_summary.csv",
@@ -442,6 +661,7 @@ def main() -> int:
                 "count",
                 "mean_s",
                 "median_s",
+                "p90_s",
                 "min_s",
                 "max_s",
                 "total_s",
@@ -450,7 +670,16 @@ def main() -> int:
         write_csv(
             args.out_dir / "tile_summary.csv",
             tile_rows,
-            ["tile", "count", "mean_s", "median_s", "min_s", "max_s", "total_s"],
+            [
+                "tile",
+                "count",
+                "mean_s",
+                "median_s",
+                "p90_s",
+                "min_s",
+                "max_s",
+                "total_s",
+            ],
         )
         hottest_rows: list[dict[str, object]] = []
         for row in tile_rows[: args.tile_limit]:
