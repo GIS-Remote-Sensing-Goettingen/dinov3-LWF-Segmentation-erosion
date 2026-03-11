@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+import yaml
 from rasterio.transform import from_origin
 
 from segedge.core.config_loader import cfg
@@ -20,6 +21,7 @@ from segedge.pipeline.inference_flow import (
     run_holdout_inference,
 )
 from segedge.pipeline.run import _maybe_run_holdout_inference
+from segedge.pipeline.runtime.checkpointing import write_rolling_best_config
 from segedge.pipeline.runtime.holdout_inference import (
     _apply_inference_score_prior,
     _compute_xgb_stream,
@@ -351,6 +353,38 @@ def test_apply_inference_score_prior_is_disabled_outside_final_inference(
     )
 
     assert np.allclose(boosted, score_map)
+
+
+def test_write_rolling_best_config_exports_inside_and_outside_score_prior(
+    tmp_path,
+    monkeypatch,
+):
+    """Rolling checkpoints should export both score-prior multipliers.
+
+    Examples:
+        >>> True
+        True
+    """
+    out_path = tmp_path / "rolling.yml"
+    monkeypatch.setattr(cfg.io.inference.score_prior, "enabled", True)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "inside_factor", 1.4)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "outside_factor", 0.7)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "clip_max", 0.9)
+
+    write_rolling_best_config(
+        str(out_path),
+        stage="holdout_inference",
+        tuned={},
+        fold_done=0,
+        fold_total=0,
+        holdout_done=1,
+        holdout_total=2,
+    )
+
+    payload = yaml.safe_load(out_path.read_text(encoding="utf-8"))
+    assert payload["inference_score_prior"]["inside_factor"] == 1.4
+    assert payload["inference_score_prior"]["outside_factor"] == 0.7
+    assert payload["inference_score_prior"]["clip_max"] == 0.9
 
 
 def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatch):

@@ -18,7 +18,7 @@
 - Description: Split the final-inference XGB score prior into separate inside/outside multipliers for `SOURCE_LABEL_RASTER`, while keeping the old single `factor` config backward compatible.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Allow the user to bias XGB scores differently inside and outside the source-label raster without changing validation or tuning behavior.
-- Problems fixed: Final holdout inference can now apply separate inside/outside XGB multipliers, old configs that still use `factor` keep the previous inside-only behavior, and logging/tests now cover both regions explicitly.
+- Problems fixed: Final holdout inference can now apply separate inside/outside XGB multipliers, old configs that still use `factor` keep the previous inside-only behavior, rolling checkpoints and exported settings now write both multipliers, and logging/tests now cover both regions explicitly.
 
 - Description: Cache per-tile `SOURCE_LABEL_RASTER` label-presence decisions under `output/.cache` so repeated folder/list inference runs stop reopening every candidate tile during startup filtering.
 - Files touched: `segedge/pipeline/common.py`, `tests/test_inference_flow.py`, `docs/CHANGELOG.md`
