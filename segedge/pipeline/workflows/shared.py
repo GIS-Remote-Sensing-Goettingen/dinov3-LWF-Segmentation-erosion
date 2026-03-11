@@ -103,7 +103,8 @@ def _inference_score_prior_payload() -> dict[str, object]:
         "apply_to": prior_cfg.apply_to,
         "target": prior_cfg.target,
         "mode": prior_cfg.mode,
-        "factor": prior_cfg.factor,
+        "inside_factor": prior_cfg.inside_factor,
+        "outside_factor": prior_cfg.outside_factor,
         "clip_max": prior_cfg.clip_max,
     }
 

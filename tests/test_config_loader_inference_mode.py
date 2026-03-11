@@ -47,6 +47,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
         True
     """
     raw = _load_repo_config()
+    expected_trimap = list(raw["search"]["crf"]["trimap_band_pixels_values"])
     raw["io"].pop("inference", None)
     raw["io"]["training"] = True
     cfg_path = tmp_path / "config.yml"
@@ -62,9 +63,10 @@ def test_inference_group_defaults_are_applied(tmp_path):
     assert loaded.io.inference.score_prior.apply_to == "xgb"
     assert loaded.io.inference.score_prior.target == "source_labels"
     assert loaded.io.inference.score_prior.mode == "multiply"
-    assert loaded.io.inference.score_prior.factor == 1.15
+    assert loaded.io.inference.score_prior.inside_factor == 1.15
+    assert loaded.io.inference.score_prior.outside_factor == 1.0
     assert loaded.io.inference.score_prior.clip_max == 1.0
-    assert loaded.search.crf.trimap_band_pixels_values == [16]
+    assert loaded.search.crf.trimap_band_pixels_values == expected_trimap
 
 
 def test_inference_score_prior_parses_from_config(tmp_path):
@@ -88,8 +90,36 @@ def test_inference_score_prior_parses_from_config(tmp_path):
     cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     loaded = load_config(cfg_path)
     assert loaded.io.inference.score_prior.enabled is True
-    assert loaded.io.inference.score_prior.factor == 1.3
+    assert loaded.io.inference.score_prior.inside_factor == 1.3
+    assert loaded.io.inference.score_prior.outside_factor == 1.0
     assert loaded.io.inference.score_prior.clip_max == 0.95
+
+
+def test_inference_score_prior_parses_inside_and_outside_factors(tmp_path):
+    """io.inference.score_prior should support separate inside/outside factors.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["io"].setdefault("inference", {})
+    raw["io"]["inference"]["score_prior"] = {
+        "enabled": True,
+        "apply_to": "xgb",
+        "target": "source_labels",
+        "mode": "multiply",
+        "inside_factor": 1.4,
+        "outside_factor": 0.8,
+        "clip_max": 0.9,
+    }
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+    assert loaded.io.inference.score_prior.enabled is True
+    assert loaded.io.inference.score_prior.inside_factor == 1.4
+    assert loaded.io.inference.score_prior.outside_factor == 0.8
+    assert loaded.io.inference.score_prior.clip_max == 0.9
 
 
 def test_inference_plot_every_must_be_positive(tmp_path):

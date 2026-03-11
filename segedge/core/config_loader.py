@@ -72,7 +72,8 @@ class IOInferenceScorePriorConfig:
     apply_to: str
     target: str
     mode: str
-    factor: float
+    inside_factor: float
+    outside_factor: float
     clip_max: float
 
 
@@ -526,7 +527,15 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
                     {"multiply"},
                     "multiply",
                 ),
-                factor=float(io_inference_score_prior.get("factor", 1.15)),
+                inside_factor=float(
+                    io_inference_score_prior.get(
+                        "inside_factor",
+                        io_inference_score_prior.get("factor", 1.15),
+                    )
+                ),
+                outside_factor=float(
+                    io_inference_score_prior.get("outside_factor", 1.0)
+                ),
                 clip_max=float(io_inference_score_prior.get("clip_max", 1.0)),
             ),
         ),
@@ -957,8 +966,10 @@ def _validate_loaded_config(config: Config) -> None:
         0.0 <= config.search.xgb.fixed_threshold <= 1.0
     ):
         raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
-    if config.io.inference.score_prior.factor < 0.0:
-        raise ValueError("'io.inference.score_prior.factor' must be >= 0")
+    if config.io.inference.score_prior.inside_factor < 0.0:
+        raise ValueError("'io.inference.score_prior.inside_factor' must be >= 0")
+    if config.io.inference.score_prior.outside_factor < 0.0:
+        raise ValueError("'io.inference.score_prior.outside_factor' must be >= 0")
     if not (0.0 <= config.io.inference.score_prior.clip_max <= 1.0):
         raise ValueError("'io.inference.score_prior.clip_max' must be in [0, 1]")
     if config.io.inference.plot_every <= 0:

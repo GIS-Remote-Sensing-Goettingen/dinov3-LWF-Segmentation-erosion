@@ -108,7 +108,7 @@ Its job is orchestration at the holdout-set level:
 
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 
-When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply a manual XGB score boost inside `SOURCE_LABEL_RASTER` pixels. This boost is not used during validation inference or tuning.
+When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply manual XGB score multipliers separately inside and outside `SOURCE_LABEL_RASTER` pixels. This prior is not used during validation inference or tuning.
 When the optimized XGB scorer is active, the first 3 pending holdout tiles are also compared against the legacy scorer. If the optimized and legacy score maps differ meaningfully, the run logs the mismatch and automatically falls back to the legacy scorer for the rest of that holdout phase.
 
 ## Major Functions

@@ -392,7 +392,7 @@ def _apply_inference_score_prior(
     *,
     final_inference_phase: bool,
 ) -> np.ndarray:
-    """Apply the manual inference-only score prior inside source-label pixels.
+    """Apply the manual inference-only score prior inside/outside source-label pixels.
 
     Examples:
         >>> score = np.array([[0.5, 0.5]], dtype=np.float32)
@@ -410,20 +410,38 @@ def _apply_inference_score_prior(
     if not final_inference_phase or not prior_cfg.enabled:
         return score_map
     inside_mask = labels_sh > 0
-    if not np.any(inside_mask):
+    outside_mask = ~inside_mask
+    if not np.any(inside_mask) and not np.any(outside_mask):
         return score_map
     score_with_prior = score_map.astype(np.float32, copy=True)
-    score_before = score_with_prior[inside_mask]
-    score_with_prior[inside_mask] *= float(prior_cfg.factor)
+    inside_before = (
+        score_with_prior[inside_mask].copy() if np.any(inside_mask) else None
+    )
+    outside_before = (
+        score_with_prior[outside_mask].copy() if np.any(outside_mask) else None
+    )
+    if np.any(inside_mask):
+        score_with_prior[inside_mask] *= float(prior_cfg.inside_factor)
+    if np.any(outside_mask):
+        score_with_prior[outside_mask] *= float(prior_cfg.outside_factor)
     score_with_prior = np.clip(score_with_prior, 0.0, float(prior_cfg.clip_max))
-    score_after = score_with_prior[inside_mask]
+    inside_after = score_with_prior[inside_mask] if np.any(inside_mask) else None
+    outside_after = score_with_prior[outside_mask] if np.any(outside_mask) else None
     logger.info(
-        "inference score prior: tile=%s factor=%.3f boosted_pixels=%s mean_before=%.4f mean_after=%.4f",
+        (
+            "inference score prior: tile=%s inside_factor=%.3f outside_factor=%.3f "
+            "inside_pixels=%s outside_pixels=%s inside_mean_before=%.4f "
+            "inside_mean_after=%.4f outside_mean_before=%.4f outside_mean_after=%.4f"
+        ),
         image_id_b,
-        float(prior_cfg.factor),
+        float(prior_cfg.inside_factor),
+        float(prior_cfg.outside_factor),
         int(inside_mask.sum()),
-        float(score_before.mean()),
-        float(score_after.mean()),
+        int(outside_mask.sum()),
+        float(inside_before.mean()) if inside_before is not None else 0.0,
+        float(inside_after.mean()) if inside_after is not None else 0.0,
+        float(outside_before.mean()) if outside_before is not None else 0.0,
+        float(outside_after.mean()) if outside_after is not None else 0.0,
     )
     return score_with_prior
 

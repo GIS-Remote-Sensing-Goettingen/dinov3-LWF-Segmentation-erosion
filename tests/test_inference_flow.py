@@ -304,15 +304,16 @@ def test_resolve_tiles_from_gt_presence_prefilters_by_source_label_presence(
     )
 
 
-def test_apply_inference_score_prior_boosts_only_inside_source_labels(monkeypatch):
-    """The manual score prior should affect only source-label pixels.
+def test_apply_inference_score_prior_applies_inside_and_outside_factors(monkeypatch):
+    """The manual score prior should support separate inside/outside multipliers.
 
     Examples:
         >>> True
         True
     """
     monkeypatch.setattr(cfg.io.inference.score_prior, "enabled", True)
-    monkeypatch.setattr(cfg.io.inference.score_prior, "factor", 1.2)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "inside_factor", 1.2)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "outside_factor", 0.5)
     monkeypatch.setattr(cfg.io.inference.score_prior, "clip_max", 1.0)
     score_map = np.array([[0.4, 0.4]], dtype=np.float32)
     labels_sh = np.array([[1, 0]], dtype=np.uint8)
@@ -324,7 +325,7 @@ def test_apply_inference_score_prior_boosts_only_inside_source_labels(monkeypatc
         final_inference_phase=True,
     )
 
-    assert np.allclose(boosted, np.array([[0.48, 0.4]], dtype=np.float32))
+    assert np.allclose(boosted, np.array([[0.48, 0.2]], dtype=np.float32))
 
 
 def test_apply_inference_score_prior_is_disabled_outside_final_inference(
@@ -337,7 +338,8 @@ def test_apply_inference_score_prior_is_disabled_outside_final_inference(
         True
     """
     monkeypatch.setattr(cfg.io.inference.score_prior, "enabled", True)
-    monkeypatch.setattr(cfg.io.inference.score_prior, "factor", 1.2)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "inside_factor", 1.2)
+    monkeypatch.setattr(cfg.io.inference.score_prior, "outside_factor", 0.5)
     score_map = np.array([[0.4, 0.4]], dtype=np.float32)
     labels_sh = np.array([[1, 0]], dtype=np.uint8)
 
