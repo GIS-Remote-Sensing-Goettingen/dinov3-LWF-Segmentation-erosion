@@ -240,7 +240,7 @@ postprocess:
   novel_proposals:
     enabled: true
     # strict | balanced | lax | very_lax
-    heuristic_preset: balanced
+    heuristic_preset: strict
     # whole_tile allows suggestions outside SH raster bounds.
     search_scope: whole_tile
     # champion_score | champion_mask
@@ -250,9 +250,9 @@ postprocess:
     min_area_px: 100
     min_length_m: 20.0
     max_width_m: 18.0
-    min_skeleton_ratio: 6.0
-    min_pca_ratio: 2.0
-    max_circularity: 0.45
+    min_skeleton_ratio: 8.0
+    min_pca_ratio: 3.0
+    max_circularity: 0.30
     min_mean_score: 0.2
     max_road_overlap: 0.8
     connectivity: 2
