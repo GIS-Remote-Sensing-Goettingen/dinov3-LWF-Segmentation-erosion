@@ -8,10 +8,12 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from scipy.ndimage import binary_dilation, binary_erosion
 
 logger = logging.getLogger(__name__)
+_PLOT_DPI = 220
 
 
 def _normalize_heatmap(values: np.ndarray) -> np.ndarray:
@@ -53,6 +55,55 @@ def _overlay_mask(
     out_f = out.astype(np.float32)
     out_f[mask_bool] = (1.0 - alpha) * out_f[mask_bool] + alpha * c
     return np.clip(out_f, 0, 255).astype(img_rgb.dtype)
+
+
+def _proposal_unified_overlay(
+    img_rgb: np.ndarray,
+    accepted_mask: np.ndarray,
+    rejected_mask: np.ndarray,
+) -> np.ndarray:
+    """Overlay accepted and rejected proposals in one RGB panel.
+
+    Examples:
+        >>> img = np.zeros((2, 2, 3), dtype=np.uint8)
+        >>> out = _proposal_unified_overlay(img, np.array([[1, 0], [0, 0]]), np.array([[0, 1], [0, 0]]))
+        >>> out.shape
+        (2, 2, 3)
+    """
+    overlay = _overlay_mask(img_rgb, accepted_mask, (140, 235, 255), alpha=0.45)
+    overlay = _overlay_mask(overlay, rejected_mask, (255, 170, 170), alpha=0.45)
+    return overlay
+
+
+def _add_proposal_legend(
+    ax, legend_items: list[tuple[str, tuple[int, int, int]]]
+) -> None:
+    """Add a compact legend for proposal overlays.
+
+    Examples:
+        >>> fig, ax = plt.subplots()
+        >>> _add_proposal_legend(ax, [("Accepted", (140, 235, 255))])
+        >>> len(ax.get_legend().texts)
+        1
+        >>> plt.close(fig)
+    """
+    handles = [
+        Patch(
+            facecolor=np.array(rgb, dtype=np.float32) / 255.0,
+            edgecolor="none",
+            alpha=0.55,
+            label=label,
+        )
+        for label, rgb in legend_items
+    ]
+    ax.legend(
+        handles=handles,
+        loc="lower left",
+        fontsize=9,
+        frameon=True,
+        facecolor="white",
+        framealpha=0.85,
+    )
 
 
 def save_core_qualitative_plot(
@@ -114,7 +165,7 @@ def save_core_qualitative_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     out_path = os.path.join(plot_dir, f"{image_id_b}_qualitative_core.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved core qualitative to %s", out_path)
 
@@ -159,7 +210,7 @@ def save_score_threshold_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     out_path = os.path.join(plot_dir, f"{image_id_b}_score_threshold.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved score threshold to %s", out_path)
 
@@ -201,7 +252,7 @@ def save_disagreement_entropy_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     out_path = os.path.join(plot_dir, f"{image_id_b}_disagreement_entropy.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved disagreement/entropy to %s", out_path)
 
@@ -269,6 +320,14 @@ def save_proposal_overlay_plot(
         )
     )
     ax.axis("off")
+    _add_proposal_legend(
+        ax,
+        [
+            ("Inside auto", inside_auto_rgb),
+            ("Accepted", accept_rgb),
+            ("Rejected", reject_rgb),
+        ],
+    )
     if proposal_records:
         for rec in proposal_records:
             row = rec.get("centroid_row")
@@ -301,7 +360,7 @@ def save_proposal_overlay_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     out_path = os.path.join(plot_dir, f"{image_id_b}_proposal_overlay.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved proposal overlay to %s", out_path)
 
@@ -369,7 +428,7 @@ def save_dino_channel_importance_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     out_path = os.path.join(plot_dir, "xgb_dino_channel_importance.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved dino channel importance to %s", out_path)
     return out_path
@@ -423,7 +482,7 @@ def save_plot(
 
     if show_labels:
         axs[0, 2].imshow(labels_sh > 0, cmap="gray")
-        axs[0, 2].set_title("SOURCE_LABEL_RASTER (reprojected)")
+        axs[0, 2].set_title("Administrative buffered labels (reprojected)")
         axs[0, 2].axis("off")
 
     overlay_raw = img_b.copy()
@@ -465,7 +524,7 @@ def save_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_raw_crf.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    fig.savefig(plot_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved to %s", plot_path)
 
@@ -514,7 +573,7 @@ def save_best_model_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    fig.savefig(plot_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved champion overlay to %s", plot_path)
 
@@ -579,7 +638,7 @@ def save_knn_xgb_gt_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_{filename_suffix}")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    fig.savefig(plot_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved kNN/XGB/GT overlay to %s", plot_path)
 
@@ -629,11 +688,8 @@ def save_unified_plot(
         return f"{base} IoU={m['iou']:.3f}, F1={m['f1']:.3f}"
 
     panels = []
-    panels.append(("RGB", img_b, None))
     if labels_sh is not None:
-        panels.append(("Source labels", labels_sh > 0, "gray"))
-    if gt_available:
-        panels.append(("GT" if show_metrics else "GT", gt_mask > 0, "gray"))
+        panels.append(("Administrative buffered labels", labels_sh > 0, "gray"))
     if similarity_map is not None:
         panels.append(
             ("DINO similarity", _normalize_heatmap(similarity_map), "coolwarm")
@@ -663,11 +719,13 @@ def save_unified_plot(
     for key, label in phase_order:
         if key not in masks:
             continue
+        display_key = f"{key}_plot" if f"{key}_plot" in masks else key
+        display_label = f"{label} preview" if display_key != key else label
         overlay = img_b.copy()
-        overlay[masks[key].astype(bool)] = (
-            0.5 * overlay[masks[key].astype(bool)] + 0.5 * np.array([255, 0, 0])
+        overlay[masks[display_key].astype(bool)] = (
+            0.5 * overlay[masks[display_key].astype(bool)] + 0.5 * np.array([255, 0, 0])
         ).astype(overlay.dtype)
-        panels.append((_title(label, key), overlay, None))
+        panels.append((_title(display_label, key), overlay, None))
 
     if skeleton is not None:
         overlay_skel = img_b.copy()
@@ -677,32 +735,18 @@ def save_unified_plot(
         panels.append(("Skeleton + endpoints", overlay_skel, None))
 
     if proposal_masks:
-        if "candidate" in proposal_masks:
+        if "accepted" in proposal_masks or "rejected" in proposal_masks:
             panels.append(
                 (
-                    "Proposal candidates",
-                    _overlay_mask(
-                        img_b, proposal_masks["candidate"], (255, 255, 0), 0.5
-                    ),
-                    None,
-                )
-            )
-        if "accepted" in proposal_masks:
-            panels.append(
-                (
-                    "Proposals accepted",
-                    _overlay_mask(
-                        img_b, proposal_masks["accepted"], (0, 255, 255), 0.6
-                    ),
-                    None,
-                )
-            )
-        if "rejected" in proposal_masks:
-            panels.append(
-                (
-                    "Proposals rejected",
-                    _overlay_mask(
-                        img_b, proposal_masks["rejected"], (255, 165, 0), 0.6
+                    "Proposals",
+                    _proposal_unified_overlay(
+                        img_b,
+                        proposal_masks.get(
+                            "accepted", np.zeros(img_b.shape[:2], dtype=bool)
+                        ),
+                        proposal_masks.get(
+                            "rejected", np.zeros(img_b.shape[:2], dtype=bool)
+                        ),
                     ),
                     None,
                 )
@@ -721,6 +765,14 @@ def save_unified_plot(
         else:
             axs[r, c].imshow(img, cmap=cmap)
         axs[r, c].set_title(title)
+        if title == "Proposals":
+            _add_proposal_legend(
+                axs[r, c],
+                [
+                    ("Accepted", (140, 235, 255)),
+                    ("Rejected", (255, 170, 170)),
+                ],
+            )
         axs[r, c].axis("off")
         if (
             skeleton is not None
@@ -744,6 +796,6 @@ def save_unified_plot(
     plt.tight_layout()
     os.makedirs(plot_dir, exist_ok=True)
     plot_path = os.path.join(plot_dir, f"{image_id_b}_unified.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    fig.savefig(plot_path, dpi=_PLOT_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("plot saved unified to %s", plot_path)

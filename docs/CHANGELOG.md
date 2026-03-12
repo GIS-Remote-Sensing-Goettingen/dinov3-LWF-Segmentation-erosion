@@ -15,6 +15,66 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Split feature-cache persistence into separate training/inference toggles and add explicit cache-cost metadata to feature-prefetch performance logging.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/feature_ops/extraction.py`, `segedge/pipeline/run.py`, `segedge/pipeline/workflows/shared.py`, `segedge/pipeline/workflows/manual_training.py`, `segedge/pipeline/workflows/loo_training.py`, `segedge/pipeline/workflows/inference_only.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: One-shot inference runs should be able to avoid building disk feature cache while training/tuning still keeps reusable feature artifacts, and performance analysis needs to show how much cache I/O is costing.
+- Problems fixed: `runtime.cache_training_features` and `runtime.cache_inference_features` now control disk persistence independently, legacy `runtime.feature_cache_mode` remains backward compatible for existing configs, holdout inference can run without writing feature cache even when training uses disk cache, feature consolidation respects the active phase-specific cache mode, and `performance.jsonl` / `run.log` now report cached-vs-computed tile counts plus approximate feature/manifest bytes read and written during prefetch.
+
+- Description: Let outside-buffer novel proposals trade some extra width for stronger elongation while keeping an absolute width cap.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/postprocess.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Allow obviously elongated candidates to survive moderate thickness without opening the door to arbitrary wide blobs.
+- Problems fixed: Outside-buffer proposals no longer fail on width alone when `pca_ratio` is strong enough, new `width_bonus_per_pca` and `hard_width_cap_m` settings make that tradeoff explicit, and the old hard-width behavior remains available by setting `width_bonus_per_pca` to `0`.
+
+- Description: Split holdout performance logging so tile context loading and feature prefetch/extraction are timed separately.
+- Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_performance_logging.py`, `docs/CHANGELOG.md`
+- Reason: Recent slow runs were dominated by cache-miss feature extraction, but the old `load_context` span hid that work inside one misleading bucket.
+- Problems fixed: `performance.jsonl` now distinguishes real tile-context work from feature prefetch/extraction at the `infer_on_holdout` level, making slow runs much easier to diagnose.
+
+- Description: Improve inference plot readability and consolidate proposal visualization in the unified plot.
+- Files touched: `segedge/core/plotting.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Make the unified plot show more of the XGB behavior outside the label buffer, reduce proposal-panel clutter, and export less pixelated images for review.
+- Problems fixed: Unified inference plots can now show plot-only XGB raw/CRF preview masks outside the SH/source-label buffer without changing saved masks or metrics, accepted and rejected proposals are merged into one overlay panel with clearer colors, proposal plots now include an in-plot legend for the overlay colors, source-label panels are labeled `Administrative buffered labels`, standalone RGB/GT panels are removed from the unified inference layout, and inference plot PNGs are saved at a higher DPI.
+
+- Description: Add per-plot inference toggles under `io.inference.plots` and copy the active `config.yml` into each run directory.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Reduce inference artifact overhead without disabling plotting globally, and keep each `run_*` output self-contained with the exact settings that produced it.
+- Problems fixed: Individual inference plot types can now be disabled independently while `plot_every` still controls cadence, and every run directory now includes a config snapshot for later inspection or reruns.
+
+- Description: Split the final-inference XGB score prior into separate inside/outside multipliers for `SOURCE_LABEL_RASTER`, while keeping the old single `factor` config backward compatible.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Allow the user to bias XGB scores differently inside and outside the source-label raster without changing validation or tuning behavior.
+- Problems fixed: Final holdout inference can now apply separate inside/outside XGB multipliers, old configs that still use `factor` keep the previous inside-only behavior, rolling checkpoints and exported settings now write both multipliers, and logging/tests now cover both regions explicitly.
+
+- Description: Cache per-tile `SOURCE_LABEL_RASTER` label-presence decisions under `output/.cache` so repeated folder/list inference runs stop reopening every candidate tile during startup filtering.
+- Files touched: `segedge/pipeline/common.py`, `tests/test_inference_flow.py`, `docs/CHANGELOG.md`
+- Reason: The inference bootstrap was spending several minutes rescanning thousands of candidate tiles before holdout processing even started.
+- Problems fixed: Repeated runs now reuse cached tile inclusion/exclusion decisions when the tile file and source-label raster metadata are unchanged, while changed tiles still invalidate and recheck safely.
+
+- Description: Speed up final inference with batched XGB prediction, per-image feature-cache manifests, deeper performance spans, a first-3-tiles XGB legacy guard, and `io.inference.plot_every` plot sampling.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/feature_ops/cache.py`, `segedge/core/feature_ops/extraction.py`, `segedge/core/feature_ops/fusion.py`, `segedge/core/xdboost.py`, `segedge/core/crf_utils.py`, `segedge/core/timing_utils.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/crf_eval.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/postprocess.py`, `segedge/pipeline/runtime/tile_context.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/workflows/shared.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_crf_utils.py`, `tests/test_inference_flow.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Reduce XGB/cache overhead in the holdout hot path while keeping an automatic correctness barrier and better profiling visibility for the next optimization pass.
+- Problems fixed: XGB scoring now batches prediction rows across tiles without buffering the whole image, uses a larger row-budgeted `inplace_predict` batch instead of flushing purely by tile count, avoids redundant float casts in the scorer hot path, uses a dedicated XGB fusion fast path that skips layout bookkeeping while preserving feature semantics, cache-hit validation can reuse a per-image manifest without trusting unreadable lazy cache files, the first 3 holdout tiles compare optimized vs legacy XGB scores and now short-circuit directly to the legacy scorer after a meaningful difference, XGB CRF can now use a trimap-band unary to fill holes and push the coarse patch-derived mask toward RGB edges with a single new `search.crf.trimap_band_pixels_values` control, plot rendering can be sampled with `io.inference.plot_every`, and `performance.jsonl` now exposes deeper spans inside fusion, CRF, plots, tile context, and proposal metrics.
+
+- Description: Add `scripts/analyze_performance_log.py` to summarize `performance.jsonl` by stage, substage, and hottest tile contributors, ignore generated `performance.jsonl` files in the repo file-length guard, and speed the guard up by preferring git-tracked files plus streamed byte counting.
+- Files touched: `scripts/analyze_performance_log.py`, `tests/test_analyze_performance_log.py`, `scripts/check_file_length.py`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Make the new structured performance log usable for iterative bottleneck analysis without hand-parsing JSONL.
+- Problems fixed: The repository now has a repeatable EDA entrypoint that reports average durations per process, per sub-process, per tile, can export CSV summaries for deeper comparison across runs, defaults mixed logs to inference-only rows instead of contaminating summaries with `phase=null`/`tile=null` training spans, highlights excluded records and `load_context` outliers explicitly, pre-commit no longer fails on large generated profiling logs, and the file-length hook no longer pays for a full recursive scan of the workspace on every run.
+
+- Description: Add `postprocess.fill_holes_xgb` so XGB raw masks can fill enclosed holes before trimap CRF in validation and final inference.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/crf_utils.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/crf_eval.py`, `segedge/pipeline/tuning.py`, `tests/test_crf_utils.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Let CRF expand from the filled coarse XGB mask instead of the original holey threshold mask produced from patch-resolution scores.
+- Problems fixed: Hole filling now affects both exported XGB raw masks and the XGB trimap CRF base mask, keeping validation/tuning and holdout inference aligned.
+
+- Description: Allow inference-only runs with `io.inference.model_bundle_dir: null` to reuse the newest valid previous `output/run_*/model_bundle`.
+- Files touched: `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `docs/KB.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: Remove the need to manually copy the last bundle path into the config for every inference-only run.
+- Problems fixed: `io.training=false` no longer fails at config load when `model_bundle_dir` is unset, inference-only bootstrap now resolves the latest valid prior bundle automatically, explicit bundle paths still take precedence, and the fallback failure mode is now explicit when no previous bundle exists.
+
+- Description: Add structured `performance.jsonl` logging for inference internals, cache GT vector geometries by CRS, stream XGB cached features more lazily, and refactor novel-proposal evaluation onto local component crops.
+- Files touched: `segedge/core/timing_utils.py`, `segedge/core/io_utils.py`, `segedge/core/feature_ops/cache.py`, `segedge/core/feature_ops/extraction.py`, `segedge/core/xdboost.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/postprocess.py`, `segedge/pipeline/runtime/tile_context.py`, `tests/test_performance_logging.py`, `tests/test_io_utils_reproject.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: Make long inference runs measurable at the function-internal level and reduce the dominant CPU overhead without adding new runtime knobs.
+- Problems fixed: Each run now writes machine-readable per-span performance data alongside `run.log`, holdout inference records tile/phase-aware timing summaries, GT vector reprojection work is reused across tiles, source-label reprojection now reuses cached raster handles and avoids the old `MemoryFile` roundtrip with an aligned-grid window-read fast path, XGB-only inference no longer materializes every cached feature array up front, and novel-proposal analysis now evaluates components from local bounding boxes instead of rebuilding full-image masks for every candidate.
+
 - Description: Add a manual `io.inference.score_prior` that boosts XGB scores inside `SOURCE_LABEL_RASTER` pixels during the final holdout/inference phase only.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/workflows/shared.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Allow manual recall-oriented score adjustment inside known source-label regions without affecting validation metrics or threshold tuning.

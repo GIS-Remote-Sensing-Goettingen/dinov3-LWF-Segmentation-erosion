@@ -9,7 +9,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter
 
 from ..config_loader import cfg
-from ..timing_utils import DEBUG_TIMING, DEBUG_TIMING_VERBOSE, time_end
+from ..timing_utils import DEBUG_TIMING, DEBUG_TIMING_VERBOSE, perf_span, time_end
 from .spec import hybrid_feature_spec_hash
 
 logger = logging.getLogger(__name__)
@@ -237,6 +237,183 @@ def deserialize_xgb_feature_stats(payload: dict | None) -> dict | None:
     }
 
 
+def _weighted_feature_block(values_hwc: np.ndarray, weight: float) -> np.ndarray | None:
+    """Return a weighted feature block without redundant casts.
+
+    Examples:
+        >>> _weighted_feature_block(np.ones((1, 1, 1), dtype=np.float32), 1.0).shape
+        (1, 1, 1)
+    """
+    if values_hwc.size == 0 or values_hwc.shape[-1] == 0:
+        return None
+    values = (
+        values_hwc
+        if values_hwc.dtype == np.float32
+        else values_hwc.astype(np.float32, copy=False)
+    )
+    if float(weight) == 1.0:
+        return values
+    return values * np.float32(weight)
+
+
+def _fuse_patch_features_fast_xgb(
+    dino_feats_hwc: np.ndarray,
+    img_tile_hw3: np.ndarray | None,
+    ps: int,
+    *,
+    xgb_feature_stats: dict | None = None,
+) -> np.ndarray:
+    """Fast XGB-only fusion path without layout bookkeeping.
+
+    Examples:
+        >>> feats = np.ones((1, 1, 2), dtype=np.float32)
+        >>> _fuse_patch_features_fast_xgb(feats, None, 16).shape
+        (1, 1, 2)
+    """
+    hf = cfg.model.hybrid_features
+    hp, wp, _ = dino_feats_hwc.shape
+    use_hybrid = bool(hf.enabled)
+    feat_blocks: list[np.ndarray] = []
+
+    if (not use_hybrid) or hf.blocks.dino.enabled:
+        with perf_span(
+            "fuse_patch_features", substage="dino_block", extra={"mode": "xgb"}
+        ):
+            dino_block = _weighted_feature_block(
+                dino_feats_hwc,
+                _mode_weight(hf.blocks.dino, "xgb") if use_hybrid else 1.0,
+            )
+        if dino_block is not None:
+            feat_blocks.append(dino_block)
+
+    if use_hybrid and img_tile_hw3 is not None:
+        with perf_span(
+            "fuse_patch_features",
+            substage="prepare_image_blocks",
+            extra={"mode": "xgb"},
+        ):
+            h_eff = hp * ps
+            w_eff = wp * ps
+            img_c = img_tile_hw3[:h_eff, :w_eff, :3]
+            img_f = (
+                img_c
+                if img_c.dtype == np.float32
+                else img_c.astype(np.float32, copy=False)
+            )
+            if img_f.max() > 1.5:
+                img_f = img_f / np.float32(255.0)
+            patch_rgb = img_f.reshape(hp, ps, wp, ps, 3)
+            gray = (
+                0.2989 * img_f[:, :, 0]
+                + 0.5870 * img_f[:, :, 1]
+                + 0.1140 * img_f[:, :, 2]
+            ).astype(np.float32)
+            gy, gx = np.gradient(gray)
+            grad_mag = np.hypot(gx, gy).astype(np.float32)
+            grad_ori = np.mod(np.arctan2(gy, gx), 2.0 * np.pi).astype(np.float32)
+            rows = (np.arange(h_eff, dtype=np.int32) // ps).reshape(-1, 1)
+            cols = (np.arange(w_eff, dtype=np.int32) // ps).reshape(1, -1)
+            patch_idx_map = rows * wp + cols
+
+        if hf.blocks.rgb_stats.enabled:
+            with perf_span("fuse_patch_features", substage="rgb_stats_block"):
+                rgb_mean = patch_rgb.mean(axis=(1, 3)).astype(np.float32)
+                rgb_std = patch_rgb.std(axis=(1, 3)).astype(np.float32)
+                block = _weighted_feature_block(
+                    np.concatenate([rgb_mean, rgb_std], axis=-1),
+                    _mode_weight(hf.blocks.rgb_stats, "xgb"),
+                )
+            if block is not None:
+                feat_blocks.append(block)
+
+        if hf.blocks.hsv_mean.enabled:
+            with perf_span("fuse_patch_features", substage="hsv_mean_block"):
+                hsv = _rgb_to_hsv_image(img_f)
+                patch_hsv = hsv.reshape(hp, ps, wp, ps, 3)
+                block = _weighted_feature_block(
+                    patch_hsv.mean(axis=(1, 3)).astype(np.float32),
+                    _mode_weight(hf.blocks.hsv_mean, "xgb"),
+                )
+            if block is not None:
+                feat_blocks.append(block)
+
+        if hf.blocks.grad_stats.enabled:
+            with perf_span("fuse_patch_features", substage="grad_stats_block"):
+                grad_blocks = grad_mag.reshape(hp, ps, wp, ps)
+                grad_mean = grad_blocks.mean(axis=(1, 3))
+                grad_std = grad_blocks.std(axis=(1, 3))
+                grad_stats = np.stack([grad_mean, grad_std], axis=-1).astype(np.float32)
+                block = _weighted_feature_block(
+                    grad_stats,
+                    _mode_weight(hf.blocks.grad_stats, "xgb"),
+                )
+            if block is not None:
+                feat_blocks.append(block)
+
+        if hf.blocks.grad_orient_hist.enabled:
+            with perf_span("fuse_patch_features", substage="grad_orient_hist_block"):
+                bins = int(hf.blocks.grad_orient_hist.bins or 8)
+                ori_bins = np.floor((grad_ori / (2.0 * np.pi)) * bins).astype(np.int32)
+                ori_bins = np.clip(ori_bins, 0, bins - 1)
+                hist = np.zeros((hp * wp, bins), dtype=np.float32)
+                np.add.at(
+                    hist,
+                    (patch_idx_map.reshape(-1), ori_bins.reshape(-1)),
+                    grad_mag.reshape(-1),
+                )
+                hist /= hist.sum(axis=1, keepdims=True) + 1e-8
+                block = _weighted_feature_block(
+                    hist.reshape(hp, wp, bins),
+                    _mode_weight(hf.blocks.grad_orient_hist, "xgb"),
+                )
+            if block is not None:
+                feat_blocks.append(block)
+
+        if hf.blocks.lbp_hist.enabled:
+            with perf_span("fuse_patch_features", substage="lbp_hist_block"):
+                lbp_bins = int(hf.blocks.lbp_hist.bins or 16)
+                lbp_codes = _compute_lbp_codes(gray)
+                if lbp_codes.size > 0:
+                    lbp_idx = ((lbp_codes.astype(np.int32) * lbp_bins) // 256).astype(
+                        np.int32
+                    )
+                    lbp_idx = np.clip(lbp_idx, 0, lbp_bins - 1)
+                    patch_idx_inner = patch_idx_map[1:-1, 1:-1]
+                    hist = np.zeros((hp * wp, lbp_bins), dtype=np.float32)
+                    np.add.at(
+                        hist,
+                        (patch_idx_inner.reshape(-1), lbp_idx.reshape(-1)),
+                        1.0,
+                    )
+                    hist /= hist.sum(axis=1, keepdims=True) + 1e-8
+                    lbp_hist = hist.reshape(hp, wp, lbp_bins)
+                else:
+                    lbp_hist = np.zeros((hp, wp, lbp_bins), dtype=np.float32)
+                block = _weighted_feature_block(
+                    lbp_hist,
+                    _mode_weight(hf.blocks.lbp_hist, "xgb"),
+                )
+            if block is not None:
+                feat_blocks.append(block)
+
+    if not feat_blocks:
+        fused = (
+            dino_feats_hwc
+            if dino_feats_hwc.dtype == np.float32
+            else dino_feats_hwc.astype(np.float32, copy=False)
+        )
+    elif len(feat_blocks) == 1:
+        fused = feat_blocks[0]
+    else:
+        with perf_span("fuse_patch_features", substage="concat_blocks"):
+            fused = np.concatenate(feat_blocks, axis=-1)
+
+    if use_hybrid and hf.xgb_zscore and xgb_feature_stats is not None:
+        with perf_span("fuse_patch_features", substage="xgb_zscore"):
+            fused = _apply_xgb_stats_hwc(fused, xgb_feature_stats)
+    return fused
+
+
 def fuse_patch_features(
     dino_feats_hwc: np.ndarray,
     img_tile_hw3: np.ndarray | None,
@@ -256,6 +433,16 @@ def fuse_patch_features(
         raise ValueError(f"mode must be 'knn' or 'xgb', got {mode}")
     if dino_feats_hwc.ndim != 3:
         raise ValueError("dino_feats_hwc must be (Hp, Wp, C)")
+    if mode == "xgb" and not return_layout:
+        return (
+            _fuse_patch_features_fast_xgb(
+                dino_feats_hwc,
+                img_tile_hw3,
+                ps,
+                xgb_feature_stats=xgb_feature_stats,
+            ),
+            None,
+        )
 
     hf = cfg.model.hybrid_features
     hp, wp, dino_dim = dino_feats_hwc.shape
@@ -286,124 +473,139 @@ def fuse_patch_features(
     use_hybrid = bool(hf.enabled)
     if (not use_hybrid) or hf.blocks.dino.enabled:
         dino_weight = _mode_weight(hf.blocks.dino, mode) if use_hybrid else 1.0
-        add_block(
-            "dino",
-            dino_feats_hwc,
-            [f"dino_{i}" for i in range(dino_dim)] if return_layout else [],
-            dino_weight,
-        )
+        with perf_span(
+            "fuse_patch_features", substage="dino_block", extra={"mode": mode}
+        ):
+            add_block(
+                "dino",
+                dino_feats_hwc,
+                [f"dino_{i}" for i in range(dino_dim)] if return_layout else [],
+                dino_weight,
+            )
 
     if use_hybrid and img_tile_hw3 is not None:
-        h_eff = hp * ps
-        w_eff = wp * ps
-        img_c = img_tile_hw3[:h_eff, :w_eff, :3]
-        img_f = img_c.astype(np.float32)
-        if img_f.max() > 1.5:
-            img_f /= 255.0
-        patch_rgb = img_f.reshape(hp, ps, wp, ps, 3)
-        gray = (
-            0.2989 * img_f[:, :, 0] + 0.5870 * img_f[:, :, 1] + 0.1140 * img_f[:, :, 2]
-        ).astype(np.float32)
-        gy, gx = np.gradient(gray)
-        grad_mag = np.hypot(gx, gy).astype(np.float32)
-        grad_ori = np.mod(np.arctan2(gy, gx), 2.0 * np.pi).astype(np.float32)
+        with perf_span(
+            "fuse_patch_features",
+            substage="prepare_image_blocks",
+            extra={"mode": mode},
+        ):
+            h_eff = hp * ps
+            w_eff = wp * ps
+            img_c = img_tile_hw3[:h_eff, :w_eff, :3]
+            img_f = img_c.astype(np.float32)
+            if img_f.max() > 1.5:
+                img_f /= 255.0
+            patch_rgb = img_f.reshape(hp, ps, wp, ps, 3)
+            gray = (
+                0.2989 * img_f[:, :, 0]
+                + 0.5870 * img_f[:, :, 1]
+                + 0.1140 * img_f[:, :, 2]
+            ).astype(np.float32)
+            gy, gx = np.gradient(gray)
+            grad_mag = np.hypot(gx, gy).astype(np.float32)
+            grad_ori = np.mod(np.arctan2(gy, gx), 2.0 * np.pi).astype(np.float32)
 
-        rows = (np.arange(h_eff, dtype=np.int32) // ps).reshape(-1, 1)
-        cols = (np.arange(w_eff, dtype=np.int32) // ps).reshape(1, -1)
-        patch_idx_map = rows * wp + cols
+            rows = (np.arange(h_eff, dtype=np.int32) // ps).reshape(-1, 1)
+            cols = (np.arange(w_eff, dtype=np.int32) // ps).reshape(1, -1)
+            patch_idx_map = rows * wp + cols
 
         if hf.blocks.rgb_stats.enabled:
-            rgb_mean = patch_rgb.mean(axis=(1, 3)).astype(np.float32)
-            rgb_std = patch_rgb.std(axis=(1, 3)).astype(np.float32)
-            add_block(
-                "rgb_stats",
-                np.concatenate([rgb_mean, rgb_std], axis=-1),
-                (
-                    [
-                        "rgb_mean_r",
-                        "rgb_mean_g",
-                        "rgb_mean_b",
-                        "rgb_std_r",
-                        "rgb_std_g",
-                        "rgb_std_b",
-                    ]
-                    if return_layout
-                    else []
-                ),
-                _mode_weight(hf.blocks.rgb_stats, mode),
-            )
+            with perf_span("fuse_patch_features", substage="rgb_stats_block"):
+                rgb_mean = patch_rgb.mean(axis=(1, 3)).astype(np.float32)
+                rgb_std = patch_rgb.std(axis=(1, 3)).astype(np.float32)
+                add_block(
+                    "rgb_stats",
+                    np.concatenate([rgb_mean, rgb_std], axis=-1),
+                    (
+                        [
+                            "rgb_mean_r",
+                            "rgb_mean_g",
+                            "rgb_mean_b",
+                            "rgb_std_r",
+                            "rgb_std_g",
+                            "rgb_std_b",
+                        ]
+                        if return_layout
+                        else []
+                    ),
+                    _mode_weight(hf.blocks.rgb_stats, mode),
+                )
 
         if hf.blocks.hsv_mean.enabled:
-            hsv = _rgb_to_hsv_image(img_f)
-            patch_hsv = hsv.reshape(hp, ps, wp, ps, 3)
-            hsv_mean = patch_hsv.mean(axis=(1, 3)).astype(np.float32)
-            add_block(
-                "hsv_mean",
-                hsv_mean,
-                ["hsv_mean_h", "hsv_mean_s", "hsv_mean_v"] if return_layout else [],
-                _mode_weight(hf.blocks.hsv_mean, mode),
-            )
+            with perf_span("fuse_patch_features", substage="hsv_mean_block"):
+                hsv = _rgb_to_hsv_image(img_f)
+                patch_hsv = hsv.reshape(hp, ps, wp, ps, 3)
+                hsv_mean = patch_hsv.mean(axis=(1, 3)).astype(np.float32)
+                add_block(
+                    "hsv_mean",
+                    hsv_mean,
+                    ["hsv_mean_h", "hsv_mean_s", "hsv_mean_v"] if return_layout else [],
+                    _mode_weight(hf.blocks.hsv_mean, mode),
+                )
 
         if hf.blocks.grad_stats.enabled:
-            grad_blocks = grad_mag.reshape(hp, ps, wp, ps)
-            grad_mean = grad_blocks.mean(axis=(1, 3))
-            grad_std = grad_blocks.std(axis=(1, 3))
-            grad_stats = np.stack([grad_mean, grad_std], axis=-1).astype(np.float32)
-            add_block(
-                "grad_stats",
-                grad_stats,
-                ["grad_mag_mean", "grad_mag_std"] if return_layout else [],
-                _mode_weight(hf.blocks.grad_stats, mode),
-            )
+            with perf_span("fuse_patch_features", substage="grad_stats_block"):
+                grad_blocks = grad_mag.reshape(hp, ps, wp, ps)
+                grad_mean = grad_blocks.mean(axis=(1, 3))
+                grad_std = grad_blocks.std(axis=(1, 3))
+                grad_stats = np.stack([grad_mean, grad_std], axis=-1).astype(np.float32)
+                add_block(
+                    "grad_stats",
+                    grad_stats,
+                    ["grad_mag_mean", "grad_mag_std"] if return_layout else [],
+                    _mode_weight(hf.blocks.grad_stats, mode),
+                )
 
         if hf.blocks.grad_orient_hist.enabled:
-            bins = int(hf.blocks.grad_orient_hist.bins or 8)
-            ori_bins = np.floor((grad_ori / (2.0 * np.pi)) * bins).astype(np.int32)
-            ori_bins = np.clip(ori_bins, 0, bins - 1)
-            hist = np.zeros((hp * wp, bins), dtype=np.float32)
-            np.add.at(
-                hist,
-                (patch_idx_map.reshape(-1), ori_bins.reshape(-1)),
-                grad_mag.reshape(-1),
-            )
-            hist /= hist.sum(axis=1, keepdims=True) + 1e-8
-            hist = hist.reshape(hp, wp, bins)
-            add_block(
-                "grad_orient_hist",
-                hist,
-                (
-                    [f"grad_orient_hist_{i}" for i in range(bins)]
-                    if return_layout
-                    else []
-                ),
-                _mode_weight(hf.blocks.grad_orient_hist, mode),
-            )
-
-        if hf.blocks.lbp_hist.enabled:
-            lbp_bins = int(hf.blocks.lbp_hist.bins or 16)
-            lbp_codes = _compute_lbp_codes(gray)
-            if lbp_codes.size > 0:
-                lbp_idx = ((lbp_codes.astype(np.int32) * lbp_bins) // 256).astype(
-                    np.int32
-                )
-                lbp_idx = np.clip(lbp_idx, 0, lbp_bins - 1)
-                patch_idx_inner = patch_idx_map[1:-1, 1:-1]
-                hist = np.zeros((hp * wp, lbp_bins), dtype=np.float32)
+            with perf_span("fuse_patch_features", substage="grad_orient_hist_block"):
+                bins = int(hf.blocks.grad_orient_hist.bins or 8)
+                ori_bins = np.floor((grad_ori / (2.0 * np.pi)) * bins).astype(np.int32)
+                ori_bins = np.clip(ori_bins, 0, bins - 1)
+                hist = np.zeros((hp * wp, bins), dtype=np.float32)
                 np.add.at(
                     hist,
-                    (patch_idx_inner.reshape(-1), lbp_idx.reshape(-1)),
-                    1.0,
+                    (patch_idx_map.reshape(-1), ori_bins.reshape(-1)),
+                    grad_mag.reshape(-1),
                 )
                 hist /= hist.sum(axis=1, keepdims=True) + 1e-8
-                hist = hist.reshape(hp, wp, lbp_bins)
-            else:
-                hist = np.zeros((hp, wp, lbp_bins), dtype=np.float32)
-            add_block(
-                "lbp_hist",
-                hist,
-                [f"lbp_hist_{i}" for i in range(lbp_bins)] if return_layout else [],
-                _mode_weight(hf.blocks.lbp_hist, mode),
-            )
+                hist = hist.reshape(hp, wp, bins)
+                add_block(
+                    "grad_orient_hist",
+                    hist,
+                    (
+                        [f"grad_orient_hist_{i}" for i in range(bins)]
+                        if return_layout
+                        else []
+                    ),
+                    _mode_weight(hf.blocks.grad_orient_hist, mode),
+                )
+
+        if hf.blocks.lbp_hist.enabled:
+            with perf_span("fuse_patch_features", substage="lbp_hist_block"):
+                lbp_bins = int(hf.blocks.lbp_hist.bins or 16)
+                lbp_codes = _compute_lbp_codes(gray)
+                if lbp_codes.size > 0:
+                    lbp_idx = ((lbp_codes.astype(np.int32) * lbp_bins) // 256).astype(
+                        np.int32
+                    )
+                    lbp_idx = np.clip(lbp_idx, 0, lbp_bins - 1)
+                    patch_idx_inner = patch_idx_map[1:-1, 1:-1]
+                    hist = np.zeros((hp * wp, lbp_bins), dtype=np.float32)
+                    np.add.at(
+                        hist,
+                        (patch_idx_inner.reshape(-1), lbp_idx.reshape(-1)),
+                        1.0,
+                    )
+                    hist /= hist.sum(axis=1, keepdims=True) + 1e-8
+                    hist = hist.reshape(hp, wp, lbp_bins)
+                else:
+                    hist = np.zeros((hp, wp, lbp_bins), dtype=np.float32)
+                add_block(
+                    "lbp_hist",
+                    hist,
+                    [f"lbp_hist_{i}" for i in range(lbp_bins)] if return_layout else [],
+                    _mode_weight(hf.blocks.lbp_hist, mode),
+                )
 
     if not feat_blocks:
         fused = dino_feats_hwc.astype(np.float32, copy=False)
@@ -411,12 +613,15 @@ def fuse_patch_features(
         if return_layout:
             feature_names = [f"dino_{i}" for i in range(fused.shape[-1])]
     else:
-        fused = np.concatenate(feat_blocks, axis=-1).astype(np.float32)
+        with perf_span("fuse_patch_features", substage="concat_blocks"):
+            fused = np.concatenate(feat_blocks, axis=-1).astype(np.float32)
 
     if use_hybrid and mode == "knn" and hf.knn_l2_normalize:
-        fused = l2_normalize(fused)
+        with perf_span("fuse_patch_features", substage="knn_l2_normalize"):
+            fused = l2_normalize(fused)
     if use_hybrid and mode == "xgb" and hf.xgb_zscore and xgb_feature_stats is not None:
-        fused = _apply_xgb_stats_hwc(fused, xgb_feature_stats)
+        with perf_span("fuse_patch_features", substage="xgb_zscore"):
+            fused = _apply_xgb_stats_hwc(fused, xgb_feature_stats)
 
     layout = None
     if return_layout:

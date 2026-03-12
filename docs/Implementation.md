@@ -8,7 +8,7 @@ This document explains how the current SegEdge pipeline actually runs, with emph
 
 1. Create or resume the run directory.
 2. Configure logging, processed-tile resume state, and rolling union shapefiles.
-3. Initialize the time-budget state and feature-cache mode.
+3. Initialize the time-budget state and phase-specific feature-cache settings.
 4. Resolve the tile set and dispatch the correct workflow.
 
 The dispatcher does not train or infer by itself. It builds a shared `common` runtime payload and passes it to one workflow module.
@@ -20,18 +20,27 @@ Function: `segedge.pipeline.workflows.run_inference_only`
 Use this when `io.training=false`.
 
 Execution order:
-1. Load `io.inference.model_bundle_dir`.
+1. Resolve the model bundle directory:
+   - use `io.inference.model_bundle_dir` when set
+   - otherwise use the newest valid previous `output/run_*/model_bundle`
 2. Validate that the bundle matches the current runtime assumptions:
    patch size, resample factor, tiling config, and feature-context radius.
 3. Write `rolling_best_setting.yml` with the bundle metadata.
 4. Export `inference_best_setting.yml` and the legacy `best_setting.yml`.
+5. Copy the current `config.yml` into the run directory.
 5. Run holdout inference on the resolved inference tile set.
-6. Summarize phase metrics and consolidate disk features if enabled.
+6. Summarize phase metrics and consolidate disk features if inference-side caching is enabled.
 
 Important behavior:
 - No training artifacts are built in this mode.
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
+- The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, cache read/write cost, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
+- Source-label reprojection is optimized in the shared I/O layer: repeated tiles reuse the same source-label raster handle, aligned same-CRS grids prefer direct window reads, and the performance log now splits source-label work into open/grid/reproject/finalize substages.
+- XGB CRF refinement can use a trimap-band unary: the current XGB mask is treated as strong interior foreground, a dilated ring is treated as uncertain, and CRF uses RGB edges to fill holes and expand/shrink that boundary band. The single tuning knob for this is `search.crf.trimap_band_pixels_values`.
+- `postprocess.fill_holes_xgb` can fill enclosed holes in the thresholded XGB raw mask before trimap CRF, so CRF expands from the filled coarse mask instead of the original holey threshold mask.
+- `io.inference.plot_every` can sample inference plots over pending tiles without changing mask generation, processed-tile logging, or union shapefile updates.
+- In the unified inference plot, XGB raw and XGB CRF panels can now use plot-only preview masks that are not clipped to the SH/source-label buffer, so the preview shows what the score stream is doing outside the label area without changing saved masks or metrics.
 
 ### Manual training workflow
 Function: `segedge.pipeline.workflows.run_manual_training`
@@ -98,10 +107,15 @@ Its job is orchestration at the holdout-set level:
 - append new masks into rolling union shapefiles
 - append one processed record to `processed_tiles.jsonl`
 - write the rolling checkpoint after each completed tile
+- emit rolling summaries into `performance.jsonl` every 10 completed inference tiles
 
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 
-When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply a manual XGB score boost inside `SOURCE_LABEL_RASTER` pixels. This boost is not used during validation inference or tuning.
+When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply manual XGB score multipliers separately inside and outside `SOURCE_LABEL_RASTER` pixels. This prior is not used during validation inference or tuning.
+`io.inference.plots` can disable individual inference plot types while leaving `plot_every` as the outer cadence control.
+The unified inference plot now renders accepted and rejected proposals in one combined subplot, with accepted regions shown as a light-blue transparent overlay and rejected regions shown as a light-red transparent overlay. It also labels the source-label panel as `Administrative buffered labels`, omits the standalone RGB and GT panels, and uses a higher DPI so the saved PNGs are less pixelated.
+Outside-buffer novel proposals can also relax their width limit when `pca_ratio` is well above `min_pca_ratio`: `width_bonus_per_pca` increases the allowed width for highly elongated components, while `hard_width_cap_m` still enforces an absolute maximum width.
+When the optimized XGB scorer is active, the first 3 pending holdout tiles are also compared against the legacy scorer. If the optimized and legacy score maps differ meaningfully, the run logs the mismatch and automatically falls back to the legacy scorer for the rest of that holdout phase.
 
 ## Major Functions
 ### `segedge.pipeline.run.main`
@@ -110,7 +124,7 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
 - Key decisions:
   - resume vs new run
   - inference-only vs manual vs LOO
-  - disk vs memory feature cache
+  - independent training vs inference feature-cache persistence
   - time-budget initialization policy
 
 ### `segedge.pipeline.workflows.run_inference_only`
@@ -136,6 +150,14 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
   - proposal exports and plots
   - per-tile metadata used by the outer holdout loop
 - Main value: all expensive per-tile inference happens in one place instead of being duplicated across workflows
+- Internal profiling now breaks this function down into:
+  - tile context load
+  - kNN/XGB streams
+  - CRF stage
+  - shadow stage
+  - novel proposals
+  - proposal export
+  - plot export
 
 ### `segedge.pipeline.runtime.checkpointing.write_rolling_best_config`
 - Inputs: stage name, tuned config, progress counts, optional fold and budget state
@@ -143,13 +165,15 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
 - Main value: interruption-safe state snapshots that are consistent across workflows
 
 ### `segedge.pipeline.workflows.shared.consolidate_cached_features`
-- Inputs: feature cache mode, feature directory, image ids to consolidate
-- Produces: merged per-image feature arrays when disk cache mode is active
+- Inputs: feature directory, image ids to consolidate, per-phase consolidation flags
+- Produces: merged per-image feature arrays when disk cache mode is active for the relevant phase
 - Main value: keeps feature cleanup out of the workflow bodies
 
 ## Feature and Runtime Packages
 ### `segedge/core/feature_ops`
 - `extraction.py`: DINO feature extraction and tile prefetch
+  - cached XGB-only inference tiles can now stay lazy and hand their `.npy` path to the scorer instead of loading the array up front
+  - prefetch logging now records cache hits, recomputed tiles, and approximate feature/manifest bytes read and written
 - `tiling.py`: tile iteration and patch-grid alignment
 - `fusion.py`: hybrid feature assembly and XGB stat transforms
 - `cache.py`: on-disk feature cache format
@@ -160,7 +184,9 @@ When `io.inference.score_prior.enabled=true`, the final holdout/inference phase 
 - `roads.py`: cached road-mask rasterization and roads penalty application
 - `crf_eval.py`: CRF worker initialization and evaluation
 - `postprocess.py`: shadow filtering and proposal heuristics
+  - proposal filtering now works on connected-component bounding boxes and short-circuits expensive morphology for obvious failures
 - `tile_context.py`: per-tile image, label, GT, and SH-buffer loading
+  - GT vector geometries are cached per source path and target CRS before rasterization
 - `holdout_inference.py`: per-tile inference logic
 - `checkpointing.py`: rolling checkpoint persistence
 - `phase_metrics.py`: weighted summaries and phase log markers

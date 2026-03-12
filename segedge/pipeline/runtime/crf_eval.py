@@ -28,7 +28,7 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
     """
     if _CRF_PARALLEL_CONTEXTS is None:
         raise RuntimeError("CRF contexts not initialized")
-    prob_soft, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
+    prob_soft, trimap_band, pos_w, pos_xy, bi_w, bi_xy, bi_rgb = cfg
     ious = []
     weights = []
     for ctx in _CRF_PARALLEL_CONTEXTS:
@@ -44,6 +44,14 @@ def _eval_crf_config(cfg, n_iters: int = 5) -> tuple[float, tuple[float, ...]]:
             bilateral_w=bi_w,
             bilateral_xy_std=bi_xy,
             bilateral_rgb_std=bi_rgb,
+            trimap_band_pixels=(
+                int(trimap_band) if bool(ctx.get("crf_use_trimap", False)) else None
+            ),
+            base_mask_override=(
+                ctx.get("trimap_base_mask")
+                if bool(ctx.get("crf_use_trimap", False))
+                else None
+            ),
         )
         ious.append(compute_metrics(mask_crf_local, ctx["gt_mask_eval"])["iou"])
         weights.append(float(ctx["gt_weight"]))

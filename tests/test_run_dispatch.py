@@ -5,6 +5,30 @@ from __future__ import annotations
 import segedge.pipeline.run as run
 
 
+def test_create_run_directories_copies_config_snapshot(tmp_path, monkeypatch):
+    """New run directories should include a copy of the active config file.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(run.cfg.io.paths, "output_dir", str(tmp_path / "output"))
+    monkeypatch.setattr(run.cfg.runtime, "resume_run", False)
+    monkeypatch.setattr(run.cfg.runtime, "resume_run_dir", None)
+    monkeypatch.setattr(run, "setup_logging", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "configure_performance_logging",
+        lambda *_args, **_kwargs: None,
+    )
+
+    run_paths = run._create_run_directories()
+
+    snapshot_path = tmp_path / "output" / "run_001" / "config.yml"
+    assert run_paths["run_dir"] == str(tmp_path / "output" / "run_001")
+    assert snapshot_path.exists()
+
+
 def test_main_dispatches_to_expected_workflow(monkeypatch):
     """`run.main()` should choose inference-only, manual, or LOO workflows.
 
@@ -51,7 +75,9 @@ def test_main_dispatches_to_expected_workflow(monkeypatch):
         run, "init_model", lambda *_args, **_kwargs: (None, None, "cpu")
     )
     monkeypatch.setattr(
-        run, "_resolve_feature_cache", lambda *_args, **_kwargs: ("memory", None)
+        run,
+        "_resolve_feature_cache",
+        lambda *_args, **_kwargs: ("memory", None, "memory", None),
     )
     monkeypatch.setattr(
         run,
@@ -157,3 +183,185 @@ def test_main_dispatches_to_expected_workflow(monkeypatch):
         run.main()
 
         assert branch_calls == [expected]
+
+
+def test_resolve_inference_model_bundle_dir_uses_latest_valid_previous_run(tmp_path):
+    """Inference-only fallback should select the newest valid prior bundle.
+
+    Examples:
+        >>> True
+        True
+    """
+    output_root = tmp_path / "output"
+    current_run = output_root / "run_003"
+    for run_name in ("run_001", "run_002", "run_003"):
+        (output_root / run_name).mkdir(parents=True)
+    (output_root / "run_001" / "model_bundle").mkdir()
+    (output_root / "run_001" / "model_bundle" / "manifest.yml").write_text(
+        "bundle_version: 1\n",
+        encoding="utf-8",
+    )
+    (output_root / "run_002" / "model_bundle").mkdir()
+    (output_root / "run_002" / "model_bundle" / "manifest.yml").write_text(
+        "bundle_version: 1\n",
+        encoding="utf-8",
+    )
+
+    resolved = run._resolve_inference_model_bundle_dir(
+        None,
+        output_root=str(output_root),
+        current_run_dir=str(current_run),
+    )
+
+    assert resolved == str(output_root / "run_002" / "model_bundle")
+
+
+def test_resolve_feature_cache_splits_training_and_inference_modes(
+    tmp_path, monkeypatch
+):
+    """Feature-cache resolution should allow training disk cache with inference memory.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(run.cfg.io.paths, "feature_dir", str(tmp_path / "features"))
+    monkeypatch.setattr(run.cfg.runtime, "cache_training_features", True)
+    monkeypatch.setattr(run.cfg.runtime, "cache_inference_features", False)
+    monkeypatch.setattr(run.cfg.training.loo, "enabled", True)
+    monkeypatch.setattr(run.cfg.model.augmentation, "enabled", False)
+
+    training_mode, training_dir, inference_mode, inference_dir = (
+        run._resolve_feature_cache(auto_split_tiles=False)
+    )
+
+    assert training_mode == "disk"
+    assert inference_mode == "memory"
+    assert training_dir == str(tmp_path / "features")
+    assert inference_dir is None
+
+
+def test_resolve_inference_model_bundle_dir_raises_without_previous_bundle(tmp_path):
+    """Inference-only fallback should fail clearly when no bundle exists.
+
+    Examples:
+        >>> True
+        True
+    """
+    output_root = tmp_path / "output"
+    current_run = output_root / "run_001"
+    current_run.mkdir(parents=True)
+
+    try:
+        run._resolve_inference_model_bundle_dir(
+            None,
+            output_root=str(output_root),
+            current_run_dir=str(current_run),
+        )
+    except ValueError as exc:
+        assert "no previous run bundle was found" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when no previous bundle exists")
+
+
+def test_main_resolves_previous_bundle_when_model_bundle_dir_is_null(monkeypatch):
+    """Inference-only main path should pass the resolved fallback bundle.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(run, "time_start", lambda: 0.0)
+    monkeypatch.setattr(run, "time_end", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run, "_log_phase", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "_create_run_directories",
+        lambda: {
+            "run_dir": "/tmp/run_010",
+            "plot_dir": "/tmp/run_010/plots",
+            "validation_plot_dir": "/tmp/run_010/plots/validation",
+            "inference_plot_dir": "/tmp/run_010/plots/inference",
+            "shape_dir": "/tmp/run_010/shapes",
+        },
+    )
+    monkeypatch.setattr(run, "_load_processed_tiles", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(
+        run,
+        "_initialize_time_budget_state",
+        lambda **_kwargs: {
+            "enabled": False,
+            "hours": 0.0,
+            "scope": "training_only",
+            "cutover_mode": "immediate_inference",
+            "deadline_ts": None,
+            "clock_start_ts": None,
+            "cutover_triggered": False,
+            "cutover_stage": "none",
+        },
+    )
+    monkeypatch.setattr(run, "_log_run_configuration", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        run,
+        "_initialize_union_state",
+        lambda **_kwargs: ({}, lambda *_args, **_kwargs_inner: None),
+    )
+    monkeypatch.setattr(
+        run, "init_model", lambda *_args, **_kwargs: (None, None, "cpu")
+    )
+    monkeypatch.setattr(
+        run,
+        "_resolve_feature_cache",
+        lambda *_args, **_kwargs: ("memory", None, "memory", None),
+    )
+    monkeypatch.setattr(run, "consolidate_cached_features", lambda **_kwargs: None)
+    monkeypatch.setattr(run.cfg.io, "training", False)
+    monkeypatch.setattr(run.cfg.io.auto_split, "enabled", False)
+    monkeypatch.setattr(run.cfg.io.inference, "model_bundle_dir", None)
+    monkeypatch.setattr(run.cfg.io.inference, "save_bundle", False)
+    monkeypatch.setattr(run.cfg.io.paths, "roads_mask_path", "/tmp/roads.tif")
+    monkeypatch.setattr(run.cfg.io.paths, "source_label_raster", "/tmp/labels.tif")
+    monkeypatch.setattr(run.cfg.io.paths, "eval_gt_vectors", [])
+    monkeypatch.setattr(run.cfg.io.paths, "output_dir", "/tmp")
+    monkeypatch.setattr(run.cfg.model.backbone, "name", "test-backbone")
+    monkeypatch.setattr(run.cfg.model.backbone, "patch_size", 14)
+    monkeypatch.setattr(run.cfg.model.backbone, "resample_factor", 1.0)
+    monkeypatch.setattr(run.cfg.model.tiling, "tile_size", 128)
+    monkeypatch.setattr(run.cfg.model.tiling, "stride", 64)
+    monkeypatch.setattr(run.cfg.model.banks, "feat_context_radius", 0)
+    monkeypatch.setattr(
+        run,
+        "_resolve_tile_sets",
+        lambda **_kwargs: {
+            "auto_split_tiles": False,
+            "gt_tiles": [],
+            "source_tiles": [],
+            "val_tiles": [],
+            "holdout_tiles": ["holdout_a.tif"],
+            "inference_dir": "/tmp/infer",
+            "inference_glob": "*.tif",
+        },
+    )
+    monkeypatch.setattr(
+        run,
+        "_resolve_inference_model_bundle_dir",
+        lambda *_args, **_kwargs: "/tmp/run_009/model_bundle",
+    )
+
+    seen_bundle_dirs: list[str] = []
+
+    def _record_inference(common, **_kwargs):
+        """Capture the resolved bundle path for inference-only dispatch.
+
+        Examples:
+            >>> True
+            True
+        """
+        seen_bundle_dirs.append(common["model_bundle_dir"])
+        common["should_consolidate"] = False
+
+    monkeypatch.setattr(run, "run_inference_only", _record_inference)
+
+    run.main()
+
+    assert seen_bundle_dirs == ["/tmp/run_009/model_bundle"]

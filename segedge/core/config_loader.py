@@ -7,12 +7,15 @@ Examples:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,8 +75,20 @@ class IOInferenceScorePriorConfig:
     apply_to: str
     target: str
     mode: str
-    factor: float
+    inside_factor: float
+    outside_factor: float
     clip_max: float
+
+
+@dataclass
+class IOInferencePlotsConfig:
+    """Per-plot toggles for holdout inference artifacts."""
+
+    unified: bool
+    qualitative_core: bool
+    score_threshold: bool
+    disagreement_entropy: bool
+    proposal_overlay: bool
 
 
 @dataclass
@@ -94,6 +109,8 @@ class IOInferenceConfig:
     tiles_dir: str | None
     tile_glob: str
     tiles: list[str]
+    plot_every: int
+    plots: IOInferencePlotsConfig
     save_bundle: bool
     score_prior: IOInferenceScorePriorConfig
 
@@ -228,6 +245,7 @@ class CRFConfig:
 
     enabled: bool
     prob_softness_values: list[float]
+    trimap_band_pixels_values: list[int]
     pos_w_values: list[float]
     pos_xy_std_values: list[float]
     bilateral_w_values: list[float]
@@ -290,6 +308,8 @@ class NovelProposalsConfig:
     max_width_m: float
     min_skeleton_ratio: float
     min_pca_ratio: float
+    width_bonus_per_pca: float
+    hard_width_cap_m: float
     max_circularity: float
     min_mean_score: float
     max_road_overlap: float
@@ -300,6 +320,7 @@ class NovelProposalsConfig:
 class PostprocessConfig:
     """Postprocess config group."""
 
+    fill_holes_xgb: bool
     shadow: ShadowConfig
     roads: RoadsConfig
     novel_proposals: NovelProposalsConfig
@@ -329,7 +350,8 @@ class TimeBudgetConfig:
 class RuntimeConfig:
     """Runtime and diagnostics settings."""
 
-    feature_cache_mode: str
+    cache_training_features: bool
+    cache_inference_features: bool
     feature_batch_size: int
     resume_run: bool
     resume_run_dir: str | None
@@ -483,6 +505,10 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
     io_paths = _require_mapping(io["paths"], "io.paths")
     io_auto_split = _require_mapping(io["auto_split"], "io.auto_split")
     io_inference = _require_mapping(io.get("inference", {}), "io.inference")
+    io_inference_plots = _require_mapping(
+        io_inference.get("plots", {}),
+        "io.inference.plots",
+    )
     io_inference_score_prior = _require_mapping(
         io_inference.get("score_prior", {}),
         "io.inference.score_prior",
@@ -502,6 +528,16 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
             ),
             tile_glob=str(io_inference.get("tile_glob", "*.tif")),
             tiles=_as_list_str(io_inference.get("tiles", []), "io.inference.tiles"),
+            plot_every=int(io_inference.get("plot_every", 1)),
+            plots=IOInferencePlotsConfig(
+                unified=bool(io_inference_plots.get("unified", True)),
+                qualitative_core=bool(io_inference_plots.get("qualitative_core", True)),
+                score_threshold=bool(io_inference_plots.get("score_threshold", True)),
+                disagreement_entropy=bool(
+                    io_inference_plots.get("disagreement_entropy", True)
+                ),
+                proposal_overlay=bool(io_inference_plots.get("proposal_overlay", True)),
+            ),
             save_bundle=bool(io_inference.get("save_bundle", True)),
             score_prior=IOInferenceScorePriorConfig(
                 enabled=bool(io_inference_score_prior.get("enabled", False)),
@@ -523,7 +559,15 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
                     {"multiply"},
                     "multiply",
                 ),
-                factor=float(io_inference_score_prior.get("factor", 1.15)),
+                inside_factor=float(
+                    io_inference_score_prior.get(
+                        "inside_factor",
+                        io_inference_score_prior.get("factor", 1.15),
+                    )
+                ),
+                outside_factor=float(
+                    io_inference_score_prior.get("outside_factor", 1.0)
+                ),
                 clip_max=float(io_inference_score_prior.get("clip_max", 1.0)),
             ),
         ),
@@ -739,6 +783,10 @@ def _load_search_config(search: dict[str, Any]) -> SearchConfig:
             prob_softness_values=_as_list_float(
                 search_crf["prob_softness_values"], "search.crf.prob_softness_values"
             ),
+            trimap_band_pixels_values=_as_list_int(
+                search_crf.get("trimap_band_pixels_values", [16]),
+                "search.crf.trimap_band_pixels_values",
+            ),
             pos_w_values=_as_list_float(
                 search_crf["pos_w_values"], "search.crf.pos_w_values"
             ),
@@ -798,7 +846,69 @@ def _load_postprocess_config(postprocess: dict[str, Any]) -> PostprocessConfig:
         "balanced",
     )
     heuristic_defaults = _novel_heuristic_defaults(heuristic_preset)
+    novel_proposals = NovelProposalsConfig(
+        enabled=bool(post_novel.get("enabled", False)),
+        heuristic_preset=heuristic_preset,
+        search_scope=_as_enum(
+            post_novel.get("search_scope", "sh_buffer"),
+            "postprocess.novel_proposals.search_scope",
+            {"sh_buffer", "whole_tile"},
+            "sh_buffer",
+        ),
+        source=_as_enum(
+            post_novel.get("source", "champion_mask"),
+            "postprocess.novel_proposals.source",
+            {"champion_mask", "champion_score"},
+            "champion_mask",
+        ),
+        score_threshold=(
+            None
+            if post_novel.get("score_threshold") is None
+            else float(post_novel.get("score_threshold"))
+        ),
+        min_area_px=int(
+            post_novel.get("min_area_px", heuristic_defaults["min_area_px"])
+        ),
+        min_length_m=float(
+            post_novel.get("min_length_m", heuristic_defaults["min_length_m"])
+        ),
+        max_width_m=float(
+            post_novel.get("max_width_m", heuristic_defaults["max_width_m"])
+        ),
+        min_skeleton_ratio=float(
+            post_novel.get(
+                "min_skeleton_ratio", heuristic_defaults["min_skeleton_ratio"]
+            )
+        ),
+        min_pca_ratio=float(
+            post_novel.get("min_pca_ratio", heuristic_defaults["min_pca_ratio"])
+        ),
+        width_bonus_per_pca=float(post_novel.get("width_bonus_per_pca", 1.0)),
+        hard_width_cap_m=float(
+            post_novel.get(
+                "hard_width_cap_m",
+                max(20.0, heuristic_defaults["max_width_m"]),
+            )
+        ),
+        max_circularity=float(
+            post_novel.get("max_circularity", heuristic_defaults["max_circularity"])
+        ),
+        min_mean_score=float(
+            post_novel.get("min_mean_score", heuristic_defaults["min_mean_score"])
+        ),
+        max_road_overlap=float(
+            post_novel.get("max_road_overlap", heuristic_defaults["max_road_overlap"])
+        ),
+        connectivity=int(post_novel.get("connectivity", 2)),
+    )
+    if novel_proposals.width_bonus_per_pca < 0.0:
+        raise ValueError("postprocess.novel_proposals.width_bonus_per_pca must be >= 0")
+    if novel_proposals.hard_width_cap_m < novel_proposals.max_width_m:
+        raise ValueError(
+            "postprocess.novel_proposals.hard_width_cap_m must be >= max_width_m"
+        )
     return PostprocessConfig(
+        fill_holes_xgb=bool(postprocess.get("fill_holes_xgb", False)),
         shadow=ShadowConfig(
             weight_sets=[tuple(float(x) for x in row) for row in weight_sets_raw],
             thresholds=_as_list_float(
@@ -813,56 +923,7 @@ def _load_postprocess_config(postprocess: dict[str, Any]) -> PostprocessConfig:
                 post_roads["penalty_values"], "postprocess.roads.penalty_values"
             )
         ),
-        novel_proposals=NovelProposalsConfig(
-            enabled=bool(post_novel.get("enabled", False)),
-            heuristic_preset=heuristic_preset,
-            search_scope=_as_enum(
-                post_novel.get("search_scope", "sh_buffer"),
-                "postprocess.novel_proposals.search_scope",
-                {"sh_buffer", "whole_tile"},
-                "sh_buffer",
-            ),
-            source=_as_enum(
-                post_novel.get("source", "champion_mask"),
-                "postprocess.novel_proposals.source",
-                {"champion_mask", "champion_score"},
-                "champion_mask",
-            ),
-            score_threshold=(
-                None
-                if post_novel.get("score_threshold") is None
-                else float(post_novel.get("score_threshold"))
-            ),
-            min_area_px=int(
-                post_novel.get("min_area_px", heuristic_defaults["min_area_px"])
-            ),
-            min_length_m=float(
-                post_novel.get("min_length_m", heuristic_defaults["min_length_m"])
-            ),
-            max_width_m=float(
-                post_novel.get("max_width_m", heuristic_defaults["max_width_m"])
-            ),
-            min_skeleton_ratio=float(
-                post_novel.get(
-                    "min_skeleton_ratio", heuristic_defaults["min_skeleton_ratio"]
-                )
-            ),
-            min_pca_ratio=float(
-                post_novel.get("min_pca_ratio", heuristic_defaults["min_pca_ratio"])
-            ),
-            max_circularity=float(
-                post_novel.get("max_circularity", heuristic_defaults["max_circularity"])
-            ),
-            min_mean_score=float(
-                post_novel.get("min_mean_score", heuristic_defaults["min_mean_score"])
-            ),
-            max_road_overlap=float(
-                post_novel.get(
-                    "max_road_overlap", heuristic_defaults["max_road_overlap"]
-                )
-            ),
-            connectivity=int(post_novel.get("connectivity", 2)),
-        ),
+        novel_proposals=novel_proposals,
     )
 
 
@@ -877,8 +938,35 @@ def _load_runtime_config(runtime: dict[str, Any]) -> RuntimeConfig:
     runtime_time_budget = _require_mapping(
         runtime.get("time_budget", {}), "runtime.time_budget"
     )
+    legacy_feature_cache_mode = runtime.get("feature_cache_mode")
+    if legacy_feature_cache_mode is not None:
+        legacy_mode = str(legacy_feature_cache_mode)
+        if legacy_mode not in {"disk", "memory"}:
+            raise ValueError("runtime.feature_cache_mode must be 'disk' or 'memory'")
+        if (
+            "cache_training_features" not in runtime
+            and "cache_inference_features" not in runtime
+        ):
+            logger.warning(
+                "runtime.feature_cache_mode is deprecated; use "
+                "runtime.cache_training_features and "
+                "runtime.cache_inference_features"
+            )
+            cache_training_features = legacy_mode == "disk"
+            cache_inference_features = legacy_mode == "disk"
+        else:
+            cache_training_features = bool(
+                runtime.get("cache_training_features", legacy_mode == "disk")
+            )
+            cache_inference_features = bool(
+                runtime.get("cache_inference_features", legacy_mode == "disk")
+            )
+    else:
+        cache_training_features = bool(runtime.get("cache_training_features", True))
+        cache_inference_features = bool(runtime.get("cache_inference_features", True))
     return RuntimeConfig(
-        feature_cache_mode=str(runtime["feature_cache_mode"]),
+        cache_training_features=cache_training_features,
+        cache_inference_features=cache_inference_features,
         feature_batch_size=int(runtime["feature_batch_size"]),
         resume_run=bool(runtime["resume_run"]),
         resume_run_dir=(
@@ -950,15 +1038,15 @@ def _validate_loaded_config(config: Config) -> None:
         0.0 <= config.search.xgb.fixed_threshold <= 1.0
     ):
         raise ValueError("'search.xgb.fixed_threshold' must be in [0, 1]")
-    if config.io.inference.score_prior.factor < 0.0:
-        raise ValueError("'io.inference.score_prior.factor' must be >= 0")
+    if config.io.inference.score_prior.inside_factor < 0.0:
+        raise ValueError("'io.inference.score_prior.inside_factor' must be >= 0")
+    if config.io.inference.score_prior.outside_factor < 0.0:
+        raise ValueError("'io.inference.score_prior.outside_factor' must be >= 0")
     if not (0.0 <= config.io.inference.score_prior.clip_max <= 1.0):
         raise ValueError("'io.inference.score_prior.clip_max' must be in [0, 1]")
+    if config.io.inference.plot_every <= 0:
+        raise ValueError("'io.inference.plot_every' must be > 0")
     if not config.io.training:
-        if config.io.inference.model_bundle_dir is None:
-            raise ValueError(
-                "'io.inference.model_bundle_dir' must be set when io.training=false"
-            )
         has_inference_tiles = bool(
             config.io.inference.tiles_dir
             or config.io.inference.tiles

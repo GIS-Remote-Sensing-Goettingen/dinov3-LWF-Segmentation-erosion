@@ -9,6 +9,7 @@ from typing import Callable
 
 import numpy as np
 
+from ..core.timing_utils import emit_performance_summary, performance_context
 from .common import filter_tiles_by_source_label_presence
 from .runtime_utils import _update_phase_metrics, infer_on_holdout
 
@@ -95,6 +96,7 @@ def run_holdout_inference(
     write_checkpoint: Callable[[int], None],
     logger,
     final_inference_phase: bool = True,
+    plot_every: int = 1,
 ) -> int:
     """Run holdout inference tiles and update rolling checkpoints.
 
@@ -107,36 +109,53 @@ def run_holdout_inference(
         1 for tile_path in holdout_tiles if tile_path not in processed_tiles
     )
     pending_tile_index = 0
+    summary_stride = 10
+    xgb_guard_state = {
+        "enabled": bool(final_inference_phase),
+        "checked_tiles": 0,
+        "fallback_to_legacy": False,
+        "guard_tiles": 3,
+        "atol": 1e-5,
+        "rtol": 1e-4,
+    }
     for b_path in holdout_tiles:
         if b_path in processed_tiles:
             logger.info("holdout skip (already processed): %s", b_path)
             continue
         pending_tile_index += 1
+        save_plots = ((pending_tile_index - 1) % max(1, int(plot_every))) == 0
         logger.info(
             "Processing tile %s, %s / %s",
             b_path,
             pending_tile_index,
             total_pending_tiles,
         )
-        result = infer_on_holdout(
-            b_path,
-            gt_vector_paths,
-            model,
-            processor,
-            device,
-            pos_bank,
-            neg_bank,
-            tuned,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            shape_dir,
-            plot_dir,
-            context_radius,
-            plot_with_metrics=False,
-            final_inference_phase=final_inference_phase,
-        )
+        with performance_context(
+            phase="holdout_inference",
+            tile=b_path,
+            image_id=os.path.splitext(os.path.basename(b_path))[0],
+        ):
+            result = infer_on_holdout(
+                b_path,
+                gt_vector_paths,
+                model,
+                processor,
+                device,
+                pos_bank,
+                neg_bank,
+                tuned,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+                shape_dir,
+                plot_dir,
+                context_radius,
+                plot_with_metrics=False,
+                final_inference_phase=final_inference_phase,
+                save_plots=save_plots,
+                xgb_guard_state=xgb_guard_state,
+            )
         if result["gt_available"]:
             _update_phase_metrics(holdout_phase_metrics, result["metrics"])
         holdout_tiles_processed += 1
@@ -156,4 +175,9 @@ def run_holdout_inference(
         with open(processed_log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
         write_checkpoint(holdout_tiles_processed)
+        if pending_tile_index % summary_stride == 0:
+            emit_performance_summary(
+                "holdout_progress",
+                tile_index=holdout_tiles_processed,
+            )
     return holdout_tiles_processed

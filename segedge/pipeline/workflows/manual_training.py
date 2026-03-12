@@ -55,6 +55,7 @@ def run_manual_training(
     gt_vector_paths = common["gt_vector_paths"]
     feature_cache_mode = common["feature_cache_mode"]
     feature_dir = common["feature_dir"]
+    inference_feature_dir = common["inference_feature_dir"]
     val_phase_metrics = common["val_phase_metrics"]
     holdout_phase_metrics = common["holdout_phase_metrics"]
     run_dir = common["run_dir"]
@@ -250,7 +251,7 @@ def run_manual_training(
         ps=ps,
         tile_size=tile_size,
         stride=stride,
-        feature_dir=feature_dir,
+        feature_dir=inference_feature_dir,
         shape_dir=common["shape_dir"],
         plot_dir=common["inference_plot_dir"],
         context_radius=context_radius,

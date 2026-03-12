@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from typing import Callable
 
@@ -17,7 +18,12 @@ from ..core.io_utils import (
     count_shapefile_features,
 )
 from ..core.logging_utils import setup_logging
-from ..core.timing_utils import time_end, time_start
+from ..core.timing_utils import (
+    configure_performance_logging,
+    emit_performance_summary,
+    time_end,
+    time_start,
+)
 from .common import init_model, resolve_tiles_from_gt_presence
 from .inference_flow import resolve_inference_tiles
 from .runtime_utils import (
@@ -52,6 +58,7 @@ __all__ = [
     "_export_best_settings_dual",
     "_maybe_run_holdout_inference",
     "_novel_proposals_payload",
+    "_resolve_inference_model_bundle_dir",
     "main",
 ]
 
@@ -105,6 +112,16 @@ def _create_run_directories() -> dict[str, str]:
     cfg.io.paths.best_settings_path = os.path.join(run_dir, "best_settings.yml")
     cfg.io.paths.log_path = os.path.join(run_dir, "run.log")
     setup_logging(cfg.io.paths.log_path)
+    configure_performance_logging(
+        os.path.join(run_dir, "performance.jsonl"),
+        run_id=os.path.basename(run_dir),
+    )
+    config_snapshot_src = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.yml"
+    )
+    config_snapshot_dst = os.path.join(run_dir, "config.yml")
+    if os.path.exists(config_snapshot_src):
+        shutil.copyfile(config_snapshot_src, config_snapshot_dst)
     return {
         "run_dir": run_dir,
         "plot_dir": plot_dir,
@@ -112,6 +129,67 @@ def _create_run_directories() -> dict[str, str]:
         "inference_plot_dir": inference_plot_dir,
         "shape_dir": shape_dir,
     }
+
+
+def _run_dir_sort_key(run_name: str) -> tuple[int, str]:
+    """Return a stable descending-sort key for `run_*` directories.
+
+    Examples:
+        >>> _run_dir_sort_key("run_007")
+        (7, 'run_007')
+    """
+    parts = run_name.split("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return (int(parts[1]), run_name)
+    return (-1, run_name)
+
+
+def _resolve_inference_model_bundle_dir(
+    model_bundle_dir: str | None,
+    *,
+    output_root: str,
+    current_run_dir: str,
+) -> str:
+    """Resolve the bundle directory for inference-only runs.
+
+    Examples:
+        >>> _resolve_inference_model_bundle_dir(
+        ...     "/tmp/bundle",
+        ...     output_root="/tmp/out",
+        ...     current_run_dir="/tmp/out/run_001",
+        ... )
+        '/tmp/bundle'
+    """
+    if model_bundle_dir:
+        return model_bundle_dir
+
+    current_run_dir_abs = os.path.abspath(current_run_dir)
+    candidate_names = sorted(
+        (
+            name
+            for name in os.listdir(output_root)
+            if name.startswith("run_")
+            and os.path.isdir(os.path.join(output_root, name))
+        ),
+        key=_run_dir_sort_key,
+        reverse=True,
+    )
+    for run_name in candidate_names:
+        run_dir = os.path.join(output_root, run_name)
+        if os.path.abspath(run_dir) == current_run_dir_abs:
+            continue
+        bundle_dir = os.path.join(run_dir, "model_bundle")
+        manifest_path = os.path.join(bundle_dir, "manifest.yml")
+        if os.path.exists(manifest_path):
+            logger.info(
+                "inference-only: model_bundle_dir unset, using previous run bundle %s",
+                bundle_dir,
+            )
+            return bundle_dir
+    raise ValueError(
+        "io.training=false and io.inference.model_bundle_dir is null, but no "
+        f"previous run bundle was found under {output_root}"
+    )
 
 
 def _load_processed_tiles(processed_log_path: str, resume_run: bool) -> set[str]:
@@ -447,34 +525,57 @@ def _resolve_tile_sets(
     }
 
 
-def _resolve_feature_cache(auto_split_tiles: bool) -> tuple[str, str | None]:
-    """Resolve feature-cache mode and create the cache directory if needed.
+def _resolve_feature_cache(
+    auto_split_tiles: bool,
+) -> tuple[str, str | None, str, str | None]:
+    """Resolve training and inference feature-cache modes/directories.
 
     Examples:
         >>> callable(_resolve_feature_cache)
         True
     """
-    feature_cache_mode = cfg.runtime.feature_cache_mode
-    if feature_cache_mode not in {"disk", "memory"}:
-        raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
+    training_feature_cache_mode = (
+        "disk" if cfg.runtime.cache_training_features else "memory"
+    )
+    inference_feature_cache_mode = (
+        "disk" if cfg.runtime.cache_inference_features else "memory"
+    )
     if (
-        feature_cache_mode == "memory"
+        training_feature_cache_mode == "memory"
         and auto_split_tiles
         and cfg.training.loo.enabled
         and cfg.model.augmentation.enabled
     ):
         logger.warning(
-            "feature_cache_mode=memory with LOO+augmentation causes "
-            "repeated DINO extraction; forcing disk cache"
+            "cache_training_features=false with LOO+augmentation causes "
+            "repeated DINO extraction; forcing training-side disk cache"
         )
-        feature_cache_mode = "disk"
-    if feature_cache_mode == "disk":
-        feature_dir = cfg.io.paths.feature_dir
-        os.makedirs(feature_dir, exist_ok=True)
+        training_feature_cache_mode = "disk"
+    use_disk_cache = (
+        training_feature_cache_mode == "disk" or inference_feature_cache_mode == "disk"
+    )
+    if use_disk_cache:
+        feature_dir_root = cfg.io.paths.feature_dir
+        os.makedirs(feature_dir_root, exist_ok=True)
     else:
-        feature_dir = None
-    logger.info("feature cache mode: %s", feature_cache_mode)
-    return feature_cache_mode, feature_dir
+        feature_dir_root = None
+    training_feature_dir = (
+        feature_dir_root if training_feature_cache_mode == "disk" else None
+    )
+    inference_feature_dir = (
+        feature_dir_root if inference_feature_cache_mode == "disk" else None
+    )
+    logger.info(
+        "feature cache mode: training=%s inference=%s",
+        training_feature_cache_mode,
+        inference_feature_cache_mode,
+    )
+    return (
+        training_feature_cache_mode,
+        training_feature_dir,
+        inference_feature_cache_mode,
+        inference_feature_dir,
+    )
 
 
 def main():
@@ -525,9 +626,12 @@ def main():
         auto_split_tiles=auto_split_tiles,
         gt_vector_paths=gt_vector_paths,
     )
-    feature_cache_mode, feature_dir = _resolve_feature_cache(
-        bool(tile_sets["auto_split_tiles"])
-    )
+    (
+        training_feature_cache_mode,
+        training_feature_dir,
+        inference_feature_cache_mode,
+        inference_feature_dir,
+    ) = _resolve_feature_cache(bool(tile_sets["auto_split_tiles"]))
 
     if (
         training_enabled
@@ -539,6 +643,13 @@ def main():
         budget_state["deadline_ts"] = compute_budget_deadline(
             float(budget_state["clock_start_ts"]),
             float(budget_state["hours"]),
+        )
+    resolved_model_bundle_dir = cfg.io.inference.model_bundle_dir
+    if not training_enabled:
+        resolved_model_bundle_dir = _resolve_inference_model_bundle_dir(
+            cfg.io.inference.model_bundle_dir,
+            output_root=cfg.io.paths.output_dir,
+            current_run_dir=run_dir,
         )
 
     common = {
@@ -552,13 +663,17 @@ def main():
         "context_radius": context_radius,
         "current_time_budget_status": lambda: _current_time_budget_status(budget_state),
         "device": device,
-        "feature_cache_mode": feature_cache_mode,
-        "feature_dir": feature_dir,
+        "feature_cache_mode": training_feature_cache_mode,
+        "feature_dir": training_feature_dir,
+        "training_feature_cache_mode": training_feature_cache_mode,
+        "training_feature_dir": training_feature_dir,
+        "inference_feature_cache_mode": inference_feature_cache_mode,
+        "inference_feature_dir": inference_feature_dir,
         "gt_vector_paths": gt_vector_paths,
         "holdout_phase_metrics": {},
         "inference_plot_dir": run_paths["inference_plot_dir"],
         "model": model,
-        "model_bundle_dir": cfg.io.inference.model_bundle_dir,
+        "model_bundle_dir": resolved_model_bundle_dir,
         "model_name": model_name,
         "plot_dir": run_paths["plot_dir"],
         "processed_log_path": processed_log_path,
@@ -582,10 +697,6 @@ def main():
     }
 
     if not training_enabled:
-        if not common["model_bundle_dir"]:
-            raise ValueError(
-                "io.training=false requires io.inference.model_bundle_dir to be set"
-            )
         run_inference_only(
             common,
             holdout_tiles=list(tile_sets["holdout_tiles"]),
@@ -620,12 +731,14 @@ def main():
 
     if common["should_consolidate"]:
         consolidate_cached_features(
-            feature_cache_mode=feature_cache_mode,
-            feature_dir=feature_dir,
+            feature_dir=cfg.io.paths.feature_dir,
             train_image_ids=list(common["train_image_ids"]),
             inference_tiles=list(common["consolidation_tiles"]),
+            consolidate_training=training_feature_cache_mode == "disk",
+            consolidate_inference=inference_feature_cache_mode == "disk",
         )
 
+    emit_performance_summary("run_complete")
     time_end("main (total)", t0_main)
 
 
