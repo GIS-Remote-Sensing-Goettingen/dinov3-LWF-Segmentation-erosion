@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Simplify holdout shapefile artifacts to 4 rolling union outputs and remove per-image proposal shapefile/CSV exports.
+- Files touched: `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: The old per-image proposal shapefile/CSV output produced too many artifacts and made the useful final geometry harder to navigate.
+- Problems fixed: Holdout inference now updates only `raw`, `crf`, `shadow`, and `shadow_with_proposals` rolling union shapefiles, accepted proposals are folded into `shadow_with_proposals` instead of being written per image, and union backups now rotate one fixed backup per union target every `union_backup_every` tiles.
+
 - Description: Stream one-shot XGB inference directly from extracted feature batches instead of prefetching all tile features for the image up front, and vectorize batch feature normalization.
 - Files touched: `segedge/core/feature_ops/extraction.py`, `segedge/core/xdboost.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
 - Reason: Recent inference profiles showed `infer_on_holdout::prefetch_features` dominating one-shot inference when inference-side disk cache was disabled, because the pipeline still extracted the whole image before any XGB scoring could start.
