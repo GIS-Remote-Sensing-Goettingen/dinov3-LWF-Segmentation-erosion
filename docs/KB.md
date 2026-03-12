@@ -41,7 +41,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `output/run_*/processed_tiles.jsonl`
 - `output/run_*/plots/validation/`
 - `output/run_*/plots/inference/`
-- `output/run_*/shapes/unions/{knn|xgb|champion}/{raw|crf|shadow}/union.shp`
+- `output/run_*/shapes/unions/{raw|crf|shadow|shadow_with_proposals}/union.shp`
 - `output/run_*/inference_best_setting.yml`
 - `output/run_*/best_setting.yml`
 - `output/run_*/model_bundle/` when bundle saving is enabled
@@ -52,6 +52,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `io.inference.plots` can disable individual inference plot files without changing masks, checkpoints, or `plot_every` cadence.
 - The unified inference plot uses plot-only XGB raw/CRF preview masks so it can show activity outside the SH/source-label buffer without changing runtime masks, metrics, or shapefile outputs.
 - The unified inference plot now merges accepted and rejected proposals into one overlay panel: accepted regions are light blue and rejected regions are light red.
+- Inference no longer writes per-image proposal shapefiles or proposal CSVs; accepted proposals are folded into the rolling `shadow_with_proposals` union instead.
 - The unified inference plot labels the source-label panel as `Administrative buffered labels` and no longer includes separate RGB or GT panels.
 - Each `output/run_*/` directory now contains a copy of the active `config.yml`.
 - `search.crf.trimap_band_pixels_values` controls how far XGB CRF is allowed to expand/shrink the coarse XGB mask boundary when filling holes against RGB edges.

@@ -361,7 +361,7 @@ def _initialize_union_state(
     *,
     shape_dir: str,
     resume_run: bool,
-) -> tuple[dict[tuple[str, str], dict[str, str | int]], Callable[..., None]]:
+) -> tuple[dict[str, dict[str, str | int]], Callable[..., None]]:
     """Create rolling union targets and return an append helper.
 
     Examples:
@@ -370,27 +370,20 @@ def _initialize_union_state(
     """
     union_backup_every = int(cfg.runtime.union_backup_every or 0)
     union_root = os.path.join(shape_dir, "unions")
-    union_streams = ["knn", "xgb", "champion"]
-    union_variants = ["raw", "crf", "shadow"]
-    union_states: dict[tuple[str, str], dict[str, str | int]] = {}
-    for stream in union_streams:
-        for variant in union_variants:
-            union_dir = os.path.join(union_root, stream, variant)
-            os.makedirs(union_dir, exist_ok=True)
-            union_path = os.path.join(union_dir, "union.shp")
-            feature_id = count_shapefile_features(union_path) if resume_run else 0
-            union_states[(stream, variant)] = {
-                "path": union_path,
-                "backup_dir": os.path.join(union_dir, "backups"),
-                "feature_id": feature_id,
-            }
-            if resume_run and feature_id:
-                logger.info(
-                    "resume union: %s/%s features=%s",
-                    stream,
-                    variant,
-                    feature_id,
-                )
+    union_variants = ["raw", "crf", "shadow", "shadow_with_proposals"]
+    union_states: dict[str, dict[str, str | int]] = {}
+    for variant in union_variants:
+        union_dir = os.path.join(union_root, variant)
+        os.makedirs(union_dir, exist_ok=True)
+        union_path = os.path.join(union_dir, "union.shp")
+        feature_id = count_shapefile_features(union_path) if resume_run else 0
+        union_states[variant] = {
+            "path": union_path,
+            "backup_dir": os.path.join(union_dir, "backup"),
+            "feature_id": feature_id,
+        }
+        if resume_run and feature_id:
+            logger.info("resume union: %s features=%s", variant, feature_id)
     logger.info(
         "rolling unions: root=%s backup_every=%s",
         union_root,
@@ -398,13 +391,12 @@ def _initialize_union_state(
     )
 
     def _append_union(
-        stream: str,
         variant: str,
         mask,
         ref_path: str,
         step: int,
     ) -> None:
-        state = union_states[(stream, variant)]
+        state = union_states[variant]
         union_path = str(state["path"])
         backup_dir = str(state["backup_dir"])
         feature_id = int(state["feature_id"])
@@ -415,7 +407,12 @@ def _initialize_union_state(
             start_id=feature_id,
         )
         if union_backup_every > 0 and step % union_backup_every == 0:
-            backup_union_shapefile(union_path, backup_dir, step)
+            backup_union_shapefile(
+                union_path,
+                backup_dir,
+                step,
+                backup_name="union_backup",
+            )
 
     return union_states, _append_union
 

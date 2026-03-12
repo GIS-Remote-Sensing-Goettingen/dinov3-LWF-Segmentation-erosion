@@ -91,7 +91,7 @@ def run_holdout_inference(
     plot_dir: str,
     context_radius: int,
     holdout_phase_metrics: dict[str, list[dict]],
-    append_union: Callable[[str, str, np.ndarray, str, int], None],
+    append_union: Callable[[str, np.ndarray, str, int], None],
     processed_log_path: str,
     write_checkpoint: Callable[[int], None],
     logger,
@@ -161,11 +161,8 @@ def run_holdout_inference(
         holdout_tiles_processed += 1
         ref_path = result["ref_path"]
         masks = result["masks"]
-        for mask_key, mask_val in masks.items():
-            if "_" not in mask_key:
-                continue
-            stream, variant = mask_key.split("_", 1)
-            append_union(stream, variant, mask_val, ref_path, holdout_tiles_processed)
+        for variant, mask_val in masks.items():
+            append_union(variant, mask_val, ref_path, holdout_tiles_processed)
         record = {
             "tile_path": b_path,
             "image_id": result["image_id"],

@@ -88,7 +88,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `output/run_*/processed_tiles.jsonl`: append-only holdout completion log.
 - `output/run_*/plots/validation/`: validation-stage plots.
 - `output/run_*/plots/inference/`: holdout/inference plots.
-- `output/run_*/shapes/unions/.../union.shp`: rolling union shapefiles for `knn`, `xgb`, and `champion`, each with `raw`, `crf`, and `shadow` variants.
+- `output/run_*/shapes/unions/.../union.shp`: rolling union shapefiles for `raw`, `crf`, `shadow`, and `shadow_with_proposals`.
 - `output/run_*/inference_best_setting.yml` and `output/run_*/best_setting.yml`: exported run settings.
 - `output/run_*/model_bundle/`: optional inference bundle when bundle saving is enabled.
 
@@ -99,6 +99,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `segedge.pipeline.workflows.run_loo_training`: execute per-fold tuning, best-fold selection, optional final retraining, and holdout inference.
 - `segedge.pipeline.workflows.shared.run_holdout_with_checkpoint`: standard wrapper that ensures holdout inference uses phase markers and rolling checkpoint writes.
 - `segedge.pipeline.runtime.holdout_inference.infer_on_holdout`: load one tile, score it, refine it, export overlays/proposals, and return masks plus metrics.
+  - accepted proposals are folded into the `shadow_with_proposals` union instead of being exported as per-tile shapefiles/CSVs.
 - `segedge.pipeline.runtime.checkpointing.write_rolling_best_config`: serialize the best-known stage/config/progress snapshot for resume and inspection.
 
 ## Design Constraints

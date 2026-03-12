@@ -759,13 +759,19 @@ def append_mask_to_union_shapefile(
     return idx
 
 
-def backup_union_shapefile(out_path: str, backup_dir: str, step: int) -> None:
+def backup_union_shapefile(
+    out_path: str,
+    backup_dir: str,
+    step: int,
+    backup_name: str | None = None,
+) -> None:
     """Copy a union shapefile set to a backup directory.
 
     Args:
         out_path (str): Union shapefile path.
         backup_dir (str): Directory for backups.
         step (int): Step index for naming.
+        backup_name (str | None): Fixed backup basename when rotating one backup.
 
     Examples:
         >>> callable(backup_union_shapefile)
@@ -776,7 +782,11 @@ def backup_union_shapefile(out_path: str, backup_dir: str, step: int) -> None:
         return
     os.makedirs(backup_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(out_path))[0]
-    backup_base = os.path.join(backup_dir, f"{base}_step_{step:05d}")
+    backup_base = (
+        os.path.join(backup_dir, backup_name)
+        if backup_name
+        else os.path.join(backup_dir, f"{base}_step_{step:05d}")
+    )
     exts = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
     for ext in exts:
         src_path = os.path.splitext(out_path)[0] + ext

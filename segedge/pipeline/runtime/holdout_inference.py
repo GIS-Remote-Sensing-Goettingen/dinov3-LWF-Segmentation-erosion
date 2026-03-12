@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import logging
 import os
 
@@ -12,7 +11,6 @@ from scipy.ndimage import binary_fill_holes, median_filter
 from ...core.config_loader import cfg
 from ...core.crf_utils import refine_with_densecrf
 from ...core.features import prefetch_features_single_scale_image
-from ...core.io_utils import export_mask_to_shapefile
 from ...core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ...core.metrics_utils import compute_metrics
 from ...core.plotting import (
@@ -818,81 +816,6 @@ def _build_proposal_masks(
         "accepted_mask": proposal_bundle["accepted_mask"],
         "rejected_mask": proposal_bundle["rejected_mask"],
     }
-
-
-def _export_proposal_artifacts(
-    proposal_bundle: dict,
-    proposal_masks: dict[str, np.ndarray],
-    holdout_path: str,
-    image_id_b: str,
-    shape_dir: str,
-) -> None:
-    """Write proposal shapefiles and CSV exports.
-
-    Examples:
-        >>> callable(_export_proposal_artifacts)
-        True
-    """
-    if not cfg.postprocess.novel_proposals.enabled:
-        return
-    proposal_dir = os.path.join(shape_dir, "proposals")
-    os.makedirs(proposal_dir, exist_ok=True)
-    if proposal_masks["accepted_mask"].any():
-        export_mask_to_shapefile(
-            proposal_masks["accepted_mask"],
-            holdout_path,
-            os.path.join(proposal_dir, f"{image_id_b}_accepted.shp"),
-        )
-    if proposal_masks["rejected_mask"].any():
-        export_mask_to_shapefile(
-            proposal_masks["rejected_mask"],
-            holdout_path,
-            os.path.join(proposal_dir, f"{image_id_b}_rejected.shp"),
-        )
-    records_path = os.path.join(proposal_dir, f"{image_id_b}_proposal_records.csv")
-    records = list(proposal_bundle.get("records", []))
-    fieldnames = [
-        "component_id",
-        "zone",
-        "accepted",
-        "acceptance_score",
-        "reject_reasons",
-        "area_px",
-        "length_m",
-        "mean_width_m",
-        "skeleton_ratio",
-        "pca_ratio",
-        "circularity",
-        "mean_score",
-        "road_overlap",
-        "centroid_row",
-        "centroid_col",
-    ]
-    with open(records_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for rec in records:
-            writer.writerow(
-                {
-                    "component_id": rec.get("component_id"),
-                    "zone": rec.get("zone"),
-                    "accepted": rec.get("accepted"),
-                    "acceptance_score": rec.get("acceptance_score"),
-                    "reject_reasons": ";".join(rec.get("reject_reasons", [])),
-                    "area_px": rec.get("area_px"),
-                    "length_m": rec.get("length_m"),
-                    "mean_width_m": rec.get("mean_width_m"),
-                    "skeleton_ratio": rec.get("skeleton_ratio"),
-                    "pca_ratio": rec.get("pca_ratio"),
-                    "circularity": rec.get("circularity"),
-                    "mean_score": rec.get("mean_score"),
-                    "road_overlap": rec.get("road_overlap"),
-                    "centroid_row": rec.get("centroid_row"),
-                    "centroid_col": rec.get("centroid_col"),
-                }
-            )
-
-
 def _compute_probability_and_diagnostics(
     active_stream: str,
     champion_score: np.ndarray,
@@ -1210,14 +1133,6 @@ def infer_on_holdout(
         proposal_bundle,
         proposal_bundle["candidate_mask"],
     )
-    with perf_span("infer_on_holdout", substage="proposal_exports"):
-        _export_proposal_artifacts(
-            proposal_bundle,
-            proposal_masks,
-            holdout_path,
-            context["image_id_b"],
-            shape_dir,
-        )
     _, disagreement_map, entropy_map = _compute_probability_and_diagnostics(
         active_stream,
         champion_score,
@@ -1246,6 +1161,11 @@ def infer_on_holdout(
                 entropy_map=entropy_map,
             )
 
+    shadow_with_proposals_mask = np.logical_or(
+        active_shadow_mask,
+        proposal_masks["accepted_mask"],
+    )
+
     return {
         "ref_path": holdout_path,
         "image_id": context["image_id_b"],
@@ -1255,9 +1175,10 @@ def infer_on_holdout(
         "pixel_size_m": context["pixel_size_m"],
         "metrics": metrics_map,
         "masks": {
-            f"{active_stream}_raw": active_raw_mask,
-            f"{active_stream}_crf": active_crf_mask,
-            f"{active_stream}_shadow": active_shadow_mask,
+            "raw": active_raw_mask,
+            "crf": active_crf_mask,
+            "shadow": active_shadow_mask,
+            "shadow_with_proposals": shadow_with_proposals_mask,
         },
         "proposals": proposal_bundle,
     }

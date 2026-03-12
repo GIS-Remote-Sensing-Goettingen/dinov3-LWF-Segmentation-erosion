@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import segedge.pipeline.run as run
 
 
@@ -183,6 +185,53 @@ def test_main_dispatches_to_expected_workflow(monkeypatch):
         run.main()
 
         assert branch_calls == [expected]
+
+
+def test_initialize_union_state_uses_stage_unions_and_rotating_backups(
+    tmp_path,
+    monkeypatch,
+):
+    """Union state should create 4 stage targets with one rotating backup each.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(run.cfg.runtime, "union_backup_every", 2)
+    recorded_backups = []
+
+    monkeypatch.setattr(run, "count_shapefile_features", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        run,
+        "append_mask_to_union_shapefile",
+        lambda mask, ref_path, out_path, start_id=0: start_id + 1,
+    )
+    monkeypatch.setattr(
+        run,
+        "backup_union_shapefile",
+        lambda out_path, backup_dir, step, backup_name=None: recorded_backups.append(
+            (Path(out_path).parent.name, Path(backup_dir).name, step, backup_name)
+        ),
+    )
+
+    union_states, append_union = run._initialize_union_state(
+        shape_dir=str(tmp_path / "shapes"),
+        resume_run=False,
+    )
+
+    assert sorted(union_states) == [
+        "crf",
+        "raw",
+        "shadow",
+        "shadow_with_proposals",
+    ]
+
+    append_union("shadow_with_proposals", mask=[[1]], ref_path="tile.tif", step=1)
+    append_union("shadow_with_proposals", mask=[[1]], ref_path="tile.tif", step=2)
+
+    assert recorded_backups == [
+        ("shadow_with_proposals", "backup", 2, "union_backup")
+    ]
 
 
 def test_resolve_inference_model_bundle_dir_uses_latest_valid_previous_run(tmp_path):
