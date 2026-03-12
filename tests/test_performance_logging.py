@@ -28,6 +28,7 @@ from segedge.core.xdboost import (
     train_xgb_classifier,
     xgb_score_image_b,
     xgb_score_image_b_legacy,
+    xgb_score_image_b_streaming,
 )
 from segedge.pipeline.runtime.holdout_inference import infer_on_holdout
 
@@ -211,6 +212,187 @@ def test_xgb_score_image_optimized_matches_legacy_on_cached_features(tmp_path):
 
     np.testing.assert_allclose(score_optimized, score_legacy, rtol=1e-6, atol=1e-6)
     assert np.array_equal(score_optimized >= 0.5, score_legacy >= 0.5)
+
+
+def test_xgb_score_image_streaming_matches_cached_prefetch_path(
+    tmp_path,
+    monkeypatch,
+):
+    """Streaming XGB scoring should match the cached-feature scorer.
+
+    Examples:
+        >>> True
+        True
+    """
+    rng = np.random.default_rng(2)
+    feature_dir = tmp_path / "features"
+    image_id = "tile_stream"
+    image = np.zeros((64, 32, 3), dtype=np.uint8)
+    image[:32, :, :] = 32
+    image[32:, :, :] = 96
+    feats_top = rng.normal(size=(2, 2, 4)).astype(np.float32)
+    feats_bottom = rng.normal(size=(2, 2, 4)).astype(np.float32)
+    save_tile_features(
+        feats_top,
+        str(feature_dir),
+        image_id,
+        0,
+        0,
+        meta={
+            "ps": 16,
+            "resample_factor": 1,
+            "h_eff": 32,
+            "w_eff": 32,
+            "feature_spec_hash": hybrid_feature_spec_hash(),
+        },
+    )
+    save_tile_features(
+        feats_bottom,
+        str(feature_dir),
+        image_id,
+        32,
+        0,
+        meta={
+            "ps": 16,
+            "resample_factor": 1,
+            "h_eff": 32,
+            "w_eff": 32,
+            "feature_spec_hash": hybrid_feature_spec_hash(),
+        },
+    )
+    prefetched = prefetch_features_single_scale_image(
+        image,
+        model=None,
+        processor=None,
+        device=None,
+        ps=16,
+        tile_size=32,
+        stride=32,
+        aggregate_layers=None,
+        feature_dir=str(feature_dir),
+        image_id=image_id,
+        materialize_cached=False,
+    )
+    X = np.vstack(
+        [
+            feats_top.reshape(-1, feats_top.shape[-1]),
+            feats_bottom.reshape(-1, feats_bottom.shape[-1]),
+        ]
+    ).astype(np.float32)
+    y = np.array([1, 0, 1, 0, 0, 1, 0, 1], dtype=np.float32)
+    booster = train_xgb_classifier(
+        X,
+        y,
+        use_gpu=False,
+        num_boost_round=8,
+        verbose_eval=False,
+    )
+
+    def _fake_extract_single(img_hw3, *args, **kwargs):
+        value = int(img_hw3[0, 0, 0])
+        if value == 32:
+            return feats_top.copy(), 2, 2
+        if value == 96:
+            return feats_bottom.copy(), 2, 2
+        raise AssertionError(f"unexpected tile marker {value}")
+
+    def _fake_extract_batch(images_hw3, *args, **kwargs):
+        feats = []
+        for img_hw3 in images_hw3:
+            feats_tile, _, _ = _fake_extract_single(img_hw3)
+            feats.append(feats_tile)
+        return np.stack(feats, axis=0), 2, 2
+
+    monkeypatch.setattr(
+        "segedge.core.xdboost.extract_patch_features_single_scale",
+        _fake_extract_single,
+    )
+    monkeypatch.setattr(
+        "segedge.core.xdboost.extract_patch_features_batch_single_scale",
+        _fake_extract_batch,
+    )
+
+    score_cached = xgb_score_image_b(
+        image,
+        booster,
+        16,
+        32,
+        32,
+        str(feature_dir),
+        image_id,
+        prefetched_tiles=prefetched,
+    )
+    score_streaming = xgb_score_image_b_streaming(
+        image,
+        booster,
+        model=None,
+        processor=None,
+        device=None,
+        ps=16,
+        tile_size=32,
+        stride=32,
+    )
+
+    np.testing.assert_allclose(score_streaming, score_cached, rtol=1e-6, atol=1e-6)
+    assert np.array_equal(score_streaming >= 0.5, score_cached >= 0.5)
+
+
+def test_xgb_score_image_streaming_respects_feature_batch_size(monkeypatch):
+    """Streaming extraction should not exceed the configured feature batch size.
+
+    Examples:
+        >>> True
+        True
+    """
+    image = np.zeros((128, 32, 3), dtype=np.uint8)
+    for idx, y in enumerate(range(0, 128, 32), start=1):
+        image[y : y + 32, :, :] = idx
+
+    extract_calls: list[int] = []
+
+    def _fake_extract_single(img_hw3, *args, **kwargs):
+        value = float(img_hw3[0, 0, 0])
+        feats_tile = np.full((2, 2, 4), value, dtype=np.float32)
+        return feats_tile, 2, 2
+
+    def _fake_extract_batch(images_hw3, *args, **kwargs):
+        extract_calls.append(len(images_hw3))
+        feats = [_fake_extract_single(img_hw3)[0] for img_hw3 in images_hw3]
+        return np.stack(feats, axis=0), 2, 2
+
+    def _fake_fuse(
+        feats_tile, img_c, ps, *, mode, xgb_feature_stats=None, return_layout=False
+    ):
+        return feats_tile, None
+
+    class _Booster:
+        def inplace_predict(self, feats):
+            return np.full((feats.shape[0],), 0.5, dtype=np.float32)
+
+    monkeypatch.setattr(cfg.runtime, "feature_batch_size", 1)
+    monkeypatch.setattr(
+        "segedge.core.xdboost.extract_patch_features_single_scale",
+        _fake_extract_single,
+    )
+    monkeypatch.setattr(
+        "segedge.core.xdboost.extract_patch_features_batch_single_scale",
+        _fake_extract_batch,
+    )
+    monkeypatch.setattr("segedge.core.xdboost.fuse_patch_features", _fake_fuse)
+
+    score = xgb_score_image_b_streaming(
+        image,
+        _Booster(),
+        model=None,
+        processor=None,
+        device=None,
+        ps=16,
+        tile_size=32,
+        stride=32,
+    )
+
+    assert score.shape == (128, 32)
+    assert extract_calls == []
 
 
 def test_prefetch_manifest_hit_revalidates_lazy_cached_tile(tmp_path, monkeypatch):

@@ -15,6 +15,16 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Stream one-shot XGB inference directly from extracted feature batches instead of prefetching all tile features for the image up front, and vectorize batch feature normalization.
+- Files touched: `segedge/core/feature_ops/extraction.py`, `segedge/core/xdboost.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: Recent inference profiles showed `infer_on_holdout::prefetch_features` dominating one-shot inference when inference-side disk cache was disabled, because the pipeline still extracted the whole image before any XGB scoring could start.
+- Problems fixed: `extract_patch_features_batch_single_scale` now normalizes whole batches at once, one-shot XGB inference can stream extract/fuse/predict/accumulate work without building a full `prefetched_tiles` dictionary first, and the holdout XGB guard still compares the optimized streaming scorer against the legacy scorer on the first guarded tiles.
+
+- Description: Clamp streaming XGB feature extraction batches to `runtime.feature_batch_size`.
+- Files touched: `segedge/core/xdboost.py`, `tests/test_performance_logging.py`, `docs/CHANGELOG.md`
+- Reason: The optimized streaming scorer had started extracting up to four times more tiles per DINO batch than the configured budget, which could exceed VRAM on setups sized to the existing limit.
+- Problems fixed: One-shot XGB inference now treats `runtime.feature_batch_size` as a hard extraction cap again, and a regression test pins that budget-sensitive behavior.
+
 - Description: Split feature-cache persistence into separate training/inference toggles and add explicit cache-cost metadata to feature-prefetch performance logging.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/feature_ops/extraction.py`, `segedge/pipeline/run.py`, `segedge/pipeline/workflows/shared.py`, `segedge/pipeline/workflows/manual_training.py`, `segedge/pipeline/workflows/loo_training.py`, `segedge/pipeline/workflows/inference_only.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: One-shot inference runs should be able to avoid building disk feature cache while training/tuning still keeps reusable feature artifacts, and performance analysis needs to show how much cache I/O is costing.

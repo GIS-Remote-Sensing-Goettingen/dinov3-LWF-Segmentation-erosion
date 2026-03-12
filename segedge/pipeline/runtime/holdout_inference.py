@@ -23,7 +23,11 @@ from ...core.plotting import (
     save_unified_plot,
 )
 from ...core.timing_utils import perf_span
-from ...core.xdboost import xgb_score_image_b, xgb_score_image_b_legacy
+from ...core.xdboost import (
+    xgb_score_image_b,
+    xgb_score_image_b_legacy,
+    xgb_score_image_b_streaming,
+)
 from .postprocess import _apply_shadow_filter, filter_novel_proposals
 from .roads import _apply_roads_penalty, _get_roads_mask
 from .tile_context import load_b_tile_context
@@ -219,6 +223,23 @@ def _prefetch_holdout_features(
     )
 
 
+def _should_stream_xgb_features(
+    context: dict[str, object],
+    feature_dir: str | None,
+) -> bool:
+    """Return whether one-shot XGB inference should stream features.
+
+    Examples:
+        >>> _should_stream_xgb_features({"xgb_enabled": True, "knn_enabled": False}, None)
+        True
+    """
+    return bool(
+        feature_dir is None
+        and bool(context.get("xgb_enabled", False))
+        and not bool(context.get("knn_enabled", False))
+    )
+
+
 def _compute_knn_stream(
     context: dict[str, object],
     tuned: dict,
@@ -297,6 +318,9 @@ def _compute_knn_stream(
 def _compute_xgb_stream(
     context: dict[str, object],
     tuned: dict,
+    model,
+    processor,
+    device,
     ps: int,
     tile_size: int,
     stride: int,
@@ -329,6 +353,9 @@ def _compute_xgb_stream(
         context=context,
         tuned=tuned,
         bst=bst,
+        model=model,
+        processor=processor,
+        device=device,
         ps=ps,
         tile_size=tile_size,
         stride=stride,
@@ -370,6 +397,9 @@ def _score_xgb_with_guard(
     context: dict[str, object],
     tuned: dict,
     bst,
+    model,
+    processor,
+    device,
     ps: int,
     tile_size: int,
     stride: int,
@@ -378,7 +408,22 @@ def _score_xgb_with_guard(
     xgb_guard_state: dict[str, object] | None,
 ) -> np.ndarray:
     """Score one tile with the optimized XGB path and optional legacy guard."""
-    if not xgb_guard_state or not bool(xgb_guard_state.get("enabled", False)):
+    use_streaming = _should_stream_xgb_features(context, feature_dir)
+
+    def _score_xgb_optimized() -> np.ndarray:
+        if use_streaming:
+            return xgb_score_image_b_streaming(
+                context["img_b"],
+                bst,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                context_radius=context_radius,
+                xgb_feature_stats=context["xgb_feature_stats"],
+            )
         return xgb_score_image_b(
             context["img_b"],
             bst,
@@ -391,9 +436,15 @@ def _score_xgb_with_guard(
             context_radius=context_radius,
             xgb_feature_stats=context["xgb_feature_stats"],
         )
+
+    if not xgb_guard_state or not bool(xgb_guard_state.get("enabled", False)):
+        return _score_xgb_optimized()
     if bool(xgb_guard_state.get("fallback_to_legacy", False)):
         return _score_xgb_legacy(
             context=context,
+            model=model,
+            processor=processor,
+            device=device,
             bst=bst,
             ps=ps,
             tile_size=tile_size,
@@ -404,32 +455,13 @@ def _score_xgb_with_guard(
     checked_tiles = int(xgb_guard_state.get("checked_tiles", 0))
     guard_tiles = int(xgb_guard_state.get("guard_tiles", 0))
     if checked_tiles >= guard_tiles:
-        return xgb_score_image_b(
-            context["img_b"],
-            bst,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            context["image_id_b"],
-            prefetched_tiles=context["prefetched_b"],
-            context_radius=context_radius,
-            xgb_feature_stats=context["xgb_feature_stats"],
-        )
-    score_map = xgb_score_image_b(
-        context["img_b"],
-        bst,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        context["image_id_b"],
-        prefetched_tiles=context["prefetched_b"],
-        context_radius=context_radius,
-        xgb_feature_stats=context["xgb_feature_stats"],
-    )
+        return _score_xgb_optimized()
+    score_map = _score_xgb_optimized()
     legacy_score = _score_xgb_legacy(
         context=context,
+        model=model,
+        processor=processor,
+        device=device,
         bst=bst,
         ps=ps,
         tile_size=tile_size,
@@ -467,6 +499,9 @@ def _score_xgb_with_guard(
 def _score_xgb_legacy(
     *,
     context: dict[str, object],
+    model,
+    processor,
+    device,
     bst,
     ps: int,
     tile_size: int,
@@ -475,6 +510,18 @@ def _score_xgb_legacy(
     context_radius: int,
 ) -> np.ndarray:
     """Run the legacy XGB scorer for guard comparisons and fallback."""
+    prefetched_b = context["prefetched_b"]
+    if prefetched_b is None:
+        prefetched_b = _prefetch_holdout_features(
+            context,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+        )
     return xgb_score_image_b_legacy(
         context["img_b"],
         bst,
@@ -483,7 +530,7 @@ def _score_xgb_legacy(
         stride,
         feature_dir,
         context["image_id_b"],
-        prefetched_tiles=context["prefetched_b"],
+        prefetched_tiles=prefetched_b,
         context_radius=context_radius,
         xgb_feature_stats=context["xgb_feature_stats"],
     )
@@ -1034,17 +1081,25 @@ def infer_on_holdout(
             gt_vector_paths,
             tuned,
         )
-    with perf_span("infer_on_holdout", substage="prefetch_features"):
-        context["prefetched_b"] = _prefetch_holdout_features(
-            context,
-            model,
-            processor,
-            device,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-        )
+    context["prefetched_b"] = None
+    with perf_span(
+        "infer_on_holdout",
+        substage="prefetch_features",
+        extra={
+            "streaming_xgb": _should_stream_xgb_features(context, feature_dir),
+        },
+    ):
+        if not _should_stream_xgb_features(context, feature_dir):
+            context["prefetched_b"] = _prefetch_holdout_features(
+                context,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+            )
     if not (context["knn_enabled"] or context["xgb_enabled"]):
         raise ValueError("both kNN and XGB are disabled for inference")
     with perf_span("infer_on_holdout", substage="knn_stream"):
@@ -1066,6 +1121,9 @@ def infer_on_holdout(
         xgb_result = _compute_xgb_stream(
             context,
             tuned,
+            model,
+            processor,
+            device,
             ps,
             tile_size,
             stride,

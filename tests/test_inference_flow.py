@@ -427,6 +427,9 @@ def test_compute_xgb_stream_fills_holes_when_enabled(monkeypatch):
     result = _compute_xgb_stream(
         context,
         tuned,
+        model=None,
+        processor=None,
+        device=None,
         ps=16,
         tile_size=16,
         stride=16,
@@ -661,6 +664,10 @@ def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatc
         _fake_optimized,
     )
     monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.xgb_score_image_b_streaming",
+        _fake_optimized,
+    )
+    monkeypatch.setattr(
         "segedge.pipeline.runtime.holdout_inference.xgb_score_image_b_legacy",
         _fake_legacy,
     )
@@ -692,6 +699,9 @@ def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatc
     result_a = _compute_xgb_stream(
         context,
         tuned,
+        model=None,
+        processor=None,
+        device=None,
         ps=16,
         tile_size=32,
         stride=32,
@@ -703,6 +713,9 @@ def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatc
     result_b = _compute_xgb_stream(
         context,
         tuned,
+        model=None,
+        processor=None,
+        device=None,
         ps=16,
         tile_size=32,
         stride=32,

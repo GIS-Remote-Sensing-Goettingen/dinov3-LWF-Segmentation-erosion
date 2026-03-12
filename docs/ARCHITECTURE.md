@@ -45,6 +45,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 
 ### Runtime Helpers
 - `runtime/holdout_inference.py`: per-tile inference loop for validation and holdout tiles.
+  - when inference-side disk cache is disabled and the active stream is XGB-only, holdout inference uses a streaming extract/fuse/predict path instead of prefetching the whole image's features before scoring.
 - `runtime/checkpointing.py`: writes `rolling_best_setting.yml`.
 - `runtime/time_budget.py`: computes deadlines, remaining time, and serialized budget state.
 - `runtime/roads.py`: cached road-mask rasterization and roads-penalty scoring.
@@ -61,6 +62,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `feature_ops/extraction.py`: DINO feature extraction and batched tile prefetch.
   - for XGB-only inference, cached feature tiles can stay lazy until the scorer actually needs each tile.
   - cache-hit validation can reuse a per-image manifest instead of reopening every tile sidecar.
+  - batch feature normalization is vectorized so one-shot inference avoids per-item normalization loops after the DINO forward pass.
 - `feature_ops/tiling.py`: tile iteration, patch-size cropping, and patch-label mapping.
 - `feature_ops/fusion.py`: hybrid DINO + image-descriptor feature assembly and XGB feature-stat transforms.
 - `feature_ops/cache.py`: per-tile feature cache persistence, validation, and per-image manifests.
