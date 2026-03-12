@@ -1,8 +1,5 @@
 # Documentation
 
-This repository keeps all human-maintained project documentation under `docs/`.
-`AGENTS.md` stays at the repository root because it contains repository-wide
-instructions for coding agents.
 
 ## Core docs
 - `docs/ARCHITECTURE.md`: repository structure, runtime boundaries, and outputs
