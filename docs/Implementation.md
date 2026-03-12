@@ -8,7 +8,7 @@ This document explains how the current SegEdge pipeline actually runs, with emph
 
 1. Create or resume the run directory.
 2. Configure logging, processed-tile resume state, and rolling union shapefiles.
-3. Initialize the time-budget state and feature-cache mode.
+3. Initialize the time-budget state and phase-specific feature-cache settings.
 4. Resolve the tile set and dispatch the correct workflow.
 
 The dispatcher does not train or infer by itself. It builds a shared `common` runtime payload and passes it to one workflow module.
@@ -29,13 +29,13 @@ Execution order:
 4. Export `inference_best_setting.yml` and the legacy `best_setting.yml`.
 5. Copy the current `config.yml` into the run directory.
 5. Run holdout inference on the resolved inference tile set.
-6. Summarize phase metrics and consolidate disk features if enabled.
+6. Summarize phase metrics and consolidate disk features if inference-side caching is enabled.
 
 Important behavior:
 - No training artifacts are built in this mode.
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
-- The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
+- The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, cache read/write cost, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
 - Source-label reprojection is optimized in the shared I/O layer: repeated tiles reuse the same source-label raster handle, aligned same-CRS grids prefer direct window reads, and the performance log now splits source-label work into open/grid/reproject/finalize substages.
 - XGB CRF refinement can use a trimap-band unary: the current XGB mask is treated as strong interior foreground, a dilated ring is treated as uncertain, and CRF uses RGB edges to fill holes and expand/shrink that boundary band. The single tuning knob for this is `search.crf.trimap_band_pixels_values`.
 - `postprocess.fill_holes_xgb` can fill enclosed holes in the thresholded XGB raw mask before trimap CRF, so CRF expands from the filled coarse mask instead of the original holey threshold mask.
@@ -124,7 +124,7 @@ When the optimized XGB scorer is active, the first 3 pending holdout tiles are a
 - Key decisions:
   - resume vs new run
   - inference-only vs manual vs LOO
-  - disk vs memory feature cache
+  - independent training vs inference feature-cache persistence
   - time-budget initialization policy
 
 ### `segedge.pipeline.workflows.run_inference_only`
@@ -165,14 +165,15 @@ When the optimized XGB scorer is active, the first 3 pending holdout tiles are a
 - Main value: interruption-safe state snapshots that are consistent across workflows
 
 ### `segedge.pipeline.workflows.shared.consolidate_cached_features`
-- Inputs: feature cache mode, feature directory, image ids to consolidate
-- Produces: merged per-image feature arrays when disk cache mode is active
+- Inputs: feature directory, image ids to consolidate, per-phase consolidation flags
+- Produces: merged per-image feature arrays when disk cache mode is active for the relevant phase
 - Main value: keeps feature cleanup out of the workflow bodies
 
 ## Feature and Runtime Packages
 ### `segedge/core/feature_ops`
 - `extraction.py`: DINO feature extraction and tile prefetch
   - cached XGB-only inference tiles can now stay lazy and hand their `.npy` path to the scorer instead of loading the array up front
+  - prefetch logging now records cache hits, recomputed tiles, and approximate feature/manifest bytes read and written
 - `tiling.py`: tile iteration and patch-grid alignment
 - `fusion.py`: hybrid feature assembly and XGB stat transforms
 - `cache.py`: on-disk feature cache format

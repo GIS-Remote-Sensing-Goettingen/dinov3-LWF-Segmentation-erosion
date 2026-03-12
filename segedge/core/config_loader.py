@@ -7,12 +7,15 @@ Examples:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -347,7 +350,8 @@ class TimeBudgetConfig:
 class RuntimeConfig:
     """Runtime and diagnostics settings."""
 
-    feature_cache_mode: str
+    cache_training_features: bool
+    cache_inference_features: bool
     feature_batch_size: int
     resume_run: bool
     resume_run_dir: str | None
@@ -934,8 +938,35 @@ def _load_runtime_config(runtime: dict[str, Any]) -> RuntimeConfig:
     runtime_time_budget = _require_mapping(
         runtime.get("time_budget", {}), "runtime.time_budget"
     )
+    legacy_feature_cache_mode = runtime.get("feature_cache_mode")
+    if legacy_feature_cache_mode is not None:
+        legacy_mode = str(legacy_feature_cache_mode)
+        if legacy_mode not in {"disk", "memory"}:
+            raise ValueError("runtime.feature_cache_mode must be 'disk' or 'memory'")
+        if (
+            "cache_training_features" not in runtime
+            and "cache_inference_features" not in runtime
+        ):
+            logger.warning(
+                "runtime.feature_cache_mode is deprecated; use "
+                "runtime.cache_training_features and "
+                "runtime.cache_inference_features"
+            )
+            cache_training_features = legacy_mode == "disk"
+            cache_inference_features = legacy_mode == "disk"
+        else:
+            cache_training_features = bool(
+                runtime.get("cache_training_features", legacy_mode == "disk")
+            )
+            cache_inference_features = bool(
+                runtime.get("cache_inference_features", legacy_mode == "disk")
+            )
+    else:
+        cache_training_features = bool(runtime.get("cache_training_features", True))
+        cache_inference_features = bool(runtime.get("cache_inference_features", True))
     return RuntimeConfig(
-        feature_cache_mode=str(runtime["feature_cache_mode"]),
+        cache_training_features=cache_training_features,
+        cache_inference_features=cache_inference_features,
         feature_batch_size=int(runtime["feature_batch_size"]),
         resume_run=bool(runtime["resume_run"]),
         resume_run_dir=(

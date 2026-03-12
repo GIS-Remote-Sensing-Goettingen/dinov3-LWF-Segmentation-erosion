@@ -525,34 +525,57 @@ def _resolve_tile_sets(
     }
 
 
-def _resolve_feature_cache(auto_split_tiles: bool) -> tuple[str, str | None]:
-    """Resolve feature-cache mode and create the cache directory if needed.
+def _resolve_feature_cache(
+    auto_split_tiles: bool,
+) -> tuple[str, str | None, str, str | None]:
+    """Resolve training and inference feature-cache modes/directories.
 
     Examples:
         >>> callable(_resolve_feature_cache)
         True
     """
-    feature_cache_mode = cfg.runtime.feature_cache_mode
-    if feature_cache_mode not in {"disk", "memory"}:
-        raise ValueError("FEATURE_CACHE_MODE must be 'disk' or 'memory'")
+    training_feature_cache_mode = (
+        "disk" if cfg.runtime.cache_training_features else "memory"
+    )
+    inference_feature_cache_mode = (
+        "disk" if cfg.runtime.cache_inference_features else "memory"
+    )
     if (
-        feature_cache_mode == "memory"
+        training_feature_cache_mode == "memory"
         and auto_split_tiles
         and cfg.training.loo.enabled
         and cfg.model.augmentation.enabled
     ):
         logger.warning(
-            "feature_cache_mode=memory with LOO+augmentation causes "
-            "repeated DINO extraction; forcing disk cache"
+            "cache_training_features=false with LOO+augmentation causes "
+            "repeated DINO extraction; forcing training-side disk cache"
         )
-        feature_cache_mode = "disk"
-    if feature_cache_mode == "disk":
-        feature_dir = cfg.io.paths.feature_dir
-        os.makedirs(feature_dir, exist_ok=True)
+        training_feature_cache_mode = "disk"
+    use_disk_cache = (
+        training_feature_cache_mode == "disk" or inference_feature_cache_mode == "disk"
+    )
+    if use_disk_cache:
+        feature_dir_root = cfg.io.paths.feature_dir
+        os.makedirs(feature_dir_root, exist_ok=True)
     else:
-        feature_dir = None
-    logger.info("feature cache mode: %s", feature_cache_mode)
-    return feature_cache_mode, feature_dir
+        feature_dir_root = None
+    training_feature_dir = (
+        feature_dir_root if training_feature_cache_mode == "disk" else None
+    )
+    inference_feature_dir = (
+        feature_dir_root if inference_feature_cache_mode == "disk" else None
+    )
+    logger.info(
+        "feature cache mode: training=%s inference=%s",
+        training_feature_cache_mode,
+        inference_feature_cache_mode,
+    )
+    return (
+        training_feature_cache_mode,
+        training_feature_dir,
+        inference_feature_cache_mode,
+        inference_feature_dir,
+    )
 
 
 def main():
@@ -603,9 +626,12 @@ def main():
         auto_split_tiles=auto_split_tiles,
         gt_vector_paths=gt_vector_paths,
     )
-    feature_cache_mode, feature_dir = _resolve_feature_cache(
-        bool(tile_sets["auto_split_tiles"])
-    )
+    (
+        training_feature_cache_mode,
+        training_feature_dir,
+        inference_feature_cache_mode,
+        inference_feature_dir,
+    ) = _resolve_feature_cache(bool(tile_sets["auto_split_tiles"]))
 
     if (
         training_enabled
@@ -637,8 +663,12 @@ def main():
         "context_radius": context_radius,
         "current_time_budget_status": lambda: _current_time_budget_status(budget_state),
         "device": device,
-        "feature_cache_mode": feature_cache_mode,
-        "feature_dir": feature_dir,
+        "feature_cache_mode": training_feature_cache_mode,
+        "feature_dir": training_feature_dir,
+        "training_feature_cache_mode": training_feature_cache_mode,
+        "training_feature_dir": training_feature_dir,
+        "inference_feature_cache_mode": inference_feature_cache_mode,
+        "inference_feature_dir": inference_feature_dir,
         "gt_vector_paths": gt_vector_paths,
         "holdout_phase_metrics": {},
         "inference_plot_dir": run_paths["inference_plot_dir"],
@@ -701,10 +731,11 @@ def main():
 
     if common["should_consolidate"]:
         consolidate_cached_features(
-            feature_cache_mode=feature_cache_mode,
-            feature_dir=feature_dir,
+            feature_dir=cfg.io.paths.feature_dir,
             train_image_ids=list(common["train_image_ids"]),
             inference_tiles=list(common["consolidation_tiles"]),
+            consolidate_training=training_feature_cache_mode == "disk",
+            consolidate_inference=inference_feature_cache_mode == "disk",
         )
 
     emit_performance_summary("run_complete")

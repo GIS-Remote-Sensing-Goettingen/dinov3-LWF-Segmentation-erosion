@@ -215,26 +215,30 @@ def build_weighted_phase_metrics(
 
 
 def consolidate_cached_features(
-    feature_cache_mode: str,
     feature_dir: str | None,
     train_image_ids: list[str],
     inference_tiles: list[str],
+    *,
+    consolidate_training: bool,
+    consolidate_inference: bool,
 ) -> None:
     """Consolidate per-tile feature caches after a run.
 
     Examples:
-        >>> consolidate_cached_features("memory", None, [], [])
+        >>> consolidate_cached_features(None, [], [], consolidate_training=False, consolidate_inference=False)
     """
-    if feature_cache_mode != "disk":
+    if not consolidate_training and not consolidate_inference:
         return
     if feature_dir is None:
         raise ValueError("feature_dir must be set for disk cache mode")
     _log_phase("START", "feature_consolidation")
-    for image_id_a in train_image_ids:
-        consolidate_features_for_image(feature_dir, image_id_a)
-    for b_path in inference_tiles:
-        image_id_b = os.path.splitext(os.path.basename(b_path))[0]
-        consolidate_features_for_image(feature_dir, image_id_b)
+    if consolidate_training:
+        for image_id_a in train_image_ids:
+            consolidate_features_for_image(feature_dir, image_id_a)
+    if consolidate_inference:
+        for b_path in inference_tiles:
+            image_id_b = os.path.splitext(os.path.basename(b_path))[0]
+            consolidate_features_for_image(feature_dir, image_id_b)
     _log_phase("END", "feature_consolidation")
 
 

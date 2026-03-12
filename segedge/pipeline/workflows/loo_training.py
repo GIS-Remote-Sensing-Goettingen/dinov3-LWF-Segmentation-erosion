@@ -925,7 +925,7 @@ def _run_loo_holdout_phase(
         ps=common["ps"],
         tile_size=common["tile_size"],
         stride=common["stride"],
-        feature_dir=common["feature_dir"],
+        feature_dir=common["inference_feature_dir"],
         shape_dir=common["shape_dir"],
         plot_dir=common["inference_plot_dir"],
         context_radius=common["context_radius"],

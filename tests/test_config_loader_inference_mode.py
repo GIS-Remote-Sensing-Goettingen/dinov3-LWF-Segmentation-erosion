@@ -175,6 +175,43 @@ def test_inference_plot_toggles_parse_from_config(tmp_path):
     assert loaded.io.inference.plots.proposal_overlay is True
 
 
+def test_runtime_cache_phase_toggles_parse_from_config(tmp_path):
+    """Runtime cache booleans should parse explicitly for train/infer phases.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["runtime"]["cache_training_features"] = False
+    raw["runtime"]["cache_inference_features"] = True
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.runtime.cache_training_features is False
+    assert loaded.runtime.cache_inference_features is True
+
+
+def test_legacy_runtime_feature_cache_mode_maps_to_phase_toggles(tmp_path):
+    """Legacy runtime.feature_cache_mode should remain backward compatible.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["runtime"].pop("cache_training_features", None)
+    raw["runtime"].pop("cache_inference_features", None)
+    raw["runtime"]["feature_cache_mode"] = "disk"
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.runtime.cache_training_features is True
+    assert loaded.runtime.cache_inference_features is True
+
+
 def test_crf_trimap_band_pixels_parse_from_config(tmp_path):
     """search.crf.trimap_band_pixels_values should parse when explicitly configured.
 

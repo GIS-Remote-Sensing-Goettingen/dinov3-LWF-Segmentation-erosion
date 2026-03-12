@@ -9,8 +9,9 @@ import numpy as np
 import torch
 
 from ..config_loader import cfg
-from ..timing_utils import perf_span, time_end, time_start
+from ..timing_utils import perf_span, record_performance, time_end, time_start
 from .cache import (
+    image_feature_manifest_path,
     inspect_tile_features_if_valid,
     load_feature_manifest_if_valid,
     load_tile_features_if_valid,
@@ -23,6 +24,19 @@ from .spec import hybrid_feature_spec_hash
 from .tiling import crop_to_multiple_of_ps, tile_iterator
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_file_size(path: str) -> int:
+    """Return file size or zero when unavailable.
+
+    Examples:
+        >>> _safe_file_size("/tmp/missing") >= 0
+        True
+    """
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
 
 
 def _manifest_feature_path_if_loadable(
@@ -151,6 +165,17 @@ def prefetch_features_single_scale_image(
     t0 = time_start()
     cache = {}
     cached_tiles = computed_tiles = skipped_tiles = 0
+    manifest_cache_hits = 0
+    cache_stats = {
+        "feature_bytes_read": 0,
+        "feature_bytes_written": 0,
+        "feature_files_read": 0,
+        "feature_files_written": 0,
+        "manifest_bytes_read": 0,
+        "manifest_bytes_written": 0,
+        "manifest_files_read": 0,
+        "manifest_files_written": 0,
+    }
     resample_factor = int(cfg.model.backbone.resample_factor or 1)
     batch_size = int(cfg.runtime.feature_batch_size or 1)
     batch_size = max(1, batch_size)
@@ -159,6 +184,7 @@ def prefetch_features_single_scale_image(
     manifest_entries: dict[tuple[int, int], dict[str, int]] = {}
     manifest_dirty = False
     if feature_dir is not None and image_id is not None:
+        manifest_path = image_feature_manifest_path(feature_dir, image_id)
         with perf_span(
             "prefetch_features_single_scale_image",
             substage="load_feature_manifest",
@@ -172,6 +198,9 @@ def prefetch_features_single_scale_image(
             )
         if manifest_tiles:
             manifest_entries.update(manifest_tiles)
+        if os.path.exists(manifest_path):
+            cache_stats["manifest_files_read"] += 1
+            cache_stats["manifest_bytes_read"] += _safe_file_size(manifest_path)
 
     def flush_pending(
         items: list[tuple[int, int, np.ndarray, int, int]],
@@ -196,6 +225,7 @@ def prefetch_features_single_scale_image(
                     )
                 computed_tiles += 1
                 if feature_dir is not None and image_id is not None:
+                    feature_path = tile_feature_path(feature_dir, image_id, y_i, x_i)
                     meta = {
                         "ps": ps,
                         "resample_factor": resample_factor,
@@ -211,6 +241,10 @@ def prefetch_features_single_scale_image(
                         save_tile_features(
                             feats_tile, feature_dir, image_id, y_i, x_i, meta=meta
                         )
+                    cache_stats["feature_files_written"] += 1
+                    cache_stats["feature_bytes_written"] += _safe_file_size(
+                        feature_path
+                    )
                 cache[(y_i, x_i)] = {
                     "feats": feats_tile,
                     "h_eff": h_i,
@@ -264,6 +298,7 @@ def prefetch_features_single_scale_image(
             ):
                 computed_tiles += 1
                 if feature_dir is not None and image_id is not None:
+                    feature_path = tile_feature_path(feature_dir, image_id, y_i, x_i)
                     meta = {
                         "ps": ps,
                         "resample_factor": resample_factor,
@@ -279,6 +314,10 @@ def prefetch_features_single_scale_image(
                         save_tile_features(
                             feats_tile, feature_dir, image_id, y_i, x_i, meta=meta
                         )
+                    cache_stats["feature_files_written"] += 1
+                    cache_stats["feature_bytes_written"] += _safe_file_size(
+                        feature_path
+                    )
                 cache[(y_i, x_i)] = {
                     "feats": feats_tile,
                     "h_eff": h_i,
@@ -319,6 +358,7 @@ def prefetch_features_single_scale_image(
                     manifest_dirty = True
                     manifest_entries.pop((y, x), None)
                 else:
+                    manifest_cache_hits += 1
                     with perf_span(
                         "prefetch_features_single_scale_image",
                         substage="manifest_cache_hit",
@@ -338,6 +378,10 @@ def prefetch_features_single_scale_image(
                                 feats_tile = np.load(checked_path, mmap_mode="r")
                                 feats_tile = np.asarray(feats_tile, dtype=np.float32)
                                 cached_tiles += 1
+                                cache_stats["feature_files_read"] += 1
+                                cache_stats["feature_bytes_read"] += _safe_file_size(
+                                    checked_path
+                                )
                         else:
                             checked_path = _manifest_feature_path_if_loadable(
                                 feature_path,
@@ -349,6 +393,10 @@ def prefetch_features_single_scale_image(
                                 manifest_entries.pop((y, x), None)
                             else:
                                 cached_tiles += 1
+                                cache_stats["feature_files_read"] += 1
+                                cache_stats["feature_bytes_read"] += _safe_file_size(
+                                    checked_path
+                                )
                                 cache[(y, x)] = {
                                     "feats": None,
                                     "feature_path": checked_path,
@@ -377,6 +425,10 @@ def prefetch_features_single_scale_image(
                         )
                         if feats_tile is not None:
                             cached_tiles += 1
+                            cache_stats["feature_files_read"] += 1
+                            cache_stats["feature_bytes_read"] += _safe_file_size(
+                                tile_feature_path(feature_dir, image_id, y, x)
+                            )
                     else:
                         feature_path = inspect_tile_features_if_valid(
                             feature_dir,
@@ -390,6 +442,10 @@ def prefetch_features_single_scale_image(
                         )
                         if feature_path is not None:
                             cached_tiles += 1
+                            cache_stats["feature_files_read"] += 1
+                            cache_stats["feature_bytes_read"] += _safe_file_size(
+                                feature_path
+                            )
                             cache[(y, x)] = {
                                 "feats": None,
                                 "feature_path": feature_path,
@@ -452,12 +508,38 @@ def prefetch_features_single_scale_image(
                     resample_factor,
                     manifest_entries,
                 )
+            cache_stats["manifest_files_written"] += 1
+            cache_stats["manifest_bytes_written"] += _safe_file_size(
+                image_feature_manifest_path(feature_dir, image_id)
+            )
+    summary_extra = {
+        "cached_tiles": int(cached_tiles),
+        "computed_tiles": int(computed_tiles),
+        "skipped_tiles": int(skipped_tiles),
+        "manifest_cache_hits": int(manifest_cache_hits),
+        "cache_hit_ratio": float(cached_tiles / max(1, cached_tiles + computed_tiles)),
+        **cache_stats,
+    }
+    record_performance(
+        "prefetch_features_single_scale_image",
+        0.0,
+        substage="cache_summary",
+        extra={"image_id": image_id, **summary_extra},
+    )
     time_end("prefetch_features_single_scale_image", t0)
     logger.info(
-        "prefetch tiles=%s (cached=%s, computed=%s, skipped=%s)",
+        "prefetch tiles=%s (cached=%s, computed=%s, skipped=%s, "
+        "cache_hit_ratio=%.3f, manifest_hits=%s, read=%.1f MB/%s files, "
+        "written=%.1f MB/%s files)",
         len(cache),
         cached_tiles,
         computed_tiles,
         skipped_tiles,
+        float(cached_tiles / max(1, cached_tiles + computed_tiles)),
+        manifest_cache_hits,
+        cache_stats["feature_bytes_read"] / (1024 * 1024),
+        cache_stats["feature_files_read"],
+        cache_stats["feature_bytes_written"] / (1024 * 1024),
+        cache_stats["feature_files_written"],
     )
     return cache

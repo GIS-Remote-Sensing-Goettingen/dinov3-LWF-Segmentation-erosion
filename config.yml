@@ -260,8 +260,10 @@ postprocess:
     connectivity: 2
 
 runtime:
-  # Disk cache strongly recommended for LOO + augmentation workloads.
-  feature_cache_mode: disk
+  # Persist training-side feature caches to disk.
+  cache_training_features: true
+  # Persist final holdout / inference-only feature caches to disk.
+  cache_inference_features: false
   feature_batch_size: 4
   resume_run: false
   resume_run_dir: null

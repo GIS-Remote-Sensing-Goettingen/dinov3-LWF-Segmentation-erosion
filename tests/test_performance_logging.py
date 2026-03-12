@@ -29,6 +29,7 @@ from segedge.core.xdboost import (
     xgb_score_image_b,
     xgb_score_image_b_legacy,
 )
+from segedge.pipeline.runtime.holdout_inference import infer_on_holdout
 
 
 def test_performance_log_writes_contextual_jsonl(tmp_path):
@@ -278,6 +279,67 @@ def test_prefetch_manifest_hit_revalidates_lazy_cached_tile(tmp_path, monkeypatc
     )
 
 
+def test_prefetch_features_logs_cache_summary_metadata(tmp_path):
+    """Prefetch should emit cache summary metadata for later cost analysis.
+
+    Examples:
+        >>> True
+        True
+    """
+    perf_path = tmp_path / "performance.jsonl"
+    configure_performance_logging(str(perf_path), run_id="run_999")
+    feature_dir = tmp_path / "features"
+    image_id = "tile_summary"
+    feats = np.ones((2, 2, 4), dtype=np.float32)
+    save_tile_features(
+        feats,
+        str(feature_dir),
+        image_id,
+        0,
+        0,
+        meta={
+            "ps": 16,
+            "resample_factor": 1,
+            "h_eff": 32,
+            "w_eff": 32,
+            "feature_spec_hash": hybrid_feature_spec_hash(),
+        },
+    )
+
+    _ = prefetch_features_single_scale_image(
+        np.zeros((32, 32, 3), dtype=np.uint8),
+        model=None,
+        processor=None,
+        device=None,
+        ps=16,
+        tile_size=32,
+        stride=32,
+        aggregate_layers=None,
+        feature_dir=str(feature_dir),
+        image_id=image_id,
+        materialize_cached=False,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in perf_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary_rows = [
+        row
+        for row in rows
+        if row["stage"] == "prefetch_features_single_scale_image"
+        and row.get("substage") == "cache_summary"
+    ]
+    assert len(summary_rows) == 1
+    extra = summary_rows[0]["extra"]
+    assert extra["image_id"] == image_id
+    assert extra["cached_tiles"] == 1
+    assert extra["computed_tiles"] == 0
+    assert extra["feature_files_read"] >= 1
+    assert extra["feature_bytes_read"] > 0
+
+
 def test_xgb_tile_payloads_are_streamed_lazily(monkeypatch):
     """Payload preparation should be lazy instead of buffering the whole image.
 
@@ -412,3 +474,153 @@ def test_xgb_score_image_batches_multiple_small_tiles_into_one_predict(
 
     assert score.shape == (64, 16)
     assert booster.calls == [4]
+
+
+def test_infer_on_holdout_logs_prefetch_features_separately(tmp_path, monkeypatch):
+    """Infer-on-holdout should log feature prefetch separately from tile context.
+
+    Examples:
+        >>> True
+        True
+    """
+    perf_path = tmp_path / "performance.jsonl"
+    configure_performance_logging(str(perf_path), run_id="run_999")
+
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._load_holdout_tile_context",
+        lambda *args, **kwargs: {
+            "img_b": np.zeros((2, 2, 3), dtype=np.uint8),
+            "labels_sh": np.zeros((2, 2), dtype=np.uint8),
+            "gt_mask_eval": np.zeros((2, 2), dtype=bool),
+            "gt_available": False,
+            "gt_weight": 0.0,
+            "sh_buffer_mask": np.ones((2, 2), dtype=bool),
+            "buffer_m": 5.0,
+            "pixel_size_m": 0.2,
+            "image_id_b": "tile_a",
+            "roads_mask": None,
+            "roads_penalty": 1.0,
+            "xgb_feature_stats": None,
+            "knn_enabled": False,
+            "xgb_enabled": True,
+            "crf_enabled": True,
+        },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._prefetch_holdout_features",
+        lambda *args, **kwargs: {
+            (0, 0): {"feats": np.ones((1, 1, 2), dtype=np.float32)}
+        },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._compute_knn_stream",
+        lambda *args, **kwargs: {
+            "score": None,
+            "score_raw": None,
+            "threshold": None,
+            "mask": np.zeros((2, 2), dtype=bool),
+        },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._compute_xgb_stream",
+        lambda *args, **kwargs: {
+            "score": np.full((2, 2), 0.8, dtype=np.float32),
+            "score_raw": np.full((2, 2), 0.8, dtype=np.float32),
+            "threshold": 0.5,
+            "mask": np.ones((2, 2), dtype=bool),
+        },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._run_crf_stage",
+        lambda *args, **kwargs: (
+            np.zeros((2, 2), dtype=bool),
+            np.ones((2, 2), dtype=bool),
+        ),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._apply_shadow_mask",
+        lambda *args, **kwargs: np.ones((2, 2), dtype=bool),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._build_metrics_map",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.filter_novel_proposals",
+        lambda *args, **kwargs: {
+            "candidate_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_inside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_outside_mask": np.zeros((2, 2), dtype=bool),
+            "rejected_mask": np.zeros((2, 2), dtype=bool),
+            "records": [],
+        },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._build_proposal_masks",
+        lambda *args, **kwargs: {
+            "candidate_mask": np.zeros((2, 2), dtype=bool),
+            "candidate_inside_mask": np.zeros((2, 2), dtype=bool),
+            "evaluated_outside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_inside_mask": np.zeros((2, 2), dtype=bool),
+            "accepted_outside_mask": np.zeros((2, 2), dtype=bool),
+            "rejected_mask": np.zeros((2, 2), dtype=bool),
+        },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._export_proposal_artifacts",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._compute_probability_and_diagnostics",
+        lambda *args, **kwargs: (
+            np.full((2, 2), 0.8, dtype=np.float32),
+            np.zeros((2, 2), dtype=np.float32),
+            np.zeros((2, 2), dtype=np.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._save_holdout_plots",
+        lambda *args, **kwargs: None,
+    )
+
+    with performance_context(
+        phase="holdout_inference",
+        tile="tile_a.tif",
+        image_id="tile_a",
+    ):
+        infer_on_holdout(
+            holdout_path="tile_a.tif",
+            gt_vector_paths=[],
+            model=None,
+            processor=None,
+            device=None,
+            pos_bank=np.zeros((0, 2), dtype=np.float32),
+            neg_bank=np.zeros((0, 2), dtype=np.float32),
+            tuned={
+                "shadow_cfg": {"weights": [1.0, 1.0, 1.0], "threshold": 0.0},
+                "xgb_enabled": True,
+                "knn_enabled": False,
+                "crf_enabled": True,
+            },
+            ps=16,
+            tile_size=32,
+            stride=32,
+            feature_dir=None,
+            shape_dir=str(tmp_path / "shapes"),
+            plot_dir=str(tmp_path / "plots"),
+            context_radius=0,
+            save_plots=False,
+        )
+
+    rows = [
+        json.loads(line) for line in perf_path.read_text(encoding="utf-8").splitlines()
+    ]
+    infer_rows = [
+        row
+        for row in rows
+        if row.get("kind") == "span" and row.get("stage") == "infer_on_holdout"
+    ]
+    substages = {row.get("substage") for row in infer_rows}
+    assert "load_context" in substages
+    assert "prefetch_features" in substages

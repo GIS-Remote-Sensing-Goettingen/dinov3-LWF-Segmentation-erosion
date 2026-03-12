@@ -141,22 +141,15 @@ def _build_xgb_plot_preview_masks(
     }
 
 
-def _load_holdout_tile(
+def _load_holdout_tile_context(
     holdout_path: str,
     gt_vector_paths: list[str] | None,
-    model,
-    processor,
-    device,
-    ps: int,
-    tile_size: int,
-    stride: int,
-    feature_dir: str | None,
     tuned: dict,
 ) -> dict[str, object]:
-    """Load tile context, prefetched features, and runtime toggles.
+    """Load tile context and runtime toggles.
 
     Examples:
-        >>> callable(_load_holdout_tile)
+        >>> callable(_load_holdout_tile_context)
         True
     """
     (
@@ -175,19 +168,6 @@ def _load_holdout_tile(
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
     knn_enabled = bool(tuned.get("knn_enabled", cfg.search.knn.enabled))
     xgb_enabled = bool(tuned.get("xgb_enabled", cfg.search.xgb.enabled))
-    prefetched_b = prefetch_features_single_scale_image(
-        img_b,
-        model,
-        processor,
-        device,
-        ps,
-        tile_size,
-        stride,
-        None,
-        feature_dir,
-        image_id_b,
-        materialize_cached=bool(knn_enabled or not xgb_enabled),
-    )
     ds = int(cfg.model.backbone.resample_factor or 1)
     return {
         "img_b": img_b,
@@ -199,7 +179,6 @@ def _load_holdout_tile(
         "buffer_m": buffer_m,
         "pixel_size_m": pixel_size_m,
         "image_id_b": image_id_b,
-        "prefetched_b": prefetched_b,
         "roads_mask": _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2]),
         "roads_penalty": float(tuned.get("roads_penalty", 1.0)),
         "xgb_feature_stats": tuned.get("xgb_feature_stats"),
@@ -207,6 +186,37 @@ def _load_holdout_tile(
         "xgb_enabled": xgb_enabled,
         "crf_enabled": bool(tuned.get("crf_enabled", cfg.search.crf.enabled)),
     }
+
+
+def _prefetch_holdout_features(
+    context: dict[str, object],
+    model,
+    processor,
+    device,
+    ps: int,
+    tile_size: int,
+    stride: int,
+    feature_dir: str | None,
+) -> dict[tuple[int, int], dict[str, object]]:
+    """Prefetch or compute per-tile feature caches for one holdout image.
+
+    Examples:
+        >>> callable(_prefetch_holdout_features)
+        True
+    """
+    return prefetch_features_single_scale_image(
+        context["img_b"],
+        model,
+        processor,
+        device,
+        ps,
+        tile_size,
+        stride,
+        None,
+        feature_dir,
+        context["image_id_b"],
+        materialize_cached=bool(context["knn_enabled"] or not context["xgb_enabled"]),
+    )
 
 
 def _compute_knn_stream(
@@ -1019,9 +1029,14 @@ def infer_on_holdout(
     """
     logger.info("inference: holdout tile %s", holdout_path)
     with perf_span("infer_on_holdout", substage="load_context"):
-        context = _load_holdout_tile(
+        context = _load_holdout_tile_context(
             holdout_path,
             gt_vector_paths,
+            tuned,
+        )
+    with perf_span("infer_on_holdout", substage="prefetch_features"):
+        context["prefetched_b"] = _prefetch_holdout_features(
+            context,
             model,
             processor,
             device,
@@ -1029,7 +1044,6 @@ def infer_on_holdout(
             tile_size,
             stride,
             feature_dir,
-            tuned,
         )
     if not (context["knn_enabled"] or context["xgb_enabled"]):
         raise ValueError("both kNN and XGB are disabled for inference")

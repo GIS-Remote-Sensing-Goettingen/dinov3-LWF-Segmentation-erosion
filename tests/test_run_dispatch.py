@@ -75,7 +75,9 @@ def test_main_dispatches_to_expected_workflow(monkeypatch):
         run, "init_model", lambda *_args, **_kwargs: (None, None, "cpu")
     )
     monkeypatch.setattr(
-        run, "_resolve_feature_cache", lambda *_args, **_kwargs: ("memory", None)
+        run,
+        "_resolve_feature_cache",
+        lambda *_args, **_kwargs: ("memory", None, "memory", None),
     )
     monkeypatch.setattr(
         run,
@@ -214,6 +216,31 @@ def test_resolve_inference_model_bundle_dir_uses_latest_valid_previous_run(tmp_p
     assert resolved == str(output_root / "run_002" / "model_bundle")
 
 
+def test_resolve_feature_cache_splits_training_and_inference_modes(
+    tmp_path, monkeypatch
+):
+    """Feature-cache resolution should allow training disk cache with inference memory.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(run.cfg.io.paths, "feature_dir", str(tmp_path / "features"))
+    monkeypatch.setattr(run.cfg.runtime, "cache_training_features", True)
+    monkeypatch.setattr(run.cfg.runtime, "cache_inference_features", False)
+    monkeypatch.setattr(run.cfg.training.loo, "enabled", True)
+    monkeypatch.setattr(run.cfg.model.augmentation, "enabled", False)
+
+    training_mode, training_dir, inference_mode, inference_dir = (
+        run._resolve_feature_cache(auto_split_tiles=False)
+    )
+
+    assert training_mode == "disk"
+    assert inference_mode == "memory"
+    assert training_dir == str(tmp_path / "features")
+    assert inference_dir is None
+
+
 def test_resolve_inference_model_bundle_dir_raises_without_previous_bundle(tmp_path):
     """Inference-only fallback should fail clearly when no bundle exists.
 
@@ -283,7 +310,9 @@ def test_main_resolves_previous_bundle_when_model_bundle_dir_is_null(monkeypatch
         run, "init_model", lambda *_args, **_kwargs: (None, None, "cpu")
     )
     monkeypatch.setattr(
-        run, "_resolve_feature_cache", lambda *_args, **_kwargs: ("memory", None)
+        run,
+        "_resolve_feature_cache",
+        lambda *_args, **_kwargs: ("memory", None, "memory", None),
     )
     monkeypatch.setattr(run, "consolidate_cached_features", lambda **_kwargs: None)
     monkeypatch.setattr(run.cfg.io, "training", False)

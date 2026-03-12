@@ -22,6 +22,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ### Entrypoint
 - `main.py` exists only to keep the CLI stable.
 - `segedge.pipeline.run.main()` owns run-directory creation, logging setup, resume state loading, time-budget initialization, tile resolution, feature-cache mode selection, and workflow dispatch.
+  - training and final inference now resolve feature-cache persistence separately, so one-shot inference can run without building disk cache while training/tuning still keeps reusable feature artifacts.
 
 ### Workflows
 - `workflows/inference_only.py`:
@@ -80,6 +81,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ## Outputs
 - `output/run_*/run.log`: main runtime log.
 - `output/run_*/performance.jsonl`: structured per-span performance log with tile and phase context plus rolling summaries.
+  - feature-prefetch spans now include cache hit counts plus approximate feature/manifest bytes read and written, so disk-cache cost is visible in profiling output.
 - `output/run_*/rolling_best_setting.yml`: interruption-safe best-known config and progress state.
 - `output/run_*/processed_tiles.jsonl`: append-only holdout completion log.
 - `output/run_*/plots/validation/`: validation-stage plots.

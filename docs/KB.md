@@ -63,7 +63,8 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - The optimized XGB scorer checks the first 3 pending holdout tiles against the legacy scorer and auto-falls back if the difference is meaningful.
 - CRF tuning is guarded against unsafe CUDA multiprocessing.
 - Time-budget state is persisted in the rolling checkpoint and can trigger cutover behavior.
-- Disk feature cache mode consolidates per-tile caches after successful workflows.
+- `runtime.cache_training_features` and `runtime.cache_inference_features` control disk persistence separately for training/validation vs final inference.
+- `performance.jsonl` now records cache-cost metadata for feature prefetch, including cached vs computed tile counts and approximate feature/manifest bytes read and written.
 
 ## Major Functions to know
 - `segedge.pipeline.run.main`: dispatcher and bootstrap.

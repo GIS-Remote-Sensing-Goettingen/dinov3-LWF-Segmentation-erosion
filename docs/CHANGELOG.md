@@ -15,10 +15,20 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Split feature-cache persistence into separate training/inference toggles and add explicit cache-cost metadata to feature-prefetch performance logging.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/core/feature_ops/extraction.py`, `segedge/pipeline/run.py`, `segedge/pipeline/workflows/shared.py`, `segedge/pipeline/workflows/manual_training.py`, `segedge/pipeline/workflows/loo_training.py`, `segedge/pipeline/workflows/inference_only.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_run_dispatch.py`, `tests/test_performance_logging.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: One-shot inference runs should be able to avoid building disk feature cache while training/tuning still keeps reusable feature artifacts, and performance analysis needs to show how much cache I/O is costing.
+- Problems fixed: `runtime.cache_training_features` and `runtime.cache_inference_features` now control disk persistence independently, legacy `runtime.feature_cache_mode` remains backward compatible for existing configs, holdout inference can run without writing feature cache even when training uses disk cache, feature consolidation respects the active phase-specific cache mode, and `performance.jsonl` / `run.log` now report cached-vs-computed tile counts plus approximate feature/manifest bytes read and written during prefetch.
+
 - Description: Let outside-buffer novel proposals trade some extra width for stronger elongation while keeping an absolute width cap.
 - Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/runtime/postprocess.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Allow obviously elongated candidates to survive moderate thickness without opening the door to arbitrary wide blobs.
 - Problems fixed: Outside-buffer proposals no longer fail on width alone when `pca_ratio` is strong enough, new `width_bonus_per_pca` and `hard_width_cap_m` settings make that tradeoff explicit, and the old hard-width behavior remains available by setting `width_bonus_per_pca` to `0`.
+
+- Description: Split holdout performance logging so tile context loading and feature prefetch/extraction are timed separately.
+- Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_performance_logging.py`, `docs/CHANGELOG.md`
+- Reason: Recent slow runs were dominated by cache-miss feature extraction, but the old `load_context` span hid that work inside one misleading bucket.
+- Problems fixed: `performance.jsonl` now distinguishes real tile-context work from feature prefetch/extraction at the `infer_on_holdout` level, making slow runs much easier to diagnose.
 
 - Description: Improve inference plot readability and consolidate proposal visualization in the unified plot.
 - Files touched: `segedge/core/plotting.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
