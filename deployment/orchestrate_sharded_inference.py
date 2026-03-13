@@ -43,16 +43,32 @@ def _load_module(name: str, path: Path):
     return module
 
 
-_BUILD_MODULE = _load_module(
-    "build_inference_shards_module",
-    REPO_ROOT / "deployment" / "build_inference_shards.py",
-)
-_MERGE_MODULE = _load_module(
-    "merge_shard_unions_module",
-    REPO_ROOT / "deployment" / "merge_shard_unions.py",
-)
-build_inference_shards = _BUILD_MODULE.build_inference_shards
-merge_shard_unions = _MERGE_MODULE.merge_shard_unions
+def build_inference_shards(*args, **kwargs):
+    """Load and dispatch to the shard-builder helper lazily.
+
+    Examples:
+        >>> callable(build_inference_shards)
+        True
+    """
+    module = _load_module(
+        "build_inference_shards_module",
+        REPO_ROOT / "deployment" / "build_inference_shards.py",
+    )
+    return module.build_inference_shards(*args, **kwargs)
+
+
+def merge_shard_unions(*args, **kwargs):
+    """Load and dispatch to the shard-merge helper lazily.
+
+    Examples:
+        >>> callable(merge_shard_unions)
+        True
+    """
+    module = _load_module(
+        "merge_shard_unions_module",
+        REPO_ROOT / "deployment" / "merge_shard_unions.py",
+    )
+    return module.merge_shard_unions(*args, **kwargs)
 
 
 SBATCH_ID_RE = re.compile(r"Submitted batch job (\d+)")
