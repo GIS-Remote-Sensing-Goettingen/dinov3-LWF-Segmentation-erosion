@@ -16,14 +16,19 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
+from rasterio import open as rio_open
+from rasterio.warp import transform_bounds
+from rasterio.windows import from_bounds
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from segedge.core.config_loader import cfg  # noqa: E402
-from segedge.pipeline.common import filter_tiles_by_source_label_presence  # noqa: E402
 
 logger = logging.getLogger(__name__)
+_SOURCE_LABEL_FILTER_CACHE_VERSION = 1
 
 
 def _round_robin_shards(tiles: list[str], shard_count: int) -> list[list[str]]:
@@ -55,7 +60,9 @@ def build_inference_shards(
         raise ValueError("shard_count must be > 0")
     shard_root = Path(output_dir) / job_name
     shard_root.mkdir(parents=True, exist_ok=True)
-    tiles, inference_dir, inference_glob = _resolve_inference_tiles_for_shards()
+    tiles, inference_dir, inference_glob = _resolve_inference_tiles_for_shards(
+        shard_root=shard_root
+    )
     shards = _round_robin_shards(tiles, shard_count)
     shard_files: list[Path] = []
     for idx, shard_tiles in enumerate(shards):
@@ -95,7 +102,188 @@ def _load_tiles_file(path: str) -> list[str]:
         return [line.strip() for line in fh if line.strip()]
 
 
-def _resolve_inference_tiles_for_shards() -> tuple[list[str], str | None, str]:
+def _source_label_filter_cache_path(shard_root: Path) -> Path:
+    """Return the deployment-local cache path for source-label tile filtering."""
+    cache_dir = shard_root / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "source_label_tile_presence_cache.json"
+
+
+def _stat_signature(path: str) -> dict[str, int | str]:
+    """Return a compact metadata signature for cache invalidation."""
+    st = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "mtime_ns": int(st.st_mtime_ns),
+        "size": int(st.st_size),
+    }
+
+
+def _load_source_label_filter_cache(
+    *,
+    cache_path: Path,
+    raster_path: str,
+) -> tuple[dict[str, dict], dict[str, int | str]]:
+    """Load the persisted source-label cache if it matches the raster."""
+    raster_signature = _stat_signature(raster_path)
+    if not cache_path.exists():
+        return {}, raster_signature
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}, raster_signature
+    if payload.get("version") != _SOURCE_LABEL_FILTER_CACHE_VERSION:
+        return {}, raster_signature
+    if payload.get("raster_signature") != raster_signature:
+        return {}, raster_signature
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}, raster_signature
+    return entries, raster_signature
+
+
+def _save_source_label_filter_cache(
+    *,
+    cache_path: Path,
+    raster_signature: dict[str, int | str],
+    entries: dict[str, dict],
+) -> None:
+    """Persist the source-label cache atomically."""
+    payload = {
+        "version": _SOURCE_LABEL_FILTER_CACHE_VERSION,
+        "raster_signature": raster_signature,
+        "entries": entries,
+    }
+    tmp_path = cache_path.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_path.replace(cache_path)
+
+
+def _filter_tiles_by_source_label_presence(
+    *,
+    tile_paths: list[str],
+    raster_path: str | None,
+    shard_root: Path,
+) -> tuple[list[str], int]:
+    """Filter tiles to those containing positive source-label pixels."""
+    if not tile_paths:
+        return [], 0
+    if not raster_path:
+        return list(tile_paths), 0
+
+    cache_path = _source_label_filter_cache_path(shard_root)
+    try:
+        cache_entries, raster_signature = _load_source_label_filter_cache(
+            cache_path=cache_path,
+            raster_path=raster_path,
+        )
+    except OSError:
+        cache_entries, raster_signature = {}, {}
+    cache_hits = 0
+    cache_dirty = False
+    filtered_paths: list[str] = []
+    excluded_count = 0
+
+    with rio_open(raster_path) as src:
+        raster_crs = src.crs
+        raster_bounds = src.bounds
+        nodata = src.nodata
+        for tile_path in tile_paths:
+            tile_signature = _stat_signature(tile_path)
+            cache_entry = cache_entries.get(tile_path)
+            if (
+                cache_entry is not None
+                and cache_entry.get("tile_signature") == tile_signature
+            ):
+                cache_hits += 1
+                if cache_entry.get("has_labels", False):
+                    filtered_paths.append(tile_path)
+                else:
+                    excluded_count += 1
+                continue
+
+            with rio_open(tile_path) as tile_src:
+                tile_bounds = tile_src.bounds
+                tile_crs = tile_src.crs
+
+            if (
+                raster_crs is not None
+                and tile_crs is not None
+                and tile_crs != raster_crs
+            ):
+                tile_bounds = transform_bounds(
+                    tile_crs,
+                    raster_crs,
+                    *tile_bounds,
+                    densify_pts=21,
+                )
+            tb_left, tb_bottom, tb_right, tb_top = tile_bounds
+            rb_left, rb_bottom, rb_right, rb_top = raster_bounds
+            overlap_left = max(tb_left, rb_left)
+            overlap_bottom = max(tb_bottom, rb_bottom)
+            overlap_right = min(tb_right, rb_right)
+            overlap_top = min(tb_top, rb_top)
+            if overlap_left >= overlap_right or overlap_bottom >= overlap_top:
+                has_labels = False
+            else:
+                window = from_bounds(
+                    overlap_left,
+                    overlap_bottom,
+                    overlap_right,
+                    overlap_top,
+                    transform=src.transform,
+                )
+                label_data = src.read(1, window=window, masked=True)
+                if label_data.size == 0:
+                    has_labels = False
+                else:
+                    positive_mask = np.logical_and(
+                        ~np.ma.getmaskarray(label_data),
+                        np.asarray(label_data) > 0,
+                    )
+                    if nodata is not None:
+                        positive_mask &= np.asarray(label_data) != nodata
+                    has_labels = bool(np.any(positive_mask))
+
+            cache_entries[tile_path] = {
+                "tile_signature": tile_signature,
+                "has_labels": has_labels,
+            }
+            cache_dirty = True
+            if has_labels:
+                filtered_paths.append(tile_path)
+            else:
+                excluded_count += 1
+
+    if cache_dirty:
+        try:
+            _save_source_label_filter_cache(
+                cache_path=cache_path,
+                raster_signature=raster_signature,
+                entries=cache_entries,
+            )
+        except OSError:
+            logger.debug(
+                "source-label filter cache save failed: %s",
+                cache_path,
+                exc_info=True,
+            )
+    if cache_hits:
+        logger.info(
+            "source-label filter cache: reused %s/%s tile decisions",
+            cache_hits,
+            len(tile_paths),
+        )
+    return filtered_paths, excluded_count
+
+
+def _resolve_inference_tiles_for_shards(
+    *,
+    shard_root: Path,
+) -> tuple[list[str], str | None, str]:
     """Resolve shard input tiles without importing the full inference runtime.
 
     Examples:
@@ -107,6 +295,7 @@ def _resolve_inference_tiles_for_shards() -> tuple[list[str], str | None, str]:
     infer_tile_glob = str(
         cfg.io.inference.tile_glob or cfg.io.paths.inference_glob or "*.tif"
     )
+    source_label_raster = str(cfg.io.paths.source_label_raster or "").strip() or None
     explicit_tiles = [str(tile) for tile in cfg.io.inference.tiles]
     legacy_inference_dir = str(cfg.io.paths.inference_dir or "").strip()
     legacy_holdout_tiles = [str(tile) for tile in cfg.io.paths.holdout_tiles]
@@ -133,7 +322,11 @@ def _resolve_inference_tiles_for_shards() -> tuple[list[str], str | None, str]:
             infer_tile_glob,
             len(tiles),
         )
-        filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(tiles)
+        filtered_tiles, excluded_count = _filter_tiles_by_source_label_presence(
+            tile_paths=tiles,
+            raster_path=source_label_raster,
+            shard_root=shard_root,
+        )
         if excluded_count:
             logger.info(
                 "inference: excluded %s tiles with no SOURCE_LABEL_RASTER labels inside tile",
@@ -142,8 +335,10 @@ def _resolve_inference_tiles_for_shards() -> tuple[list[str], str | None, str]:
         return filtered_tiles, tiles_dir, infer_tile_glob
 
     if explicit_tiles:
-        filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
-            explicit_tiles
+        filtered_tiles, excluded_count = _filter_tiles_by_source_label_presence(
+            tile_paths=explicit_tiles,
+            raster_path=source_label_raster,
+            shard_root=shard_root,
         )
         if excluded_count:
             logger.info(
@@ -152,8 +347,10 @@ def _resolve_inference_tiles_for_shards() -> tuple[list[str], str | None, str]:
             )
         return filtered_tiles, None, infer_tile_glob
 
-    filtered_tiles, excluded_count = filter_tiles_by_source_label_presence(
-        legacy_holdout_tiles
+    filtered_tiles, excluded_count = _filter_tiles_by_source_label_presence(
+        tile_paths=legacy_holdout_tiles,
+        raster_path=source_label_raster,
+        shard_root=shard_root,
     )
     if excluded_count:
         logger.info(

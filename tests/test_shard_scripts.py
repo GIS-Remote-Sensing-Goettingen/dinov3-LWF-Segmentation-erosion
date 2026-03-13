@@ -75,7 +75,7 @@ def test_build_inference_shards_writes_manifest_and_round_robin_files(
     monkeypatch.setattr(
         _BUILD_MODULE,
         "_resolve_inference_tiles_for_shards",
-        lambda: (
+        lambda **_kwargs: (
             ["tile_00.tif", "tile_01.tif", "tile_02.tif", "tile_03.tif"],
             "/tmp/tiles",
             "*.tif",
