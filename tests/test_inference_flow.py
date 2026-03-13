@@ -100,6 +100,7 @@ def test_resolve_inference_tiles_filters_directory_by_source_label_presence(
 
     with caplog.at_level(logging.INFO):
         tiles, tiles_dir, tile_glob = resolve_inference_tiles(
+            infer_tiles_file=None,
             infer_tiles_dir=str(infer_dir),
             infer_tile_glob="*.tif",
             infer_tiles=[],
@@ -115,6 +116,46 @@ def test_resolve_inference_tiles_filters_directory_by_source_label_presence(
     assert (
         "excluded 2 tiles with no SOURCE_LABEL_RASTER labels inside tile" in caplog.text
     )
+
+
+def test_resolve_inference_tiles_uses_tiles_file_without_refiltering(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """A shard tiles_file should be used exactly as written.
+
+    Examples:
+        >>> True
+        True
+    """
+    tiles_file = tmp_path / "tiles_shard_000.txt"
+    tiles_file.write_text("tile_a.tif\n\ntile_b.tif\n", encoding="utf-8")
+
+    def _unexpected_filter(_tiles):
+        raise AssertionError("tiles_file should bypass source-label filtering")
+
+    monkeypatch.setattr(
+        "segedge.pipeline.inference_flow.filter_tiles_by_source_label_presence",
+        _unexpected_filter,
+    )
+
+    with caplog.at_level(logging.INFO):
+        tiles, tiles_dir, tile_glob = resolve_inference_tiles(
+            infer_tiles_file=str(tiles_file),
+            infer_tiles_dir=None,
+            infer_tile_glob="*.tif",
+            infer_tiles=[],
+            legacy_inference_dir=None,
+            legacy_inference_glob="*.tif",
+            legacy_holdout_tiles=[],
+            logger=logging.getLogger("test_inference_flow"),
+        )
+
+    assert tiles == ["tile_a.tif", "tile_b.tif"]
+    assert tiles_dir is None
+    assert tile_glob == "*.tif"
+    assert f"inference tiles file: {tiles_file} -> 2 tiles" in caplog.text
 
 
 def test_resolve_inference_tiles_filters_explicit_tiles_by_source_label_presence(
@@ -142,6 +183,7 @@ def test_resolve_inference_tiles_filters_explicit_tiles_by_source_label_presence
 
     with caplog.at_level(logging.INFO):
         tiles, tiles_dir, tile_glob = resolve_inference_tiles(
+            infer_tiles_file=None,
             infer_tiles_dir=None,
             infer_tile_glob="*.tif",
             infer_tiles=[str(tile_keep), str(tile_empty), str(tile_drop)],

@@ -33,6 +33,8 @@ Execution order:
 
 Important behavior:
 - No training artifacts are built in this mode.
+- `main.py --config <path>` can now run the pipeline against a generated shard-specific config copy instead of the repo root `config.yml`.
+- `io.inference.tiles_file` can provide an exact one-tile-per-line shard list; when it is set, the worker run uses that list directly instead of globbing a folder or re-running source-label filtering.
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
 - Holdout unions now track only the final stage outputs: `raw`, `crf`, `shadow`, and `shadow_with_proposals`.
@@ -114,6 +116,14 @@ Its job is orchestration at the holdout-set level:
 
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
 Accepted proposals are no longer exported as per-image shapefiles or CSVs; instead, they are folded into the rolling `shadow_with_proposals` union while `shadow` remains the final mask without proposal additions.
+For large folder inference, the intended parallel pattern is:
+1. launch `deployment/orchestrate_sharded_inference.py`
+2. let it build shard files and shard-specific configs once
+3. let it submit one Slurm array for shard workers
+4. let its watchdog resubmit only incomplete shards against the same fixed shard run directories
+5. let its final verification step merge the 4 stage unions only after all shards are complete
+
+This avoids multiple jobs racing on the same run directory, `processed_tiles.jsonl`, and rolling union shapefiles, while still allowing crashed/incomplete shards to resume safely.
 
 When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply manual XGB score multipliers separately inside and outside `SOURCE_LABEL_RASTER` pixels. This prior is not used during validation inference or tuning.
 `io.inference.plots` can disable individual inference plot types while leaving `plot_every` as the outer cadence control.

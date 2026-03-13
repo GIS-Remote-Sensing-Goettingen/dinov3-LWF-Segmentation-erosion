@@ -6,6 +6,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ## Repository Layout
 - `main.py`: thin CLI wrapper; imports and calls `segedge.pipeline.run.main()`.
 - `config.yml`: typed runtime configuration source.
+- `deployment/`: cluster-facing orchestration helpers such as shard-file generation, shard-union merge, and the Slurm shard launcher.
 - `segedge/core/`: model-facing logic, feature construction, I/O, plotting, metrics, and config loading.
 - `segedge/core/feature_ops/`: feature extraction, tiling, cache I/O, and hybrid feature fusion.
 - `segedge/core/features.py`: compatibility export layer for `feature_ops`.
@@ -21,6 +22,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ## Runtime Layers
 ### Entrypoint
 - `main.py` exists only to keep the CLI stable.
+- it now also accepts `--config <path>` so generated shard workers can run against explicit config copies instead of the repo root `config.yml`
 - `segedge.pipeline.run.main()` owns run-directory creation, logging setup, resume state loading, time-budget initialization, tile resolution, feature-cache mode selection, and workflow dispatch.
   - training and final inference now resolve feature-cache persistence separately, so one-shot inference can run without building disk cache while training/tuning still keeps reusable feature artifacts.
 
@@ -30,6 +32,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
   - validates runtime compatibility
   - writes inference settings
   - runs holdout inference with rolling checkpoints
+  - can now take an exact one-tile-per-line shard file via `io.inference.tiles_file`, which bypasses folder globbing and source-label refiltering inside the worker run
 - `workflows/manual_training.py`:
   - builds artifacts from explicit source tiles
   - tunes on explicit validation tiles
@@ -81,6 +84,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 5. The selected workflow builds or loads model state, writes settings/checkpoint metadata, and invokes holdout inference when tiles are available.
 6. Holdout inference updates union shapefiles and processed-tile logs tile by tile, so partial runs keep usable outputs.
 7. Disk feature caches are consolidated after successful workflows that need them.
+8. Large folder inference can be parallelized by building shard tile files once, launching isolated shard jobs, retrying incomplete shards against the same fixed run directories, and then merging the resulting per-shard union families after verification succeeds.
 
 ## Outputs
 - `output/run_*/run.log`: main runtime log.
@@ -94,6 +98,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `output/run_*/shapes/unions/.../union.shp`: rolling union shapefiles for `raw`, `crf`, `shadow`, and `shadow_with_proposals`.
 - `output/run_*/inference_best_setting.yml` and `output/run_*/best_setting.yml`: exported run settings.
 - `output/run_*/model_bundle/`: optional inference bundle when bundle saving is enabled.
+- `output/shards/<job_name>/`: optional shard manifests, per-shard configs, rendered Slurm scripts, retry/verification status files, and merged unions created by the Slurm orchestration flow.
 
 ## Major Runtime Functions
 - `segedge.pipeline.run.main`: bootstrap, resolve runtime mode, dispatch workflow, and finalize cache consolidation.
