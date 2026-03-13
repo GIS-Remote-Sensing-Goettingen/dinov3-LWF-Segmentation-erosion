@@ -13,6 +13,8 @@ from .config_loader import cfg
 from .features import (
     add_local_context_mean,
     crop_to_multiple_of_ps,
+    extract_patch_features_batch_single_scale,
+    extract_patch_features_single_scale,
     fuse_patch_features,
     labels_to_patch_masks,
     load_tile_features_if_valid,
@@ -564,7 +566,12 @@ def xgb_score_image_b(
     context_radius: int = 0,
     xgb_feature_stats: dict | None = None,
 ):
-    """Apply a trained XGBoost model to Image B and return a score map."""
+    """Apply a trained XGBoost model to Image B and return a score map.
+
+    Examples:
+        >>> callable(xgb_score_image_b)
+        True
+    """
     batch_tile_limit = max(1, int(cfg.runtime.feature_batch_size or 1))
     batch_row_limit = max(1, batch_tile_limit * _XGB_BATCH_ROW_BUDGET_PER_UNIT)
     pending_tile_limit = max(1, batch_tile_limit * _XGB_BATCH_TILE_MULTIPLIER)
@@ -604,6 +611,148 @@ def xgb_score_image_b(
     return score_full
 
 
+def xgb_score_image_b_streaming(
+    img_b,
+    bst,
+    model,
+    processor,
+    device,
+    ps,
+    tile_size,
+    stride,
+    *,
+    context_radius: int = 0,
+    xgb_feature_stats: dict | None = None,
+):
+    """Apply XGBoost to Image B by streaming feature extraction and scoring.
+
+    Examples:
+        >>> callable(xgb_score_image_b_streaming)
+        True
+    """
+    h_full, w_full = img_b.shape[:2]
+    score_full = np.zeros((h_full, w_full), dtype=np.float32)
+    weight_full = np.zeros((h_full, w_full), dtype=np.float32)
+    batch_tile_limit = max(1, int(cfg.runtime.feature_batch_size or 1))
+    extract_batch_limit = batch_tile_limit
+    predict_batch_row_limit = max(1, batch_tile_limit * _XGB_BATCH_ROW_BUDGET_PER_UNIT)
+    predict_tile_limit = max(1, batch_tile_limit * _XGB_BATCH_TILE_MULTIPLIER)
+    pending_extract: dict[
+        tuple[int, int], list[tuple[int, int, np.ndarray, int, int]]
+    ] = {}
+    pending_predict: list[dict[str, np.ndarray | int]] = []
+    pending_predict_rows = 0
+
+    def flush_predict_batch() -> None:
+        nonlocal pending_predict_rows
+        if not pending_predict:
+            return
+        _flush_xgb_prediction_batch(pending_predict, bst, score_full, weight_full)
+        pending_predict.clear()
+        pending_predict_rows = 0
+
+    def append_predict_tile(payload: dict[str, np.ndarray | int]) -> None:
+        nonlocal pending_predict_rows
+        tile_rows = int(payload["row_count"])
+        if pending_predict and (
+            pending_predict_rows + tile_rows > predict_batch_row_limit
+            or len(pending_predict) >= predict_tile_limit
+        ):
+            flush_predict_batch()
+        pending_predict.append(payload)
+        pending_predict_rows += tile_rows
+
+    def flush_extract_batch(
+        items: list[tuple[int, int, np.ndarray, int, int]],
+    ) -> None:
+        if not items:
+            return
+        imgs = [item[2] for item in items]
+        with perf_span(
+            "xgb_score_image_b",
+            substage="streaming_extract_features",
+            extra={"batch_size": len(items)},
+        ):
+            if len(items) == 1:
+                feats_tile, hp_i, wp_i = extract_patch_features_single_scale(
+                    imgs[0],
+                    model,
+                    processor,
+                    device,
+                    ps=ps,
+                    aggregate_layers=None,
+                )
+                feats_list = [feats_tile]
+            else:
+                feats_list, hp_i, wp_i = extract_patch_features_batch_single_scale(
+                    imgs,
+                    model,
+                    processor,
+                    device,
+                    ps=ps,
+                    aggregate_layers=None,
+                )
+        for (y_i, x_i, img_i, h_i, w_i), feats_tile in zip(
+            items, feats_list, strict=True
+        ):
+            if context_radius and context_radius > 0:
+                with perf_span(
+                    "xgb_score_image_b",
+                    substage="local_context_mean",
+                    extra={"y": y_i, "x": x_i},
+                ):
+                    feats_tile = add_local_context_mean(feats_tile, int(context_radius))
+            with perf_span(
+                "xgb_score_image_b",
+                substage="streaming_fuse_features",
+                extra={"y": y_i, "x": x_i},
+            ):
+                fused_tile, _ = fuse_patch_features(
+                    feats_tile,
+                    img_i,
+                    ps,
+                    mode="xgb",
+                    xgb_feature_stats=xgb_feature_stats,
+                    return_layout=False,
+                )
+            with perf_span(
+                "xgb_score_image_b",
+                substage="flatten_features",
+                extra={"y": y_i, "x": x_i},
+            ):
+                flat_feats = fused_tile.reshape(-1, fused_tile.shape[-1])
+            append_predict_tile(
+                {
+                    "y": y_i,
+                    "x": x_i,
+                    "h_eff": h_i,
+                    "w_eff": w_i,
+                    "hp": hp_i,
+                    "wp": wp_i,
+                    "row_count": int(hp_i * wp_i),
+                    "flat_feats": flat_feats,
+                }
+            )
+
+    for y, x, img_tile, _ in tile_iterator(img_b, None, tile_size, stride):
+        with perf_span("xgb_score_image_b", substage="tile_loop"):
+            img_c, _, h_eff, w_eff = crop_to_multiple_of_ps(img_tile, None, ps)
+            if h_eff < ps or w_eff < ps:
+                continue
+            img_c = img_c[:h_eff, :w_eff]
+            key = (h_eff, w_eff)
+            pending_extract.setdefault(key, []).append((y, x, img_c, h_eff, w_eff))
+            if len(pending_extract[key]) >= extract_batch_limit:
+                flush_extract_batch(pending_extract.pop(key))
+
+    for items in pending_extract.values():
+        flush_extract_batch(items)
+    flush_predict_batch()
+    mask_nonzero = weight_full > 0
+    score_full[mask_nonzero] /= weight_full[mask_nonzero]
+    return score_full
+
+
 def _iter_xgb_tile_payloads(
     img_b,
     ps,
@@ -616,7 +765,12 @@ def _iter_xgb_tile_payloads(
     context_radius: int = 0,
     xgb_feature_stats: dict | None = None,
 ) -> Iterator[dict[str, np.ndarray | int]]:
-    """Yield flattened tile payloads for batched XGB prediction."""
+    """Yield flattened tile payloads for batched XGB prediction.
+
+    Examples:
+        >>> callable(_iter_xgb_tile_payloads)
+        True
+    """
     if feature_dir is None and prefetched_tiles is None:
         raise ValueError("feature_dir or prefetched_tiles must be provided")
 
@@ -742,7 +896,12 @@ def _flush_xgb_prediction_batch(
     score_full: np.ndarray,
     weight_full: np.ndarray,
 ) -> None:
-    """Run one batched XGB predict call and accumulate outputs."""
+    """Run one batched XGB predict call and accumulate outputs.
+
+    Examples:
+        >>> callable(_flush_xgb_prediction_batch)
+        True
+    """
     if not tile_payloads:
         return
     batch_rows = [payload["flat_feats"] for payload in tile_payloads]

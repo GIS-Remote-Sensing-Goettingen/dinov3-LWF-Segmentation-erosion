@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import logging
 import os
 
@@ -12,7 +11,6 @@ from scipy.ndimage import binary_fill_holes, median_filter
 from ...core.config_loader import cfg
 from ...core.crf_utils import refine_with_densecrf
 from ...core.features import prefetch_features_single_scale_image
-from ...core.io_utils import export_mask_to_shapefile
 from ...core.knn import zero_shot_knn_single_scale_B_with_saliency
 from ...core.metrics_utils import compute_metrics
 from ...core.plotting import (
@@ -23,7 +21,11 @@ from ...core.plotting import (
     save_unified_plot,
 )
 from ...core.timing_utils import perf_span
-from ...core.xdboost import xgb_score_image_b, xgb_score_image_b_legacy
+from ...core.xdboost import (
+    xgb_score_image_b,
+    xgb_score_image_b_legacy,
+    xgb_score_image_b_streaming,
+)
 from .postprocess import _apply_shadow_filter, filter_novel_proposals
 from .roads import _apply_roads_penalty, _get_roads_mask
 from .tile_context import load_b_tile_context
@@ -219,6 +221,23 @@ def _prefetch_holdout_features(
     )
 
 
+def _should_stream_xgb_features(
+    context: dict[str, object],
+    feature_dir: str | None,
+) -> bool:
+    """Return whether one-shot XGB inference should stream features.
+
+    Examples:
+        >>> _should_stream_xgb_features({"xgb_enabled": True, "knn_enabled": False}, None)
+        True
+    """
+    return bool(
+        feature_dir is None
+        and bool(context.get("xgb_enabled", False))
+        and not bool(context.get("knn_enabled", False))
+    )
+
+
 def _compute_knn_stream(
     context: dict[str, object],
     tuned: dict,
@@ -297,6 +316,9 @@ def _compute_knn_stream(
 def _compute_xgb_stream(
     context: dict[str, object],
     tuned: dict,
+    model,
+    processor,
+    device,
     ps: int,
     tile_size: int,
     stride: int,
@@ -329,6 +351,9 @@ def _compute_xgb_stream(
         context=context,
         tuned=tuned,
         bst=bst,
+        model=model,
+        processor=processor,
+        device=device,
         ps=ps,
         tile_size=tile_size,
         stride=stride,
@@ -370,6 +395,9 @@ def _score_xgb_with_guard(
     context: dict[str, object],
     tuned: dict,
     bst,
+    model,
+    processor,
+    device,
     ps: int,
     tile_size: int,
     stride: int,
@@ -378,7 +406,22 @@ def _score_xgb_with_guard(
     xgb_guard_state: dict[str, object] | None,
 ) -> np.ndarray:
     """Score one tile with the optimized XGB path and optional legacy guard."""
-    if not xgb_guard_state or not bool(xgb_guard_state.get("enabled", False)):
+    use_streaming = _should_stream_xgb_features(context, feature_dir)
+
+    def _score_xgb_optimized() -> np.ndarray:
+        if use_streaming:
+            return xgb_score_image_b_streaming(
+                context["img_b"],
+                bst,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                context_radius=context_radius,
+                xgb_feature_stats=context["xgb_feature_stats"],
+            )
         return xgb_score_image_b(
             context["img_b"],
             bst,
@@ -391,9 +434,15 @@ def _score_xgb_with_guard(
             context_radius=context_radius,
             xgb_feature_stats=context["xgb_feature_stats"],
         )
+
+    if not xgb_guard_state or not bool(xgb_guard_state.get("enabled", False)):
+        return _score_xgb_optimized()
     if bool(xgb_guard_state.get("fallback_to_legacy", False)):
         return _score_xgb_legacy(
             context=context,
+            model=model,
+            processor=processor,
+            device=device,
             bst=bst,
             ps=ps,
             tile_size=tile_size,
@@ -404,32 +453,13 @@ def _score_xgb_with_guard(
     checked_tiles = int(xgb_guard_state.get("checked_tiles", 0))
     guard_tiles = int(xgb_guard_state.get("guard_tiles", 0))
     if checked_tiles >= guard_tiles:
-        return xgb_score_image_b(
-            context["img_b"],
-            bst,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-            context["image_id_b"],
-            prefetched_tiles=context["prefetched_b"],
-            context_radius=context_radius,
-            xgb_feature_stats=context["xgb_feature_stats"],
-        )
-    score_map = xgb_score_image_b(
-        context["img_b"],
-        bst,
-        ps,
-        tile_size,
-        stride,
-        feature_dir,
-        context["image_id_b"],
-        prefetched_tiles=context["prefetched_b"],
-        context_radius=context_radius,
-        xgb_feature_stats=context["xgb_feature_stats"],
-    )
+        return _score_xgb_optimized()
+    score_map = _score_xgb_optimized()
     legacy_score = _score_xgb_legacy(
         context=context,
+        model=model,
+        processor=processor,
+        device=device,
         bst=bst,
         ps=ps,
         tile_size=tile_size,
@@ -467,6 +497,9 @@ def _score_xgb_with_guard(
 def _score_xgb_legacy(
     *,
     context: dict[str, object],
+    model,
+    processor,
+    device,
     bst,
     ps: int,
     tile_size: int,
@@ -475,6 +508,18 @@ def _score_xgb_legacy(
     context_radius: int,
 ) -> np.ndarray:
     """Run the legacy XGB scorer for guard comparisons and fallback."""
+    prefetched_b = context["prefetched_b"]
+    if prefetched_b is None:
+        prefetched_b = _prefetch_holdout_features(
+            context,
+            model,
+            processor,
+            device,
+            ps,
+            tile_size,
+            stride,
+            feature_dir,
+        )
     return xgb_score_image_b_legacy(
         context["img_b"],
         bst,
@@ -483,7 +528,7 @@ def _score_xgb_legacy(
         stride,
         feature_dir,
         context["image_id_b"],
-        prefetched_tiles=context["prefetched_b"],
+        prefetched_tiles=prefetched_b,
         context_radius=context_radius,
         xgb_feature_stats=context["xgb_feature_stats"],
     )
@@ -771,81 +816,6 @@ def _build_proposal_masks(
         "accepted_mask": proposal_bundle["accepted_mask"],
         "rejected_mask": proposal_bundle["rejected_mask"],
     }
-
-
-def _export_proposal_artifacts(
-    proposal_bundle: dict,
-    proposal_masks: dict[str, np.ndarray],
-    holdout_path: str,
-    image_id_b: str,
-    shape_dir: str,
-) -> None:
-    """Write proposal shapefiles and CSV exports.
-
-    Examples:
-        >>> callable(_export_proposal_artifacts)
-        True
-    """
-    if not cfg.postprocess.novel_proposals.enabled:
-        return
-    proposal_dir = os.path.join(shape_dir, "proposals")
-    os.makedirs(proposal_dir, exist_ok=True)
-    if proposal_masks["accepted_mask"].any():
-        export_mask_to_shapefile(
-            proposal_masks["accepted_mask"],
-            holdout_path,
-            os.path.join(proposal_dir, f"{image_id_b}_accepted.shp"),
-        )
-    if proposal_masks["rejected_mask"].any():
-        export_mask_to_shapefile(
-            proposal_masks["rejected_mask"],
-            holdout_path,
-            os.path.join(proposal_dir, f"{image_id_b}_rejected.shp"),
-        )
-    records_path = os.path.join(proposal_dir, f"{image_id_b}_proposal_records.csv")
-    records = list(proposal_bundle.get("records", []))
-    fieldnames = [
-        "component_id",
-        "zone",
-        "accepted",
-        "acceptance_score",
-        "reject_reasons",
-        "area_px",
-        "length_m",
-        "mean_width_m",
-        "skeleton_ratio",
-        "pca_ratio",
-        "circularity",
-        "mean_score",
-        "road_overlap",
-        "centroid_row",
-        "centroid_col",
-    ]
-    with open(records_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for rec in records:
-            writer.writerow(
-                {
-                    "component_id": rec.get("component_id"),
-                    "zone": rec.get("zone"),
-                    "accepted": rec.get("accepted"),
-                    "acceptance_score": rec.get("acceptance_score"),
-                    "reject_reasons": ";".join(rec.get("reject_reasons", [])),
-                    "area_px": rec.get("area_px"),
-                    "length_m": rec.get("length_m"),
-                    "mean_width_m": rec.get("mean_width_m"),
-                    "skeleton_ratio": rec.get("skeleton_ratio"),
-                    "pca_ratio": rec.get("pca_ratio"),
-                    "circularity": rec.get("circularity"),
-                    "mean_score": rec.get("mean_score"),
-                    "road_overlap": rec.get("road_overlap"),
-                    "centroid_row": rec.get("centroid_row"),
-                    "centroid_col": rec.get("centroid_col"),
-                }
-            )
-
-
 def _compute_probability_and_diagnostics(
     active_stream: str,
     champion_score: np.ndarray,
@@ -1034,17 +1004,25 @@ def infer_on_holdout(
             gt_vector_paths,
             tuned,
         )
-    with perf_span("infer_on_holdout", substage="prefetch_features"):
-        context["prefetched_b"] = _prefetch_holdout_features(
-            context,
-            model,
-            processor,
-            device,
-            ps,
-            tile_size,
-            stride,
-            feature_dir,
-        )
+    context["prefetched_b"] = None
+    with perf_span(
+        "infer_on_holdout",
+        substage="prefetch_features",
+        extra={
+            "streaming_xgb": _should_stream_xgb_features(context, feature_dir),
+        },
+    ):
+        if not _should_stream_xgb_features(context, feature_dir):
+            context["prefetched_b"] = _prefetch_holdout_features(
+                context,
+                model,
+                processor,
+                device,
+                ps,
+                tile_size,
+                stride,
+                feature_dir,
+            )
     if not (context["knn_enabled"] or context["xgb_enabled"]):
         raise ValueError("both kNN and XGB are disabled for inference")
     with perf_span("infer_on_holdout", substage="knn_stream"):
@@ -1066,6 +1044,9 @@ def infer_on_holdout(
         xgb_result = _compute_xgb_stream(
             context,
             tuned,
+            model,
+            processor,
+            device,
             ps,
             tile_size,
             stride,
@@ -1152,14 +1133,6 @@ def infer_on_holdout(
         proposal_bundle,
         proposal_bundle["candidate_mask"],
     )
-    with perf_span("infer_on_holdout", substage="proposal_exports"):
-        _export_proposal_artifacts(
-            proposal_bundle,
-            proposal_masks,
-            holdout_path,
-            context["image_id_b"],
-            shape_dir,
-        )
     _, disagreement_map, entropy_map = _compute_probability_and_diagnostics(
         active_stream,
         champion_score,
@@ -1188,6 +1161,11 @@ def infer_on_holdout(
                 entropy_map=entropy_map,
             )
 
+    shadow_with_proposals_mask = np.logical_or(
+        active_shadow_mask,
+        proposal_masks["accepted_mask"],
+    )
+
     return {
         "ref_path": holdout_path,
         "image_id": context["image_id_b"],
@@ -1197,9 +1175,10 @@ def infer_on_holdout(
         "pixel_size_m": context["pixel_size_m"],
         "metrics": metrics_map,
         "masks": {
-            f"{active_stream}_raw": active_raw_mask,
-            f"{active_stream}_crf": active_crf_mask,
-            f"{active_stream}_shadow": active_shadow_mask,
+            "raw": active_raw_mask,
+            "crf": active_crf_mask,
+            "shadow": active_shadow_mask,
+            "shadow_with_proposals": shadow_with_proposals_mask,
         },
         "proposals": proposal_bundle,
     }

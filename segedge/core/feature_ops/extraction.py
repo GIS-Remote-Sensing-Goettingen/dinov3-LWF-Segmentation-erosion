@@ -138,9 +138,9 @@ def extract_patch_features_batch_single_scale(
     wp = w_proc // ps
     assert hp * wp == num_tokens, f"patch-grid mismatch: {hp} * {wp} != {num_tokens}"
     feats_np = patch_tokens.cpu().numpy().reshape(len(images_hw3), hp, wp, dim)
-    feats_list = [l2_normalize(feats_np[i]) for i in range(feats_np.shape[0])]
+    feats_np = l2_normalize(feats_np)
     time_end("extract_patch_features_batch_single_scale", t0)
-    return feats_list, hp, wp
+    return feats_np, hp, wp
 
 
 def prefetch_features_single_scale_image(

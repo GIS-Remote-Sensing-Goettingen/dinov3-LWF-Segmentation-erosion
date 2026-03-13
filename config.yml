@@ -264,7 +264,7 @@ runtime:
   cache_training_features: true
   # Persist final holdout / inference-only feature caches to disk.
   cache_inference_features: false
-  feature_batch_size: 4
+  feature_batch_size: 12
   resume_run: false
   resume_run_dir: null
   union_backup_every: 10

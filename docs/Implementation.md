@@ -35,7 +35,9 @@ Important behavior:
 - No training artifacts are built in this mode.
 - If inference tile resolution returns an empty set after filtering out tiles with no positive `SOURCE_LABEL_RASTER` pixels inside them, holdout inference is skipped cleanly.
 - The holdout step still updates rolling unions and processed-tile logs tile by tile.
+- Holdout unions now track only the final stage outputs: `raw`, `crf`, `shadow`, and `shadow_with_proposals`.
 - The run also writes `performance.jsonl`, which records structured spans for tile loading, cache validation, cache read/write cost, XGB scoring internals, CRF, proposal filtering, plots, and union updates.
+- When `runtime.cache_inference_features=false` and the active inference stream is XGB-only, holdout inference now skips the old full-image feature prefetch step and instead streams extraction batches directly into XGB fusion/prediction/accumulation. This keeps one-shot inference from paying the full-image `prefetch_features` cost before scoring starts.
 - Source-label reprojection is optimized in the shared I/O layer: repeated tiles reuse the same source-label raster handle, aligned same-CRS grids prefer direct window reads, and the performance log now splits source-label work into open/grid/reproject/finalize substages.
 - XGB CRF refinement can use a trimap-band unary: the current XGB mask is treated as strong interior foreground, a dilated ring is treated as uncertain, and CRF uses RGB edges to fill holes and expand/shrink that boundary band. The single tuning knob for this is `search.crf.trimap_band_pixels_values`.
 - `postprocess.fill_holes_xgb` can fill enclosed holes in the thresholded XGB raw mask before trimap CRF, so CRF expands from the filled coarse mask instead of the original holey threshold mask.
@@ -110,6 +112,7 @@ Its job is orchestration at the holdout-set level:
 - emit rolling summaries into `performance.jsonl` every 10 completed inference tiles
 
 That ordering is deliberate: if the job stops after a tile finishes, the union shapefile and progress log already reflect that completed tile.
+Accepted proposals are no longer exported as per-image shapefiles or CSVs; instead, they are folded into the rolling `shadow_with_proposals` union while `shadow` remains the final mask without proposal additions.
 
 When `io.inference.score_prior.enabled=true`, the final holdout/inference phase can also apply manual XGB score multipliers separately inside and outside `SOURCE_LABEL_RASTER` pixels. This prior is not used during validation inference or tuning.
 `io.inference.plots` can disable individual inference plot types while leaving `plot_every` as the outer cadence control.

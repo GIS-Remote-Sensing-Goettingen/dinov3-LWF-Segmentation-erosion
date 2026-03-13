@@ -427,6 +427,9 @@ def test_compute_xgb_stream_fills_holes_when_enabled(monkeypatch):
     result = _compute_xgb_stream(
         context,
         tuned,
+        model=None,
+        processor=None,
+        device=None,
         ps=16,
         tile_size=16,
         stride=16,
@@ -661,6 +664,10 @@ def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatc
         _fake_optimized,
     )
     monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.xgb_score_image_b_streaming",
+        _fake_optimized,
+    )
+    monkeypatch.setattr(
         "segedge.pipeline.runtime.holdout_inference.xgb_score_image_b_legacy",
         _fake_legacy,
     )
@@ -692,6 +699,9 @@ def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatc
     result_a = _compute_xgb_stream(
         context,
         tuned,
+        model=None,
+        processor=None,
+        device=None,
         ps=16,
         tile_size=32,
         stride=32,
@@ -703,6 +713,9 @@ def test_xgb_guard_falls_back_to_legacy_when_difference_is_meaningful(monkeypatc
     result_b = _compute_xgb_stream(
         context,
         tuned,
+        model=None,
+        processor=None,
+        device=None,
         ps=16,
         tile_size=32,
         stride=32,
@@ -787,7 +800,12 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
             "metrics": {},
             "image_id": Path(holdout_path).stem,
             "ref_path": holdout_path,
-            "masks": {"champion_shadow": mask},
+            "masks": {
+                "raw": mask,
+                "crf": mask,
+                "shadow": mask,
+                "shadow_with_proposals": mask,
+            },
         }
 
     monkeypatch.setattr(
@@ -815,8 +833,8 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
             plot_dir=str(tmp_path / "plots"),
             context_radius=0,
             holdout_phase_metrics={},
-            append_union=lambda stream, variant, mask, ref_path, step: append_calls.append(
-                (stream, ref_path, step)
+            append_union=lambda variant, mask, ref_path, step: append_calls.append(
+                (variant, ref_path, step)
             )
             or call_order.append(("append", ref_path)),
             processed_log_path=str(processed_log_path),
@@ -827,13 +845,25 @@ def test_run_holdout_inference_appends_and_checkpoints_per_tile(
 
     assert processed == 2
     assert append_calls == [
-        ("champion", "tile_a.tif", 1),
-        ("champion", "tile_b.tif", 2),
+        ("raw", "tile_a.tif", 1),
+        ("crf", "tile_a.tif", 1),
+        ("shadow", "tile_a.tif", 1),
+        ("shadow_with_proposals", "tile_a.tif", 1),
+        ("raw", "tile_b.tif", 2),
+        ("crf", "tile_b.tif", 2),
+        ("shadow", "tile_b.tif", 2),
+        ("shadow_with_proposals", "tile_b.tif", 2),
     ]
     assert checkpoint_calls == [1, 2]
     assert call_order == [
         ("append", "tile_a.tif"),
+        ("append", "tile_a.tif"),
+        ("append", "tile_a.tif"),
+        ("append", "tile_a.tif"),
         ("checkpoint", 1),
+        ("append", "tile_b.tif"),
+        ("append", "tile_b.tif"),
+        ("append", "tile_b.tif"),
         ("append", "tile_b.tif"),
         ("checkpoint", 2),
     ]
@@ -893,7 +923,12 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
             "metrics": {},
             "image_id": Path(holdout_path).stem,
             "ref_path": holdout_path,
-            "masks": {"champion_shadow": mask},
+            "masks": {
+                "raw": mask,
+                "crf": mask,
+                "shadow": mask,
+                "shadow_with_proposals": mask,
+            },
         }
 
     monkeypatch.setattr(
@@ -920,7 +955,7 @@ def test_run_holdout_inference_progress_counts_only_pending_tiles(
             plot_dir=str(tmp_path / "plots"),
             context_radius=0,
             holdout_phase_metrics={},
-            append_union=lambda stream, variant, mask, ref_path, step: None,
+            append_union=lambda variant, mask, ref_path, step: None,
             processed_log_path=str(tmp_path / "processed.jsonl"),
             write_checkpoint=lambda holdout_done: None,
             logger=logging.getLogger("test_inference_flow_resume"),
@@ -973,7 +1008,12 @@ def test_run_holdout_inference_plots_every_pending_n_tiles(
             "metrics": {},
             "image_id": Path(holdout_path).stem,
             "ref_path": holdout_path,
-            "masks": {"champion_shadow": mask},
+            "masks": {
+                "raw": mask,
+                "crf": mask,
+                "shadow": mask,
+                "shadow_with_proposals": mask,
+            },
         }
 
     monkeypatch.setattr(
@@ -999,7 +1039,7 @@ def test_run_holdout_inference_plots_every_pending_n_tiles(
         plot_dir=str(tmp_path / "plots"),
         context_radius=0,
         holdout_phase_metrics={},
-        append_union=lambda stream, variant, mask, ref_path, step: None,
+        append_union=lambda variant, mask, ref_path, step: None,
         processed_log_path=str(tmp_path / "processed.jsonl"),
         write_checkpoint=lambda holdout_done: None,
         logger=logging.getLogger("test_inference_flow_plot_every"),
