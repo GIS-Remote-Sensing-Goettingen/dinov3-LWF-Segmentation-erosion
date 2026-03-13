@@ -12,14 +12,18 @@ import importlib.util
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from segedge.core.config_loader import get_loaded_config_path
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import yaml  # noqa: E402
+
+from segedge.core.config_loader import get_loaded_config_path  # noqa: E402
+
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "output" / "shards"
 DEFAULT_TEMPLATE = REPO_ROOT / "silver_set.sh"
 

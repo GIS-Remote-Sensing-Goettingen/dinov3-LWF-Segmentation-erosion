@@ -25,6 +25,16 @@
 - Reason: The shard/merge model was in place, but operators still had to submit and monitor Slurm jobs manually and had no built-in retry or completion verification flow.
 - Problems fixed: `main.py` now supports explicit config-path execution for generated shard configs, `runtime.run_dir` can pin a shard to a fixed resumable run directory, the new deployment orchestrator submits one worker array plus watchdog/verify stages without modifying `silver_set.sh`, incomplete shards are resubmitted against the same run directories, and final union merge only happens after all shard tile counts verify cleanly.
 
+- Description: Add `deployment/README.md` documenting the shard deployment workflow, retry model, verification semantics, and generated outputs.
+- Files touched: `deployment/README.md`, `docs/CHANGELOG.md`
+- Reason: The deployment folder now contains the operational entrypoints for large Slurm-backed inference campaigns and needs a local README that explains how to use them without digging through implementation code.
+- Problems fixed: `deployment/` now documents the purpose of each deployment script, the fixed shard run directory model, the watchdog retry flow, the verification/merge behavior, and the exact orchestration directory layout written under `output/shards/<job_name>/`.
+
+- Description: Make deployment entrypoints runnable directly with `python deployment/...` by bootstrapping the repo root onto `sys.path` before importing `segedge`.
+- Files touched: `deployment/build_inference_shards.py`, `deployment/orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
+- Reason: Direct deployment-script execution on the cluster failed with `ModuleNotFoundError: No module named 'segedge'` when the repo root was not already on `PYTHONPATH`.
+- Problems fixed: `deployment/build_inference_shards.py` and `deployment/orchestrate_sharded_inference.py` now work as direct script entrypoints from the repository checkout without requiring manual `PYTHONPATH` setup first.
+
 - Description: Deepen holdout-performance diagnostics by splitting `load_context` into child spans, instrumenting the roads-mask path, and adding analyzer `--focus` filtering for targeted bottleneck inspection.
 - Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `segedge/pipeline/runtime/tile_context.py`, `scripts/analyze_performance_log.py`, `tests/test_performance_logging.py`, `tests/test_analyze_performance_log.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Recent performance logs still had pathological `load_context` outliers, but the old logging could not attribute them to roads-mask work, tile-context work, or other wrapper overhead precisely enough to guide the next optimization pass.
