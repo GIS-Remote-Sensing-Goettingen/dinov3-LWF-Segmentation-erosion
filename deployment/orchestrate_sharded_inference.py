@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from segedge.core.config_loader import get_loaded_config_path  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "output" / "shards"
 DEFAULT_TEMPLATE = REPO_ROOT / "silver_set.sh"
+logger = logging.getLogger(__name__)
 
 
 def _load_module(name: str, path: Path):
@@ -488,22 +490,47 @@ def launch_orchestration(
     """
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
+    logger.info(
+        "orchestrate: start job=%s shards=%s template=%s output_root=%s dry_run=%s max_retries=%s",
+        job_name,
+        shard_count,
+        template_path,
+        output_root,
+        dry_run,
+        max_retries,
+    )
     orchestration_root, shard_files = build_inference_shards(
         shard_count=shard_count,
         output_dir=str(output_root),
         job_name=job_name,
     )
     orchestration_root = Path(orchestration_root)
+    logger.info(
+        "orchestrate: shard planning complete root=%s shard_count=%s",
+        orchestration_root,
+        len(shard_files),
+    )
     base_config_path = Path(get_loaded_config_path())
+    logger.info("orchestrate: using base config %s", base_config_path)
     config_paths = _write_shard_configs(
         orchestration_root=orchestration_root,
         shard_files=shard_files,
         base_config_path=base_config_path,
     )
+    logger.info(
+        "orchestrate: wrote shard configs under %s",
+        orchestration_root / "configs",
+    )
     slurm_scripts = _write_slurm_scripts(
         orchestration_root=orchestration_root,
         template_path=template_path,
         job_name=job_name,
+    )
+    logger.info(
+        "orchestrate: rendered slurm scripts worker=%s watchdog=%s verify=%s",
+        slurm_scripts["worker"],
+        slurm_scripts["watchdog"],
+        slurm_scripts["verify_merge"],
     )
     manifest = _load_manifest(orchestration_root)
     manifest.update(
@@ -529,6 +556,7 @@ def launch_orchestration(
         extra_args=["--array", _array_spec(list(range(len(shard_files))))],
         dry_run=dry_run,
     )
+    logger.info("orchestrate: worker submission=%s", worker_submission)
     status["worker_job_ids"].append(worker_submission["job_id"])
     watchdog_args = []
     if worker_submission["job_id"] is not None:
@@ -538,6 +566,7 @@ def launch_orchestration(
         extra_args=watchdog_args,
         dry_run=dry_run,
     )
+    logger.info("orchestrate: watchdog submission=%s", watchdog_submission)
     status["watchdog_job_ids"].append(watchdog_submission["job_id"])
     _write_json(orchestration_root / "status.json", status)
     _write_submission(
@@ -548,6 +577,7 @@ def launch_orchestration(
             "dry_run": dry_run,
         },
     )
+    logger.info("orchestrate: ready root=%s", orchestration_root)
     return orchestration_root
 
 
@@ -558,6 +588,7 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
         >>> callable(run_watchdog)
         True
     """
+    logger.info("watchdog: start root=%s dry_run=%s", orchestration_root, dry_run)
     manifest = _load_manifest(orchestration_root)
     status = _refresh_status(orchestration_root)
     incomplete = [
@@ -565,12 +596,22 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
         for shard in status["shards"]
         if shard["done_tiles"] < shard["expected_tiles"]
     ]
+    for shard in status["shards"]:
+        logger.info(
+            "watchdog: shard=%03d done=%s expected=%s retries=%s status=%s",
+            int(shard["shard_id"]),
+            int(shard["done_tiles"]),
+            int(shard["expected_tiles"]),
+            int(shard["retry_count"]),
+            shard["status"],
+        )
     if not incomplete:
         verify_submission = _submit_sbatch(
             script_path=Path(manifest["slurm_scripts"]["verify_merge"]),
             extra_args=None,
             dry_run=dry_run,
         )
+        logger.info("watchdog: all shards complete verify_submission=%s", verify_submission)
         status["merge_job_id"] = verify_submission["job_id"]
         status["state"] = "verifying"
         _write_json(orchestration_root / "status.json", status)
@@ -591,9 +632,14 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
     if not retryable:
         status["state"] = "failed_incomplete"
         _write_json(orchestration_root / "status.json", status)
+        logger.error(
+            "watchdog: retry budget exhausted incomplete=%s",
+            [int(shard["shard_id"]) for shard in incomplete],
+        )
         raise SystemExit("incomplete shards remain and retry limit is exhausted")
 
     retry_indices = [int(shard["shard_id"]) for shard in retryable]
+    logger.info("watchdog: retrying shards=%s", retry_indices)
     for shard in status["shards"]:
         if int(shard["shard_id"]) in retry_indices:
             shard["retry_count"] = int(shard["retry_count"]) + 1
@@ -611,6 +657,11 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
         script_path=Path(manifest["slurm_scripts"]["watchdog"]),
         extra_args=watchdog_args,
         dry_run=dry_run,
+    )
+    logger.info(
+        "watchdog: retry worker_submission=%s next_watchdog_submission=%s",
+        worker_submission,
+        watchdog_submission,
     )
     status["watchdog_job_ids"].append(watchdog_submission["job_id"])
     status["state"] = "retry_submitted"
@@ -632,6 +683,7 @@ def run_verify_merge(*, orchestration_root: Path) -> None:
         >>> callable(run_verify_merge)
         True
     """
+    logger.info("verify-merge: start root=%s", orchestration_root)
     status = _refresh_status(orchestration_root)
     incomplete = [
         shard
@@ -652,6 +704,10 @@ def run_verify_merge(*, orchestration_root: Path) -> None:
             ],
         }
         _write_json(final_status_path, payload)
+        logger.error(
+            "verify-merge: incomplete shards=%s",
+            [int(shard["shard_id"]) for shard in incomplete],
+        )
         raise SystemExit("verification failed: some shards are incomplete")
 
     merged_dir = orchestration_root / "merged"
@@ -667,6 +723,7 @@ def run_verify_merge(*, orchestration_root: Path) -> None:
     status["state"] = "complete"
     _write_json(orchestration_root / "status.json", status)
     _write_json(final_status_path, payload)
+    logger.info("verify-merge: merged unions -> %s", merged_dir)
 
 
 def main() -> None:
@@ -676,6 +733,10 @@ def main() -> None:
         >>> callable(main)
         True
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job-name", help="Name for the shard orchestration root.")
     parser.add_argument("--shards", type=int, help="Number of shard workers.")

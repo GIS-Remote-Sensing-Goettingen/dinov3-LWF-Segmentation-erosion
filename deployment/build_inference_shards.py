@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from segedge.core.config_loader import cfg  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _SOURCE_LABEL_FILTER_CACHE_VERSION = 1
+_FILTER_PROGRESS_STRIDE = 250
 
 
 def _round_robin_shards(tiles: list[str], shard_count: int) -> list[list[str]]:
@@ -60,8 +62,18 @@ def build_inference_shards(
         raise ValueError("shard_count must be > 0")
     shard_root = Path(output_dir) / job_name
     shard_root.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "build shards: job=%s shards=%s output=%s",
+        job_name,
+        shard_count,
+        shard_root,
+    )
     tiles, inference_dir, inference_glob = _resolve_inference_tiles_for_shards(
         shard_root=shard_root
+    )
+    logger.info(
+        "build shards: filtered tiles=%s assignment=round_robin",
+        len(tiles),
     )
     shards = _round_robin_shards(tiles, shard_count)
     shard_files: list[Path] = []
@@ -72,6 +84,12 @@ def build_inference_shards(
             encoding="utf-8",
         )
         shard_files.append(shard_path)
+        logger.info(
+            "build shards: wrote shard %03d with %s tiles -> %s",
+            idx,
+            len(shard_tiles),
+            shard_path,
+        )
     manifest = {
         "assignment_method": "round_robin",
         "created_at_utc": datetime.now(UTC).isoformat(),
@@ -88,6 +106,7 @@ def build_inference_shards(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    logger.info("build shards: manifest written -> %s", shard_root / "manifest.json")
     return shard_root, shard_files
 
 
@@ -186,12 +205,19 @@ def _filter_tiles_by_source_label_presence(
     cache_dirty = False
     filtered_paths: list[str] = []
     excluded_count = 0
+    start_ts = time.monotonic()
+
+    logger.info(
+        "source-label filter: start tiles=%s raster=%s",
+        len(tile_paths),
+        raster_path,
+    )
 
     with rio_open(raster_path) as src:
         raster_crs = src.crs
         raster_bounds = src.bounds
         nodata = src.nodata
-        for tile_path in tile_paths:
+        for idx, tile_path in enumerate(tile_paths, start=1):
             tile_signature = _stat_signature(tile_path)
             cache_entry = cache_entries.get(tile_path)
             if (
@@ -258,6 +284,18 @@ def _filter_tiles_by_source_label_presence(
             else:
                 excluded_count += 1
 
+            if idx % _FILTER_PROGRESS_STRIDE == 0 or idx == len(tile_paths):
+                elapsed_s = time.monotonic() - start_ts
+                logger.info(
+                    "source-label filter: processed %s/%s tiles kept=%s excluded=%s cache_hits=%s elapsed=%.1fs",
+                    idx,
+                    len(tile_paths),
+                    len(filtered_paths),
+                    excluded_count,
+                    cache_hits,
+                    elapsed_s,
+                )
+
     if cache_dirty:
         try:
             _save_source_label_filter_cache(
@@ -277,6 +315,12 @@ def _filter_tiles_by_source_label_presence(
             cache_hits,
             len(tile_paths),
         )
+    logger.info(
+        "source-label filter: done kept=%s excluded=%s elapsed=%.1fs",
+        len(filtered_paths),
+        excluded_count,
+        time.monotonic() - start_ts,
+    )
     return filtered_paths, excluded_count
 
 
@@ -362,6 +406,10 @@ def _resolve_inference_tiles_for_shards(
 
 def main() -> None:
     """CLI entrypoint for building shard tile lists."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shards", type=int, required=True, help="Number of shards.")
     parser.add_argument(

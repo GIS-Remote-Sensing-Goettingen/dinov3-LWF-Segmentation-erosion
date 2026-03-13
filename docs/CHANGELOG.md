@@ -40,6 +40,11 @@
 - Reason: Cluster-side shard planning failed before any work was submitted because importing `deployment/orchestrate_sharded_inference.py` pulled in `inference_flow.py`, `runtime_utils.py`, and heavyweight pipeline modules even though shard building only needs lightweight tile resolution and source-label filtering.
 - Problems fixed: `build_inference_shards.py` now resolves and source-label-filters tiles with a local lightweight helper instead of importing the full inference/runtime stack, `segedge/pipeline/common.py` no longer imports Fiona at module load time, `orchestrate_sharded_inference.py` loads the shard builder and merge helper lazily instead of importing them at startup, and deployment planning can proceed in environments where the full Fiona/GDAL/transformers runtime is not yet usable.
 
+- Description: Add explicit progress logging to shard planning and orchestration startup.
+- Files touched: `deployment/build_inference_shards.py`, `deployment/orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
+- Reason: Large folder runs spent noticeable time in tile discovery and source-label filtering with no visible progress, which made the launcher look hung even when it was working normally.
+- Problems fixed: Deployment startup now logs shard-build phases, periodic source-label filter progress, shard file creation, and Slurm submission/watchdog/verify stages so operators can see where time is going during orchestration.
+
 - Description: Deepen holdout-performance diagnostics by splitting `load_context` into child spans, instrumenting the roads-mask path, and adding analyzer `--focus` filtering for targeted bottleneck inspection.
 - Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `segedge/pipeline/runtime/tile_context.py`, `scripts/analyze_performance_log.py`, `tests/test_performance_logging.py`, `tests/test_analyze_performance_log.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Recent performance logs still had pathological `load_context` outliers, but the old logging could not attribute them to roads-mask work, tile-context work, or other wrapper overhead precisely enough to guide the next optimization pass.
