@@ -611,7 +611,9 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
             extra_args=None,
             dry_run=dry_run,
         )
-        logger.info("watchdog: all shards complete verify_submission=%s", verify_submission)
+        logger.info(
+            "watchdog: all shards complete verify_submission=%s", verify_submission
+        )
         status["merge_job_id"] = verify_submission["job_id"]
         status["state"] = "verifying"
         _write_json(orchestration_root / "status.json", status)

@@ -30,7 +30,7 @@ from segedge.core.config_loader import cfg  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _SOURCE_LABEL_FILTER_CACHE_VERSION = 1
-_FILTER_PROGRESS_STRIDE = 250
+_FILTER_PROGRESS_STRIDE = 10
 
 
 def _round_robin_shards(tiles: list[str], shard_count: int) -> list[list[str]]:
@@ -287,7 +287,8 @@ def _filter_tiles_by_source_label_presence(
             if idx % _FILTER_PROGRESS_STRIDE == 0 or idx == len(tile_paths):
                 elapsed_s = time.monotonic() - start_ts
                 logger.info(
-                    "source-label filter: processed %s/%s tiles kept=%s excluded=%s cache_hits=%s elapsed=%.1fs",
+                    "source-label filter: processed %s/%s tiles "
+                    "kept=%s excluded=%s cache_hits=%s elapsed=%.1fs",
                     idx,
                     len(tile_paths),
                     len(filtered_paths),
