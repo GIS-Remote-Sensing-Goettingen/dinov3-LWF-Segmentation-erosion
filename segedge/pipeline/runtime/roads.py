@@ -17,7 +17,7 @@ from shapely.strtree import STRtree
 from skimage.transform import resize
 
 from ...core.config_loader import cfg
-from ...core.timing_utils import time_end, time_start
+from ...core.timing_utils import perf_span, time_end, time_start
 
 logger = logging.getLogger(__name__)
 
@@ -149,23 +149,34 @@ def _get_roads_mask(
     """
     key = (tile_path, downsample_factor, tuple(target_shape) if target_shape else None)
     if key in _ROADS_MASK_CACHE:
+        with perf_span(
+            "roads_mask",
+            substage="memory_cache_hit",
+            extra={"tile_path": tile_path, "target_shape": list(target_shape or ())},
+        ):
+            _ = 0
         return _ROADS_MASK_CACHE[key]
 
-    with rasterio.open(tile_path) as tile_src:
-        if downsample_factor > 1:
-            out_shape = (
-                tile_src.height // downsample_factor,
-                tile_src.width // downsample_factor,
-            )
-            transform = tile_src.transform * tile_src.transform.scale(
-                tile_src.width / out_shape[1],
-                tile_src.height / out_shape[0],
-            )
-        else:
-            out_shape = (tile_src.height, tile_src.width)
-            transform = tile_src.transform
-        tile_bounds = tile_src.bounds
-        tile_crs = tile_src.crs
+    with perf_span(
+        "roads_mask",
+        substage="open_tile_metadata",
+        extra={"tile_path": tile_path, "downsample_factor": downsample_factor},
+    ):
+        with rasterio.open(tile_path) as tile_src:
+            if downsample_factor > 1:
+                out_shape = (
+                    tile_src.height // downsample_factor,
+                    tile_src.width // downsample_factor,
+                )
+                transform = tile_src.transform * tile_src.transform.scale(
+                    tile_src.width / out_shape[1],
+                    tile_src.height / out_shape[0],
+                )
+            else:
+                out_shape = (tile_src.height, tile_src.width)
+                transform = tile_src.transform
+            tile_bounds = tile_src.bounds
+            tile_crs = tile_src.crs
 
     disk_cache_path = _roads_mask_disk_cache_path(
         tile_path,
@@ -173,17 +184,46 @@ def _get_roads_mask(
         out_shape,
         target_shape,
     )
-    if os.path.exists(disk_cache_path):
+    with perf_span(
+        "roads_mask",
+        substage="disk_cache_lookup",
+        extra={
+            "tile_path": tile_path,
+            "disk_cache_path": disk_cache_path,
+            "target_shape": list(target_shape or ()),
+        },
+    ):
+        disk_cache_exists = os.path.exists(disk_cache_path)
+    if disk_cache_exists:
         try:
-            disk_mask = np.load(disk_cache_path).astype(bool)
-            if target_shape is not None and disk_mask.shape != target_shape:
-                disk_mask = resize(
-                    disk_mask.astype("uint8"),
-                    target_shape,
-                    order=0,
-                    preserve_range=True,
-                    anti_aliasing=False,
-                ).astype(bool)
+            with perf_span(
+                "roads_mask",
+                substage="disk_cache_load",
+                extra={
+                    "tile_path": tile_path,
+                    "disk_cache_path": disk_cache_path,
+                    "target_shape": list(target_shape or ()),
+                },
+            ):
+                disk_mask = np.load(disk_cache_path).astype(bool)
+                if target_shape is not None and disk_mask.shape != target_shape:
+                    with perf_span(
+                        "roads_mask",
+                        substage="resize_to_target",
+                        extra={
+                            "tile_path": tile_path,
+                            "source_shape": list(disk_mask.shape),
+                            "target_shape": list(target_shape),
+                            "roads_cache_hit": True,
+                        },
+                    ):
+                        disk_mask = resize(
+                            disk_mask.astype("uint8"),
+                            target_shape,
+                            order=0,
+                            preserve_range=True,
+                            anti_aliasing=False,
+                        ).astype(bool)
             _ROADS_MASK_CACHE[key] = disk_mask
             logger.info(
                 "roads mask disk cache hit: %s", os.path.basename(disk_cache_path)
@@ -192,12 +232,27 @@ def _get_roads_mask(
         except Exception:
             pass
 
-    tree, geoms = _get_roads_index(tile_crs)
+    with perf_span(
+        "roads_mask",
+        substage="index_lookup",
+        extra={"tile_path": tile_path},
+    ):
+        tree, geoms = _get_roads_index(tile_crs)
     if tree is None or not geoms:
         mask_empty = np.zeros(out_shape, dtype=bool)
         _ROADS_MASK_CACHE[key] = mask_empty
         try:
-            np.save(disk_cache_path, mask_empty.astype(np.uint8))
+            with perf_span(
+                "roads_mask",
+                substage="disk_cache_write",
+                extra={
+                    "tile_path": tile_path,
+                    "disk_cache_path": disk_cache_path,
+                    "candidate_geometry_count": 0,
+                    "intersecting_geometry_count": 0,
+                },
+            ):
+                np.save(disk_cache_path, mask_empty.astype(np.uint8))
         except Exception:
             pass
         return mask_empty
@@ -208,12 +263,31 @@ def _get_roads_mask(
         tile_bounds.right,
         tile_bounds.top,
     )
-    hits = tree.query(tile_box)
+    with perf_span(
+        "roads_mask",
+        substage="tree_query",
+        extra={
+            "tile_path": tile_path,
+            "tile_width_m": float(tile_bounds.right - tile_bounds.left),
+            "tile_height_m": float(tile_bounds.top - tile_bounds.bottom),
+        },
+    ):
+        hits = tree.query(tile_box)
     if len(hits) == 0:
         mask_empty = np.zeros(out_shape, dtype=bool)
         _ROADS_MASK_CACHE[key] = mask_empty
         try:
-            np.save(disk_cache_path, mask_empty.astype(np.uint8))
+            with perf_span(
+                "roads_mask",
+                substage="disk_cache_write",
+                extra={
+                    "tile_path": tile_path,
+                    "disk_cache_path": disk_cache_path,
+                    "candidate_geometry_count": 0,
+                    "intersecting_geometry_count": 0,
+                },
+            ):
+                np.save(disk_cache_path, mask_empty.astype(np.uint8))
         except Exception:
             pass
         return mask_empty
@@ -222,34 +296,72 @@ def _get_roads_mask(
         candidates = [geoms[int(idx)] for idx in hits]
     else:
         candidates = list(hits)
-    shapes = [mapping(g) for g in candidates if g.intersects(tile_box)]
+    with perf_span(
+        "roads_mask",
+        substage="candidate_filter",
+        extra={
+            "tile_path": tile_path,
+            "candidate_geometry_count": int(len(candidates)),
+        },
+    ):
+        shapes = [mapping(g) for g in candidates if g.intersects(tile_box)]
     if not shapes:
         mask_empty = np.zeros(out_shape, dtype=bool)
         _ROADS_MASK_CACHE[key] = mask_empty
         try:
-            np.save(disk_cache_path, mask_empty.astype(np.uint8))
+            with perf_span(
+                "roads_mask",
+                substage="disk_cache_write",
+                extra={
+                    "tile_path": tile_path,
+                    "disk_cache_path": disk_cache_path,
+                    "candidate_geometry_count": int(len(candidates)),
+                    "intersecting_geometry_count": 0,
+                },
+            ):
+                np.save(disk_cache_path, mask_empty.astype(np.uint8))
         except Exception:
             pass
         return mask_empty
 
     t0 = time_start()
-    mask = rfeatures.rasterize(
-        shapes=[(geom, 1) for geom in shapes],
-        out_shape=out_shape,
-        transform=transform,
-        fill=0,
-        default_value=1,
-        dtype="uint8",
-        all_touched=False,
-    )
+    with perf_span(
+        "roads_mask",
+        substage="rasterize",
+        extra={
+            "tile_path": tile_path,
+            "candidate_geometry_count": int(len(candidates)),
+            "intersecting_geometry_count": int(len(shapes)),
+            "out_shape": list(out_shape),
+        },
+    ):
+        mask = rfeatures.rasterize(
+            shapes=[(geom, 1) for geom in shapes],
+            out_shape=out_shape,
+            transform=transform,
+            fill=0,
+            default_value=1,
+            dtype="uint8",
+            all_touched=False,
+        )
     if target_shape is not None and mask.shape != target_shape:
-        mask = resize(
-            mask,
-            target_shape,
-            order=0,
-            preserve_range=True,
-            anti_aliasing=False,
-        ).astype("uint8")
+        with perf_span(
+            "roads_mask",
+            substage="resize_to_target",
+            extra={
+                "tile_path": tile_path,
+                "source_shape": list(mask.shape),
+                "target_shape": list(target_shape),
+                "roads_cache_hit": False,
+            },
+        ):
+            mask = resize(
+                mask,
+                target_shape,
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            ).astype("uint8")
     mask_bool = mask.astype(bool)
     time_end("roads_mask_rasterize", t0)
     logger.info(
@@ -259,7 +371,17 @@ def _get_roads_mask(
     )
     _ROADS_MASK_CACHE[key] = mask_bool
     try:
-        np.save(disk_cache_path, mask_bool.astype(np.uint8))
+        with perf_span(
+            "roads_mask",
+            substage="disk_cache_write",
+            extra={
+                "tile_path": tile_path,
+                "disk_cache_path": disk_cache_path,
+                "candidate_geometry_count": int(len(candidates)),
+                "intersecting_geometry_count": int(len(shapes)),
+            },
+        ):
+            np.save(disk_cache_path, mask_bool.astype(np.uint8))
     except Exception:
         logger.debug("roads mask disk cache write failed: %s", disk_cache_path)
     return mask_bool

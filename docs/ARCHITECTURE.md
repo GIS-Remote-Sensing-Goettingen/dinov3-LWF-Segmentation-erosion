@@ -49,12 +49,14 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `runtime/checkpointing.py`: writes `rolling_best_setting.yml`.
 - `runtime/time_budget.py`: computes deadlines, remaining time, and serialized budget state.
 - `runtime/roads.py`: cached road-mask rasterization and roads-penalty scoring.
+  - roads-mask timing is now decomposed into cache lookup/load, STRtree query, candidate filtering, rasterization, resize, and cache-write spans so slow tiles can be attributed to specific roads-mask work.
 - `runtime/postprocess.py`: shadow filtering and novel-proposal heuristics.
 - `runtime/crf_eval.py`: CRF worker initialization and config evaluation.
   - XGB CRF can now use a trimap-band unary that treats the current XGB mask as strong interior foreground, a boundary ring as uncertain, and the far exterior as background.
   - Optional `postprocess.fill_holes_xgb` fills enclosed holes in the thresholded XGB mask before trimap CRF builds that boundary ring.
 - `runtime/tile_context.py`: tile image/label/GT loading and SH-buffer preparation.
   - source-label loading now reuses cached raster handles and prefers aligned window reads over full temporary-dataset reprojection when the tile grid matches the label grid.
+  - tile-context spans now emit source-label, GT, and SH-buffer coverage metadata so `load_context` outliers can be compared against actual workload size.
 - `runtime/phase_metrics.py`: phase logging and summary aggregation.
   - inference now also writes structured timing spans into `performance.jsonl` so tile-level and function-internal bottlenecks can be analyzed separately from `run.log`.
 
@@ -84,6 +86,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `output/run_*/run.log`: main runtime log.
 - `output/run_*/performance.jsonl`: structured per-span performance log with tile and phase context plus rolling summaries.
   - feature-prefetch spans now include cache hit counts plus approximate feature/manifest bytes read and written, so disk-cache cost is visible in profiling output.
+  - holdout context loading now records child spans for `load_holdout_tile_context`, `resolve_runtime_toggles`, `load_roads_mask`, and `finalize_context`, plus workload metadata such as source-label, roads, and SH-buffer coverage.
 - `output/run_*/rolling_best_setting.yml`: interruption-safe best-known config and progress state.
 - `output/run_*/processed_tiles.jsonl`: append-only holdout completion log.
 - `output/run_*/plots/validation/`: validation-stage plots.

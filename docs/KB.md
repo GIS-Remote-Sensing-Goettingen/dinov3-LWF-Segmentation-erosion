@@ -66,6 +66,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - Time-budget state is persisted in the rolling checkpoint and can trigger cutover behavior.
 - `runtime.cache_training_features` and `runtime.cache_inference_features` control disk persistence separately for training/validation vs final inference.
 - `performance.jsonl` now records cache-cost metadata for feature prefetch, including cached vs computed tile counts and approximate feature/manifest bytes read and written.
+- `performance.jsonl` now also breaks `infer_on_holdout::load_context` into child spans and records roads-mask cache/query/rasterization details plus source-label/SH-buffer coverage metadata, so slow tiles can be traced to one concrete preprocessing stage instead of one opaque bucket.
 
 ## Major Functions to know
 - `segedge.pipeline.run.main`: dispatcher and bootstrap.
@@ -97,3 +98,4 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `scripts/check_function_length.py`: function-size guard that ignores leading docstrings and doctests by excluding the full docstring block from the count
 - `python scripts/analyze_performance_log.py performance.jsonl --top 10 --tile-limit 5`: summarize inference-only stage/substage timings and the hottest traced tiles from a structured performance log; mixed train+infer logs default to `phase=holdout_inference` and exclude `tile=null` rows
 - `python scripts/analyze_performance_log.py performance.jsonl --phase all --include-tile-null --top 10`: inspect the full mixed log, including training/setup spans and tile-null records
+- `python scripts/analyze_performance_log.py performance.jsonl --focus load_context --top 10 --tile-limit 5`: isolate one stage family such as `load_context` or `roads_mask` when debugging a localized bottleneck cluster

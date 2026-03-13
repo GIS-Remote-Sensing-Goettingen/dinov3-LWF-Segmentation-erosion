@@ -15,6 +15,11 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Deepen holdout-performance diagnostics by splitting `load_context` into child spans, instrumenting the roads-mask path, and adding analyzer `--focus` filtering for targeted bottleneck inspection.
+- Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `segedge/pipeline/runtime/tile_context.py`, `scripts/analyze_performance_log.py`, `tests/test_performance_logging.py`, `tests/test_analyze_performance_log.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Recent performance logs still had pathological `load_context` outliers, but the old logging could not attribute them to roads-mask work, tile-context work, or other wrapper overhead precisely enough to guide the next optimization pass.
+- Problems fixed: `performance.jsonl` now breaks holdout context loading into child stages (`load_holdout_tile_context`, `resolve_runtime_toggles`, `load_roads_mask`, `finalize_context`), roads-mask lookup/rasterization now records cache-hit state plus geometry counts, tile-context spans emit richer label/buffer metadata, and the analyzer can now focus on one stage family at a time with `--focus`.
+
 - Description: Simplify holdout shapefile artifacts to 4 rolling union outputs and remove per-image proposal shapefile/CSV exports.
 - Files touched: `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: The old per-image proposal shapefile/CSV output produced too many artifacts and made the useful final geometry harder to navigate.

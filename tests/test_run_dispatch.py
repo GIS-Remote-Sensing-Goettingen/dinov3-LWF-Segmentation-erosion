@@ -229,9 +229,7 @@ def test_initialize_union_state_uses_stage_unions_and_rotating_backups(
     append_union("shadow_with_proposals", mask=[[1]], ref_path="tile.tif", step=1)
     append_union("shadow_with_proposals", mask=[[1]], ref_path="tile.tif", step=2)
 
-    assert recorded_backups == [
-        ("shadow_with_proposals", "backup", 2, "union_backup")
-    ]
+    assert recorded_backups == [("shadow_with_proposals", "backup", 2, "union_backup")]
 
 
 def test_resolve_inference_model_bundle_dir_uses_latest_valid_previous_run(tmp_path):

@@ -20,7 +20,7 @@ from ...core.plotting import (
     save_score_threshold_plot,
     save_unified_plot,
 )
-from ...core.timing_utils import perf_span
+from ...core.timing_utils import perf_span, record_performance
 from ...core.xdboost import (
     xgb_score_image_b,
     xgb_score_image_b_legacy,
@@ -154,40 +154,85 @@ def _load_holdout_tile_context(
         >>> callable(_load_holdout_tile_context)
         True
     """
-    (
-        img_b,
-        labels_sh,
-        _,
-        gt_mask_eval,
-        sh_buffer_mask,
-        buffer_m,
-        pixel_size_m,
-    ) = load_b_tile_context(holdout_path, gt_vector_paths)
+    with perf_span(
+        "infer_on_holdout",
+        substage="load_holdout_tile_context",
+        extra={"tile_path": holdout_path},
+    ):
+        (
+            img_b,
+            labels_sh,
+            _,
+            gt_mask_eval,
+            sh_buffer_mask,
+            buffer_m,
+            pixel_size_m,
+        ) = load_b_tile_context(holdout_path, gt_vector_paths)
     gt_available = gt_mask_eval is not None
     if gt_mask_eval is None:
         logger.warning("Holdout has no GT; metrics will be reported as 0.0.")
         gt_mask_eval = np.zeros(img_b.shape[:2], dtype=bool)
     image_id_b = os.path.splitext(os.path.basename(holdout_path))[0]
-    knn_enabled = bool(tuned.get("knn_enabled", cfg.search.knn.enabled))
-    xgb_enabled = bool(tuned.get("xgb_enabled", cfg.search.xgb.enabled))
+    with perf_span(
+        "infer_on_holdout",
+        substage="resolve_runtime_toggles",
+        extra={"tile_path": holdout_path},
+    ):
+        knn_enabled = bool(tuned.get("knn_enabled", cfg.search.knn.enabled))
+        xgb_enabled = bool(tuned.get("xgb_enabled", cfg.search.xgb.enabled))
     ds = int(cfg.model.backbone.resample_factor or 1)
-    return {
-        "img_b": img_b,
-        "labels_sh": labels_sh,
-        "gt_mask_eval": gt_mask_eval,
-        "gt_available": gt_available,
-        "gt_weight": float(gt_mask_eval.sum()),
-        "sh_buffer_mask": sh_buffer_mask,
-        "buffer_m": buffer_m,
-        "pixel_size_m": pixel_size_m,
-        "image_id_b": image_id_b,
-        "roads_mask": _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2]),
-        "roads_penalty": float(tuned.get("roads_penalty", 1.0)),
-        "xgb_feature_stats": tuned.get("xgb_feature_stats"),
-        "knn_enabled": knn_enabled,
-        "xgb_enabled": xgb_enabled,
-        "crf_enabled": bool(tuned.get("crf_enabled", cfg.search.crf.enabled)),
-    }
+    with perf_span(
+        "infer_on_holdout",
+        substage="load_roads_mask",
+        extra={
+            "tile_path": holdout_path,
+            "target_shape": list(img_b.shape[:2]),
+            "downsample_factor": ds,
+        },
+    ):
+        roads_mask = _get_roads_mask(holdout_path, ds, target_shape=img_b.shape[:2])
+    with perf_span(
+        "infer_on_holdout",
+        substage="finalize_context",
+        extra={
+            "tile_path": holdout_path,
+            "image_shape": list(img_b.shape[:2]),
+            "source_label_positive_pixels": int((labels_sh > 0).sum()),
+            "source_label_coverage_ratio": (
+                float((labels_sh > 0).mean()) if labels_sh.size else 0.0
+            ),
+            "buffer_positive_pixels": int(sh_buffer_mask.sum()),
+            "buffer_coverage_ratio": (
+                float(sh_buffer_mask.mean()) if sh_buffer_mask.size else 0.0
+            ),
+            "roads_positive_pixels": (
+                int(roads_mask.sum()) if roads_mask is not None else 0
+            ),
+            "roads_coverage_ratio": (
+                float(roads_mask.mean())
+                if roads_mask is not None and roads_mask.size
+                else 0.0
+            ),
+        },
+    ):
+        context = {
+            "img_b": img_b,
+            "labels_sh": labels_sh,
+            "gt_mask_eval": gt_mask_eval,
+            "gt_available": gt_available,
+            "gt_weight": float(gt_mask_eval.sum()),
+            "sh_buffer_mask": sh_buffer_mask,
+            "buffer_m": buffer_m,
+            "pixel_size_m": pixel_size_m,
+            "image_id_b": image_id_b,
+            "roads_mask": roads_mask,
+            "roads_penalty": float(tuned.get("roads_penalty", 1.0)),
+            "xgb_feature_stats": tuned.get("xgb_feature_stats"),
+            "knn_enabled": knn_enabled,
+            "xgb_enabled": xgb_enabled,
+            "crf_enabled": bool(tuned.get("crf_enabled", cfg.search.crf.enabled)),
+        }
+    return context
 
 
 def _prefetch_holdout_features(
@@ -816,6 +861,8 @@ def _build_proposal_masks(
         "accepted_mask": proposal_bundle["accepted_mask"],
         "rejected_mask": proposal_bundle["rejected_mask"],
     }
+
+
 def _compute_probability_and_diagnostics(
     active_stream: str,
     champion_score: np.ndarray,
@@ -1160,6 +1207,41 @@ def infer_on_holdout(
                 disagreement_map=disagreement_map,
                 entropy_map=entropy_map,
             )
+
+    record_performance(
+        "infer_on_holdout",
+        0.0,
+        substage="tile_workload_metadata",
+        extra={
+            "image_shape": list(context["img_b"].shape[:2]),
+            "source_label_positive_pixels": int((context["labels_sh"] > 0).sum()),
+            "source_label_coverage_ratio": (
+                float((context["labels_sh"] > 0).mean())
+                if context["labels_sh"].size
+                else 0.0
+            ),
+            "sh_buffer_positive_pixels": int(context["sh_buffer_mask"].sum()),
+            "sh_buffer_coverage_ratio": (
+                float(context["sh_buffer_mask"].mean())
+                if context["sh_buffer_mask"].size
+                else 0.0
+            ),
+            "roads_positive_pixels": (
+                int(context["roads_mask"].sum())
+                if context["roads_mask"] is not None
+                else 0
+            ),
+            "roads_coverage_ratio": (
+                float(context["roads_mask"].mean())
+                if context["roads_mask"] is not None and context["roads_mask"].size
+                else 0.0
+            ),
+            "xgb_patch_rows": (
+                int(context["img_b"].shape[0] // ps)
+                * int(context["img_b"].shape[1] // ps)
+            ),
+        },
+    )
 
     shadow_with_proposals_mask = np.logical_or(
         active_shadow_mask,

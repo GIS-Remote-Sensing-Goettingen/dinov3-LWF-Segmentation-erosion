@@ -396,6 +396,12 @@ def _initialize_union_state(
         ref_path: str,
         step: int,
     ) -> None:
+        """Append one stage mask into the rolling union target.
+
+        Examples:
+            >>> callable(_append_union)
+            True
+        """
         state = union_states[variant]
         union_path = str(state["path"])
         backup_dir = str(state["backup_dir"])

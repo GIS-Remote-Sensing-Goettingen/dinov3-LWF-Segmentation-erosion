@@ -326,3 +326,92 @@ def test_cli_reports_default_inference_selection(tmp_path):
     assert "excluded_phase_null: 1" in result.stdout
     assert "excluded_tile_null: 0" in result.stdout
     assert "Outlier Tiles By load_context" in result.stdout
+
+
+def test_filter_records_can_focus_on_stage_family(tmp_path):
+    log_path = tmp_path / "performance.jsonl"
+    _write_records(
+        log_path,
+        [
+            {
+                "duration_s": 5.0,
+                "kind": "span",
+                "phase": "holdout_inference",
+                "stage": "infer_on_holdout",
+                "substage": "load_context",
+                "tile": "tile_a.tif",
+            },
+            {
+                "duration_s": 1.0,
+                "kind": "span",
+                "phase": "holdout_inference",
+                "stage": "roads_mask",
+                "substage": "tree_query",
+                "tile": "tile_a.tif",
+            },
+            {
+                "duration_s": 9.0,
+                "kind": "span",
+                "phase": "holdout_inference",
+                "stage": "infer_on_holdout",
+                "substage": "xgb_stream",
+                "tile": "tile_a.tif",
+            },
+        ],
+    )
+    records = load_performance_records(log_path)
+    filtered = filter_records(
+        records,
+        kinds=parse_kind_filter("span"),
+        phase=parse_phase_filter(None),
+        include_tile_null=False,
+        focus="load_context",
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0].stage == "infer_on_holdout"
+    assert filtered[0].substage == "load_context"
+
+
+def test_cli_reports_focus_selection(tmp_path):
+    log_path = tmp_path / "performance.jsonl"
+    _write_records(
+        log_path,
+        [
+            {
+                "duration_s": 5.0,
+                "kind": "span",
+                "phase": "holdout_inference",
+                "stage": "infer_on_holdout",
+                "substage": "load_context",
+                "tile": "tile_a.tif",
+            },
+            {
+                "duration_s": 1.0,
+                "kind": "span",
+                "phase": "holdout_inference",
+                "stage": "roads_mask",
+                "substage": "tree_query",
+                "tile": "tile_a.tif",
+            },
+        ],
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_MODULE_PATH),
+            str(log_path),
+            "--focus",
+            "roads_mask",
+            "--top",
+            "3",
+            "--tile-limit",
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "focus: roads_mask" in result.stdout
+    assert "roads_mask" in result.stdout
