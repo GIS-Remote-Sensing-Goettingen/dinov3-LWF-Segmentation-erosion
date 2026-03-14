@@ -17,7 +17,7 @@ io:
     # Optional explicit tile list fallback when tiles_dir is null.
     tiles: []
     # Render plots every N pending inference tiles. 1 means every tile.
-    plot_every: 1
+    plot_every: 20
     plots:
       unified: true
       qualitative_core: false
