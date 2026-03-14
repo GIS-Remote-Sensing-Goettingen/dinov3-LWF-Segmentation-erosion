@@ -12,6 +12,7 @@ import importlib.util
 import json
 import logging
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -142,6 +143,44 @@ def _strip_sbatch_overrides(sbatch_lines: list[str]) -> list[str]:
     ]
 
 
+def _is_template_main_invocation(line: str) -> bool:
+    """Return whether a template line launches the main pipeline directly.
+
+    Examples:
+        >>> _is_template_main_invocation("python -u ./main.py --config cfg.yml")
+        True
+    """
+    return line.strip().startswith("python -u ./main.py")
+
+
+def _is_hardcoded_repo_cd(line: str) -> bool:
+    """Return whether a template line hard-codes a checkout-specific `cd`.
+
+    Examples:
+        >>> _is_hardcoded_repo_cd(" cd /user/example/dinov3-LWF-Segmentation-erosion")
+        True
+    """
+    stripped = line.strip()
+    return stripped.startswith("cd ") and REPO_ROOT.name in stripped
+
+
+def _repo_root_setup_lines() -> list[str]:
+    """Return the shell stanza that validates and enters the repo root.
+
+    Examples:
+        >>> any("REPO_ROOT=" in line for line in _repo_root_setup_lines())
+        True
+    """
+    return [
+        f"REPO_ROOT={shlex.quote(str(REPO_ROOT))}",
+        'if [ ! -f "${REPO_ROOT}/main.py" ]; then',
+        '  echo "missing repo root main.py: ${REPO_ROOT}" >&2',
+        "  exit 1",
+        "fi",
+        'cd "${REPO_ROOT}"',
+    ]
+
+
 def _render_slurm_script(
     *,
     template_path: Path,
@@ -170,10 +209,17 @@ def _render_slurm_script(
             continue
         body_start = idx
         break
-    body = "\n".join(lines[body_start:]).rstrip() + "\n"
-    body = body.replace("python -u ./main.py", command, 1)
-    if command not in body:
-        body = body.rstrip() + "\n" + command + "\n"
+    body_lines = [
+        line
+        for line in lines[body_start:]
+        if not _is_template_main_invocation(line) and not _is_hardcoded_repo_cd(line)
+    ]
+    body_sections = [
+        "\n".join(body_lines).rstrip(),
+        "\n".join(_repo_root_setup_lines()),
+        command,
+    ]
+    body = "\n\n".join(section for section in body_sections if section).rstrip()
     script_lines = [
         shebang,
         *_strip_sbatch_overrides(sbatch_lines),
@@ -237,6 +283,26 @@ def _count_processed_tiles(run_dir: Path) -> int:
     return len(done_tiles)
 
 
+def _processed_tiles_path(run_dir: Path) -> Path:
+    """Return the per-run processed-tiles log path.
+
+    Examples:
+        >>> _processed_tiles_path(Path('/tmp/run')).name
+        'processed_tiles.jsonl'
+    """
+    return run_dir / "processed_tiles.jsonl"
+
+
+def _run_log_path(run_dir: Path) -> Path:
+    """Return the per-run plain-text log path.
+
+    Examples:
+        >>> _run_log_path(Path('/tmp/run')).name
+        'run.log'
+    """
+    return run_dir / "run.log"
+
+
 def _expected_run_dir(orchestration_root: Path, shard_idx: int) -> Path:
     """Return the fixed run directory for one shard.
 
@@ -245,6 +311,169 @@ def _expected_run_dir(orchestration_root: Path, shard_idx: int) -> Path:
         'shard_002'
     """
     return orchestration_root / "runs" / f"shard_{shard_idx:03d}"
+
+
+def _worker_log_path(
+    orchestration_root: Path,
+    job_id: str | None,
+    shard_idx: int,
+    suffix: str,
+) -> str | None:
+    """Return the concrete worker log path for one shard/job pair.
+
+    Examples:
+        >>> _worker_log_path(Path('/tmp/root'), '123', 2, 'out').endswith('worker_123_2.out')
+        True
+    """
+    if job_id in (None, ""):
+        return None
+    return str(orchestration_root / "slurm" / f"worker_{job_id}_{shard_idx}.{suffix}")
+
+
+def _tail_log_excerpt(path: Path, *, line_limit: int = 20) -> str | None:
+    """Return a short tail excerpt from a text log, preferring error-like lines.
+
+    Examples:
+        >>> _tail_log_excerpt(Path('/tmp/does-not-exist.log')) is None
+        True
+    """
+    if not path.exists():
+        return None
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return None
+    markers = (
+        "ERROR",
+        "CRITICAL",
+        "Traceback",
+        "Exception",
+        "No such file",
+        "missing ",
+    )
+    for line in reversed(lines[-line_limit:]):
+        if any(marker in line for marker in markers):
+            return line[:400]
+    return lines[-1][:400]
+
+
+def _update_shard_diagnostics(
+    *,
+    shard: dict[str, Any],
+    orchestration_root: Path,
+) -> None:
+    """Refresh one shard's file paths and last-known failure hint.
+
+    Examples:
+        >>> shard = {'shard_id': 0, 'run_dir': '/tmp/run', 'done_tiles': 0, 'expected_tiles': 1}
+        >>> _update_shard_diagnostics(shard=shard, orchestration_root=Path('/tmp/root'))
+        >>> shard['processed_tiles_path'].endswith('processed_tiles.jsonl')
+        True
+    """
+    run_dir = Path(shard["run_dir"])
+    shard_idx = int(shard["shard_id"])
+    processed_path = _processed_tiles_path(run_dir)
+    run_log_path = _run_log_path(run_dir)
+    shard["processed_tiles_path"] = str(processed_path)
+    shard["run_log_path"] = str(run_log_path)
+    shard["run_dir_exists"] = run_dir.exists()
+    if "worker_stdout_path" not in shard:
+        shard["worker_stdout_path"] = None
+    if "worker_stderr_path" not in shard:
+        shard["worker_stderr_path"] = None
+    if "last_worker_job_id" not in shard:
+        shard["last_worker_job_id"] = None
+
+    last_job_id = shard.get("last_worker_job_id")
+    if last_job_id and not shard.get("worker_stdout_path"):
+        shard["worker_stdout_path"] = _worker_log_path(
+            orchestration_root,
+            str(last_job_id),
+            shard_idx,
+            "out",
+        )
+    if last_job_id and not shard.get("worker_stderr_path"):
+        shard["worker_stderr_path"] = _worker_log_path(
+            orchestration_root,
+            str(last_job_id),
+            shard_idx,
+            "err",
+        )
+
+    worker_stdout = (
+        Path(shard["worker_stdout_path"]) if shard.get("worker_stdout_path") else None
+    )
+    worker_stderr = (
+        Path(shard["worker_stderr_path"]) if shard.get("worker_stderr_path") else None
+    )
+    worker_logs_present = any(
+        path is not None and path.exists() for path in (worker_stdout, worker_stderr)
+    )
+    shard["worker_logs_present"] = worker_logs_present
+
+    if int(shard.get("done_tiles", 0)) >= int(shard.get("expected_tiles", 0)):
+        shard["last_failure_source"] = None
+        shard["last_failure_reason"] = None
+        return
+
+    candidates = [
+        ("worker_stderr", worker_stderr),
+        ("worker_stdout", worker_stdout),
+        ("run_log", run_log_path),
+    ]
+    for source, path in candidates:
+        if path is None:
+            continue
+        excerpt = _tail_log_excerpt(path)
+        if excerpt:
+            shard["last_failure_source"] = source
+            shard["last_failure_reason"] = excerpt
+            return
+
+    shard["last_failure_source"] = "status"
+    shard["last_failure_reason"] = (
+        "run_dir_missing" if not run_dir.exists() else "no_worker_logs_found"
+    )
+
+
+def _apply_worker_submission_metadata(
+    *,
+    status: dict[str, Any],
+    orchestration_root: Path,
+    shard_indices: list[int],
+    worker_job_id: str | None,
+) -> None:
+    """Attach worker-job metadata to the affected shard status entries.
+
+    Examples:
+        >>> status = {'shards': [{'shard_id': 0, 'run_dir': '/tmp/run'}]}
+        >>> _apply_worker_submission_metadata(
+        ...     status=status,
+        ...     orchestration_root=Path('/tmp/root'),
+        ...     shard_indices=[0],
+        ...     worker_job_id='7',
+        ... )
+        >>> status['shards'][0]['last_worker_job_id']
+        '7'
+    """
+    target_ids = {int(idx) for idx in shard_indices}
+    for shard in status.get("shards", []):
+        if int(shard["shard_id"]) not in target_ids:
+            continue
+        shard_idx = int(shard["shard_id"])
+        shard["last_worker_job_id"] = worker_job_id
+        shard["worker_stdout_path"] = _worker_log_path(
+            orchestration_root, worker_job_id, shard_idx, "out"
+        )
+        shard["worker_stderr_path"] = _worker_log_path(
+            orchestration_root, worker_job_id, shard_idx, "err"
+        )
+        shard["worker_logs_present"] = False
+        shard["last_failure_source"] = None
+        shard["last_failure_reason"] = None
 
 
 def _write_shard_configs(
@@ -294,15 +523,25 @@ def _initial_status(
     """
     shards = []
     for idx, shard_file in enumerate(shard_files):
+        run_dir = _expected_run_dir(orchestration_root, idx)
         shards.append(
             {
                 "shard_id": idx,
                 "tiles_file": str(shard_file),
-                "run_dir": str(_expected_run_dir(orchestration_root, idx)),
+                "run_dir": str(run_dir),
+                "processed_tiles_path": str(_processed_tiles_path(run_dir)),
+                "run_log_path": str(_run_log_path(run_dir)),
                 "expected_tiles": len(_load_tiles(shard_file)),
                 "done_tiles": 0,
                 "retry_count": 0,
                 "status": "pending",
+                "last_worker_job_id": None,
+                "worker_stdout_path": None,
+                "worker_stderr_path": None,
+                "worker_logs_present": False,
+                "run_dir_exists": False,
+                "last_failure_source": None,
+                "last_failure_reason": None,
             }
         )
     return {
@@ -334,8 +573,34 @@ def _refresh_status(orchestration_root: Path) -> dict[str, Any]:
             if shard["done_tiles"] >= int(shard["expected_tiles"])
             else "incomplete"
         )
+        _update_shard_diagnostics(shard=shard, orchestration_root=orchestration_root)
     _write_json(status_path, status)
     return status
+
+
+def _incomplete_shard_payload(shard: dict[str, Any]) -> dict[str, Any]:
+    """Build the failure-oriented summary for one incomplete shard.
+
+    Examples:
+        >>> payload = _incomplete_shard_payload({'shard_id': 1, 'done_tiles': 0, 'expected_tiles': 2})
+        >>> payload['shard_id']
+        1
+    """
+    return {
+        "shard_id": shard["shard_id"],
+        "done_tiles": shard["done_tiles"],
+        "expected_tiles": shard["expected_tiles"],
+        "run_dir": shard.get("run_dir"),
+        "processed_tiles_path": shard.get("processed_tiles_path"),
+        "run_log_path": shard.get("run_log_path"),
+        "worker_stdout_path": shard.get("worker_stdout_path"),
+        "worker_stderr_path": shard.get("worker_stderr_path"),
+        "last_worker_job_id": shard.get("last_worker_job_id"),
+        "run_dir_exists": shard.get("run_dir_exists"),
+        "worker_logs_present": shard.get("worker_logs_present"),
+        "last_failure_source": shard.get("last_failure_source"),
+        "last_failure_reason": shard.get("last_failure_reason"),
+    }
 
 
 def _array_spec(indices: list[int]) -> str:
@@ -537,10 +802,12 @@ def launch_orchestration(
         {
             "base_config_path": str(base_config_path),
             "config_paths": [str(path) for path in config_paths],
+            "repo_root": str(REPO_ROOT),
             "run_dirs": [
                 str(_expected_run_dir(orchestration_root, idx))
                 for idx in range(len(shard_files))
             ],
+            "worker_log_dir": str(orchestration_root / "slurm"),
             "slurm_scripts": {key: str(path) for key, path in slurm_scripts.items()},
         }
     )
@@ -558,6 +825,12 @@ def launch_orchestration(
     )
     logger.info("orchestrate: worker submission=%s", worker_submission)
     status["worker_job_ids"].append(worker_submission["job_id"])
+    _apply_worker_submission_metadata(
+        status=status,
+        orchestration_root=orchestration_root,
+        shard_indices=list(range(len(shard_files))),
+        worker_job_id=worker_submission["job_id"],
+    )
     watchdog_args = []
     if worker_submission["job_id"] is not None:
         watchdog_args = ["--dependency", f"afterany:{worker_submission['job_id']}"]
@@ -598,12 +871,20 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
     ]
     for shard in status["shards"]:
         logger.info(
-            "watchdog: shard=%03d done=%s expected=%s retries=%s status=%s",
+            (
+                "watchdog: shard=%03d done=%s expected=%s retries=%s status=%s "
+                "run_dir_exists=%s worker_logs_present=%s "
+                "failure_source=%s failure_reason=%s"
+            ),
             int(shard["shard_id"]),
             int(shard["done_tiles"]),
             int(shard["expected_tiles"]),
             int(shard["retry_count"]),
             shard["status"],
+            bool(shard.get("run_dir_exists")),
+            bool(shard.get("worker_logs_present")),
+            shard.get("last_failure_source"),
+            shard.get("last_failure_reason"),
         )
     if not incomplete:
         verify_submission = _submit_sbatch(
@@ -634,6 +915,15 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
     if not retryable:
         status["state"] = "failed_incomplete"
         _write_json(orchestration_root / "status.json", status)
+        _write_json(
+            orchestration_root / "final_status.json",
+            {
+                "status": "failed_incomplete",
+                "incomplete_shards": [
+                    _incomplete_shard_payload(shard) for shard in incomplete
+                ],
+            },
+        )
         logger.error(
             "watchdog: retry budget exhausted incomplete=%s",
             [int(shard["shard_id"]) for shard in incomplete],
@@ -652,6 +942,12 @@ def run_watchdog(*, orchestration_root: Path, dry_run: bool) -> None:
         dry_run=dry_run,
     )
     status["worker_job_ids"].append(worker_submission["job_id"])
+    _apply_worker_submission_metadata(
+        status=status,
+        orchestration_root=orchestration_root,
+        shard_indices=retry_indices,
+        worker_job_id=worker_submission["job_id"],
+    )
     watchdog_args = []
     if worker_submission["job_id"] is not None:
         watchdog_args = ["--dependency", f"afterany:{worker_submission['job_id']}"]
@@ -697,12 +993,7 @@ def run_verify_merge(*, orchestration_root: Path) -> None:
         payload = {
             "status": "failed_incomplete",
             "incomplete_shards": [
-                {
-                    "shard_id": shard["shard_id"],
-                    "done_tiles": shard["done_tiles"],
-                    "expected_tiles": shard["expected_tiles"],
-                }
-                for shard in incomplete
+                _incomplete_shard_payload(shard) for shard in incomplete
             ],
         }
         _write_json(final_status_path, payload)

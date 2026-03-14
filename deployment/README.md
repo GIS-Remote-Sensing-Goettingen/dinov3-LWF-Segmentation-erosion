@@ -20,6 +20,7 @@ What it does:
 - writes one shard file per worker
 - writes one shard-specific config file per worker
 - renders worker, watchdog, and verify/merge Slurm scripts from `silver_set.sh`
+- pins generated Slurm scripts to the current repository checkout instead of trusting a hard-coded template `cd`
 - submits one Slurm job array for shard workers
 - submits a dependent watchdog job
 - resubmits only incomplete shards
@@ -91,7 +92,7 @@ output/shards/folder1_4way/
 
 Important contents:
 - `manifest.json`: static shard/config/script metadata
-- `status.json`: evolving orchestration state
+- `status.json`: evolving orchestration state plus per-shard diagnostics
 - `submission.json`: submitted job ids and sbatch commands
 - `final_status.json`: final verification result
 - `configs/shard_XXX.yml`: generated shard-specific configs
@@ -116,6 +117,12 @@ So if a shard does not finish all its tiles, the watchdog resubmits that shard i
 
 This is the safe model for this repository. The orchestrator does **not** run duplicate workers on the same shard concurrently.
 
+For debugging, each shard status record now also tracks:
+- the current shard run dir and its `processed_tiles.jsonl` / `run.log`
+- the latest known worker stdout/stderr paths under `slurm/worker_<job>_<shard>.out|err`
+- whether the run dir or worker logs exist yet
+- a short last-known failure hint pulled from worker stderr/stdout or `run.log`
+
 ## Verification model
 
 The orchestrator does not block locally waiting for the full campaign to finish.
@@ -130,7 +137,7 @@ Instead:
 If any shard is still incomplete after the retry budget is exhausted:
 - the workflow stops
 - merge is not performed
-- `final_status.json` records failure
+- `final_status.json` records failure plus the last-known per-shard diagnostics
 
 ## Config behavior
 
@@ -149,3 +156,5 @@ python -u ./main.py --config <generated-config>
 ```
 
 This keeps the worker runs explicit, reproducible, and isolated.
+
+Generated worker scripts still inherit scheduler and environment setup from the template, but the orchestrator now renders the repository root explicitly before launching Python so a stale template checkout path cannot silently break every shard.

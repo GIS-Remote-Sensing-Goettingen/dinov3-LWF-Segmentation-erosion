@@ -57,6 +57,8 @@ def _write_template(path: Path) -> None:
                 "#SBATCH --error=segmentation_%j.err",
                 "",
                 "set -euo pipefail",
+                'cd "${SLURM_SUBMIT_DIR:-$PWD}"',
+                " cd /user/davide.mattioli/u20330/dinov3-LWF-Segmentation-erosion",
                 "python -u ./main.py",
                 "",
             ]
@@ -160,7 +162,13 @@ def test_launch_orchestration_dry_run_writes_configs_and_scripts(tmp_path, monke
     assert shard_cfg["runtime"]["resume_run"] is True
     assert shard_cfg["runtime"]["run_dir"].endswith("runs/shard_000")
     worker_script = (root / "slurm" / "worker_array.sh").read_text(encoding="utf-8")
+    assert f"REPO_ROOT={_ORCH_MODULE.REPO_ROOT}" in worker_script
+    assert 'cd "${REPO_ROOT}"' in worker_script
     assert "--config" in worker_script
+    assert (
+        "cd /user/davide.mattioli/u20330/dinov3-LWF-Segmentation-erosion"
+        not in worker_script
+    )
     submission = json.loads((root / "submission.json").read_text(encoding="utf-8"))
     assert submission["dry_run"] is True
     assert submission["worker_submission"]["command"][0] == "sbatch"
@@ -257,6 +265,9 @@ def test_watchdog_resubmits_only_incomplete_shards(tmp_path, monkeypatch):
     status = json.loads((root / "status.json").read_text(encoding="utf-8"))
     shard_one = next(shard for shard in status["shards"] if shard["shard_id"] == 1)
     assert shard_one["retry_count"] == 1
+    assert shard_one["last_worker_job_id"] == "101"
+    assert shard_one["worker_stderr_path"].endswith("worker_101_1.err")
+    assert shard_one["worker_stdout_path"].endswith("worker_101_1.out")
 
 
 def test_verify_merge_requires_completion_and_writes_final_status(tmp_path):
@@ -416,6 +427,74 @@ def test_watchdog_fails_when_retry_budget_is_exhausted(tmp_path):
     """
     root = tmp_path / "orchestration"
     _write_fake_shards(root, 1)
+    slurm_dir = root / "slurm"
+    slurm_dir.mkdir(parents=True, exist_ok=True)
+    worker_err = slurm_dir / "worker_700_0.err"
+    worker_err.write_text(
+        (
+            "bash: line 27: cd: "
+            "/user/davide.mattioli/u20330/dinov3-LWF-Segmentation-erosion: "
+            "No such file or directory\n"
+        ),
+        encoding="utf-8",
+    )
+    _ORCH_MODULE._write_json(
+        root / "manifest.json",
+        {"slurm_scripts": {"worker": "", "watchdog": "", "verify_merge": ""}},
+    )
+    _ORCH_MODULE._write_json(
+        root / "status.json",
+        {
+            "max_retries": 0,
+            "shards": [
+                {
+                    "shard_id": 0,
+                    "tiles_file": str(root / "tiles_shard_000.txt"),
+                    "run_dir": str(root / "runs" / "shard_000"),
+                    "expected_tiles": 2,
+                    "done_tiles": 0,
+                    "retry_count": 0,
+                    "status": "pending",
+                    "last_worker_job_id": "700",
+                    "worker_stdout_path": str(slurm_dir / "worker_700_0.out"),
+                    "worker_stderr_path": str(worker_err),
+                }
+            ],
+            "worker_job_ids": [],
+            "watchdog_job_ids": [],
+            "merge_job_id": None,
+            "state": "submitted",
+        },
+    )
+
+    try:
+        run_watchdog(orchestration_root=root, dry_run=False)
+    except SystemExit as exc:
+        assert "retry limit" in str(exc)
+    else:
+        raise AssertionError("expected exhausted retry budget to stop the watchdog")
+
+    status = json.loads((root / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "failed_incomplete"
+    shard = status["shards"][0]
+    assert shard["last_failure_source"] == "worker_stderr"
+    assert "No such file or directory" in shard["last_failure_reason"]
+    final_status = json.loads((root / "final_status.json").read_text(encoding="utf-8"))
+    assert final_status["status"] == "failed_incomplete"
+    assert (
+        final_status["incomplete_shards"][0]["last_failure_source"] == "worker_stderr"
+    )
+
+
+def test_watchdog_marks_missing_run_dir_when_logs_are_absent(tmp_path):
+    """Watchdog should record a startup hint when a shard never created its run dir.
+
+    Examples:
+        >>> True
+        True
+    """
+    root = tmp_path / "orchestration"
+    _write_fake_shards(root, 1)
     _ORCH_MODULE._write_json(
         root / "manifest.json",
         {"slurm_scripts": {"worker": "", "watchdog": "", "verify_merge": ""}},
@@ -450,7 +529,11 @@ def test_watchdog_fails_when_retry_budget_is_exhausted(tmp_path):
         raise AssertionError("expected exhausted retry budget to stop the watchdog")
 
     status = json.loads((root / "status.json").read_text(encoding="utf-8"))
-    assert status["state"] == "failed_incomplete"
+    shard = status["shards"][0]
+    assert shard["run_dir_exists"] is False
+    assert shard["worker_logs_present"] is False
+    assert shard["last_failure_source"] == "status"
+    assert shard["last_failure_reason"] == "run_dir_missing"
 
 
 def test_verify_merge_fails_and_writes_status_when_incomplete(tmp_path):
@@ -493,3 +576,6 @@ def test_verify_merge_fails_and_writes_status_when_incomplete(tmp_path):
 
     final_status = json.loads((root / "final_status.json").read_text(encoding="utf-8"))
     assert final_status["status"] == "failed_incomplete"
+    assert final_status["incomplete_shards"][0]["run_dir"] == str(
+        root / "runs" / "shard_000"
+    )

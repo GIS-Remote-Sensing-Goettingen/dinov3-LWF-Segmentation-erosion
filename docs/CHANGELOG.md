@@ -45,6 +45,11 @@
 - Reason: Large folder runs spent noticeable time in tile discovery and source-label filtering with no visible progress, which made the launcher look hung even when it was working normally.
 - Problems fixed: Deployment startup now logs shard-build phases, periodic source-label filter progress, shard file creation, and Slurm submission/watchdog/verify stages so operators can see where time is going during orchestration.
 
+- Description: Harden shard worker launch scripts against stale checkout paths and persist per-shard failure hints in orchestration status files.
+- Files touched: `deployment/orchestrate_sharded_inference.py`, `deployment/README.md`, `silver_set.sh`, `tests/test_orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
+- Reason: A cluster shard campaign failed with zero completed tiles because generated worker scripts inherited a stale hard-coded repo `cd` from the Slurm template, and the watchdog only reported `done=0` without enough context to identify the startup failure quickly.
+- Problems fixed: Generated worker/watchdog/verify scripts now pin themselves to the current repo root instead of trusting template-specific checkout paths, the shared `silver_set.sh` template no longer hard-codes `/user/...`, `status.json` / `final_status.json` now record the latest worker stdout/stderr paths plus a concise last-known failure reason for incomplete shards, and exhausted retries fail with enough artifact metadata to debug the next issue without hunting across multiple logs.
+
 - Description: Deepen holdout-performance diagnostics by splitting `load_context` into child spans, instrumenting the roads-mask path, and adding analyzer `--focus` filtering for targeted bottleneck inspection.
 - Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `segedge/pipeline/runtime/tile_context.py`, `scripts/analyze_performance_log.py`, `tests/test_performance_logging.py`, `tests/test_analyze_performance_log.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: Recent performance logs still had pathological `load_context` outliers, but the old logging could not attribute them to roads-mask work, tile-context work, or other wrapper overhead precisely enough to guide the next optimization pass.
