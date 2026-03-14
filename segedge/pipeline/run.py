@@ -11,7 +11,7 @@ from typing import Callable
 
 import yaml
 
-from ..core.config_loader import cfg
+from ..core.config_loader import cfg, get_loaded_config_path
 from ..core.io_utils import (
     append_mask_to_union_shapefile,
     backup_union_shapefile,
@@ -73,9 +73,13 @@ def _create_run_directories() -> dict[str, str]:
     output_root = cfg.io.paths.output_dir
     os.makedirs(output_root, exist_ok=True)
 
+    fixed_run_dir = cfg.runtime.run_dir
     resume_run = bool(cfg.runtime.resume_run)
     resume_dir = cfg.runtime.resume_run_dir
-    if resume_run:
+    if fixed_run_dir:
+        run_dir = fixed_run_dir
+        logger.info("fixed run dir: %s", run_dir)
+    elif resume_run:
         if not resume_dir:
             raise ValueError("RESUME_RUN_DIR must be set when RESUME_RUN=True")
         if not os.path.isdir(resume_dir):
@@ -116,9 +120,7 @@ def _create_run_directories() -> dict[str, str]:
         os.path.join(run_dir, "performance.jsonl"),
         run_id=os.path.basename(run_dir),
     )
-    config_snapshot_src = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.yml"
-    )
+    config_snapshot_src = get_loaded_config_path()
     config_snapshot_dst = os.path.join(run_dir, "config.yml")
     if os.path.exists(config_snapshot_src):
         shutil.copyfile(config_snapshot_src, config_snapshot_dst)
@@ -396,6 +398,12 @@ def _initialize_union_state(
         ref_path: str,
         step: int,
     ) -> None:
+        """Append one stage mask into the rolling union target.
+
+        Examples:
+            >>> callable(_append_union)
+            True
+        """
         state = union_states[variant]
         union_path = str(state["path"])
         backup_dir = str(state["backup_dir"])
@@ -433,6 +441,7 @@ def _resolve_tile_sets(
     inference_glob = "*.tif"
     if not training_enabled:
         holdout_tiles, inference_dir, inference_glob = resolve_inference_tiles(
+            infer_tiles_file=cfg.io.inference.tiles_file,
             infer_tiles_dir=cfg.io.inference.tiles_dir,
             infer_tile_glob=cfg.io.inference.tile_glob,
             infer_tiles=list(cfg.io.inference.tiles),
@@ -489,6 +498,7 @@ def _resolve_tile_sets(
     source_tiles = list(cfg.io.paths.source_tiles or [cfg.io.paths.source_tile])
     val_tiles = list(cfg.io.paths.val_tiles)
     holdout_tiles, inference_dir, inference_glob = resolve_inference_tiles(
+        infer_tiles_file=cfg.io.inference.tiles_file,
         infer_tiles_dir=cfg.io.inference.tiles_dir,
         infer_tile_glob=cfg.io.inference.tile_glob,
         infer_tiles=list(cfg.io.inference.tiles),

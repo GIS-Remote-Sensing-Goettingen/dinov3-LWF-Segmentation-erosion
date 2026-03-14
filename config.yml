@@ -9,13 +9,15 @@ io:
     # In inference-only mode, load a previously saved model bundle from here.
   # if null it will load the previous run bundle  if it exists.
     model_bundle_dir: null
+    # Optional one-tile-per-line shard file. When set, it overrides tiles_dir and tiles.
+    tiles_file: null
     # Optional inference tile directory for both modes.
     tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
     tile_glob: "*.tif"
     # Optional explicit tile list fallback when tiles_dir is null.
     tiles: []
     # Render plots every N pending inference tiles. 1 means every tile.
-    plot_every: 1
+    plot_every: 20
     plots:
       unified: true
       qualitative_core: false
@@ -265,6 +267,7 @@ runtime:
   # Persist final holdout / inference-only feature caches to disk.
   cache_inference_features: false
   feature_batch_size: 12
+  run_dir: null
   resume_run: false
   resume_run_dir: null
   union_backup_every: 10

@@ -6,6 +6,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ## Repository Layout
 - `main.py`: thin CLI wrapper; imports and calls `segedge.pipeline.run.main()`.
 - `config.yml`: typed runtime configuration source.
+- `deployment/`: cluster-facing orchestration helpers such as shard-file generation, shard-union merge, the Slurm shard launcher, and the simpler batch-per-job launcher.
 - `segedge/core/`: model-facing logic, feature construction, I/O, plotting, metrics, and config loading.
 - `segedge/core/feature_ops/`: feature extraction, tiling, cache I/O, and hybrid feature fusion.
 - `segedge/core/features.py`: compatibility export layer for `feature_ops`.
@@ -21,6 +22,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ## Runtime Layers
 ### Entrypoint
 - `main.py` exists only to keep the CLI stable.
+- it now also accepts `--config <path>` so generated shard workers can run against explicit config copies instead of the repo root `config.yml`
 - `segedge.pipeline.run.main()` owns run-directory creation, logging setup, resume state loading, time-budget initialization, tile resolution, feature-cache mode selection, and workflow dispatch.
   - training and final inference now resolve feature-cache persistence separately, so one-shot inference can run without building disk cache while training/tuning still keeps reusable feature artifacts.
 
@@ -30,6 +32,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
   - validates runtime compatibility
   - writes inference settings
   - runs holdout inference with rolling checkpoints
+  - can now take an exact one-tile-per-line shard file via `io.inference.tiles_file`, which bypasses folder globbing and source-label refiltering inside the worker run
 - `workflows/manual_training.py`:
   - builds artifacts from explicit source tiles
   - tunes on explicit validation tiles
@@ -49,12 +52,14 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `runtime/checkpointing.py`: writes `rolling_best_setting.yml`.
 - `runtime/time_budget.py`: computes deadlines, remaining time, and serialized budget state.
 - `runtime/roads.py`: cached road-mask rasterization and roads-penalty scoring.
+  - roads-mask timing is now decomposed into cache lookup/load, STRtree query, candidate filtering, rasterization, resize, and cache-write spans so slow tiles can be attributed to specific roads-mask work.
 - `runtime/postprocess.py`: shadow filtering and novel-proposal heuristics.
 - `runtime/crf_eval.py`: CRF worker initialization and config evaluation.
   - XGB CRF can now use a trimap-band unary that treats the current XGB mask as strong interior foreground, a boundary ring as uncertain, and the far exterior as background.
   - Optional `postprocess.fill_holes_xgb` fills enclosed holes in the thresholded XGB mask before trimap CRF builds that boundary ring.
 - `runtime/tile_context.py`: tile image/label/GT loading and SH-buffer preparation.
   - source-label loading now reuses cached raster handles and prefers aligned window reads over full temporary-dataset reprojection when the tile grid matches the label grid.
+  - tile-context spans now emit source-label, GT, and SH-buffer coverage metadata so `load_context` outliers can be compared against actual workload size.
 - `runtime/phase_metrics.py`: phase logging and summary aggregation.
   - inference now also writes structured timing spans into `performance.jsonl` so tile-level and function-internal bottlenecks can be analyzed separately from `run.log`.
 
@@ -79,11 +84,13 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 5. The selected workflow builds or loads model state, writes settings/checkpoint metadata, and invokes holdout inference when tiles are available.
 6. Holdout inference updates union shapefiles and processed-tile logs tile by tile, so partial runs keep usable outputs.
 7. Disk feature caches are consolidated after successful workflows that need them.
+8. Large folder inference can be parallelized either by building shard tile files once and launching one array task per shard, or by building fixed-size batch tile files and launching one ordinary Slurm job per batch; both models retry incomplete runs against the same fixed run directories and merge the resulting union families after verification succeeds.
 
 ## Outputs
 - `output/run_*/run.log`: main runtime log.
 - `output/run_*/performance.jsonl`: structured per-span performance log with tile and phase context plus rolling summaries.
   - feature-prefetch spans now include cache hit counts plus approximate feature/manifest bytes read and written, so disk-cache cost is visible in profiling output.
+  - holdout context loading now records child spans for `load_holdout_tile_context`, `resolve_runtime_toggles`, `load_roads_mask`, and `finalize_context`, plus workload metadata such as source-label, roads, and SH-buffer coverage.
 - `output/run_*/rolling_best_setting.yml`: interruption-safe best-known config and progress state.
 - `output/run_*/processed_tiles.jsonl`: append-only holdout completion log.
 - `output/run_*/plots/validation/`: validation-stage plots.
@@ -91,6 +98,8 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `output/run_*/shapes/unions/.../union.shp`: rolling union shapefiles for `raw`, `crf`, `shadow`, and `shadow_with_proposals`.
 - `output/run_*/inference_best_setting.yml` and `output/run_*/best_setting.yml`: exported run settings.
 - `output/run_*/model_bundle/`: optional inference bundle when bundle saving is enabled.
+- `output/shards/<job_name>/`: optional shard manifests, per-shard configs, rendered Slurm scripts, retry/verification status files, and merged unions created by the Slurm orchestration flow.
+- `output/batches/<job_name>/`: optional batch manifests, per-batch configs, one-worker-per-batch Slurm scripts, controller status files, and merged unions created by the simpler Slurm batching flow.
 
 ## Major Runtime Functions
 - `segedge.pipeline.run.main`: bootstrap, resolve runtime mode, dispatch workflow, and finalize cache consolidation.

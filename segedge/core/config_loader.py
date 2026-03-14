@@ -8,6 +8,7 @@ Examples:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ import numpy as np
 import yaml
 
 logger = logging.getLogger(__name__)
+_ACTIVE_CONFIG_PATH: str | None = None
 
 
 @dataclass
@@ -106,6 +108,7 @@ class IOInferenceConfig:
     """Inference-only execution and model-bundle settings."""
 
     model_bundle_dir: str | None
+    tiles_file: str | None
     tiles_dir: str | None
     tile_glob: str
     tiles: list[str]
@@ -353,6 +356,7 @@ class RuntimeConfig:
     cache_training_features: bool
     cache_inference_features: bool
     feature_batch_size: int
+    run_dir: str | None
     resume_run: bool
     resume_run_dir: str | None
     union_backup_every: int
@@ -519,6 +523,11 @@ def _load_io_config(io: dict[str, Any]) -> IOConfig:
             model_bundle_dir=(
                 str(io_inference["model_bundle_dir"])
                 if io_inference.get("model_bundle_dir") is not None
+                else None
+            ),
+            tiles_file=(
+                str(io_inference["tiles_file"])
+                if io_inference.get("tiles_file") is not None
                 else None
             ),
             tiles_dir=(
@@ -968,6 +977,9 @@ def _load_runtime_config(runtime: dict[str, Any]) -> RuntimeConfig:
         cache_training_features=cache_training_features,
         cache_inference_features=cache_inference_features,
         feature_batch_size=int(runtime["feature_batch_size"]),
+        run_dir=(
+            str(runtime["run_dir"]) if runtime.get("run_dir") is not None else None
+        ),
         resume_run=bool(runtime["resume_run"]),
         resume_run_dir=(
             str(runtime["resume_run_dir"])
@@ -1048,14 +1060,16 @@ def _validate_loaded_config(config: Config) -> None:
         raise ValueError("'io.inference.plot_every' must be > 0")
     if not config.io.training:
         has_inference_tiles = bool(
-            config.io.inference.tiles_dir
+            config.io.inference.tiles_file
+            or config.io.inference.tiles_dir
             or config.io.inference.tiles
             or config.io.paths.inference_dir
             or config.io.paths.holdout_tiles
         )
         if not has_inference_tiles:
             raise ValueError(
-                "set inference tiles via io.inference.tiles_dir/io.inference.tiles "
+                "set inference tiles via io.inference.tiles_file/"
+                "io.inference.tiles_dir/io.inference.tiles "
                 "or legacy io.paths.inference_dir/io.paths.holdout_tiles "
                 "when io.training=false"
             )
@@ -1064,7 +1078,9 @@ def _validate_loaded_config(config: Config) -> None:
 def load_config(path: str | Path | None = None) -> Config:
     """Load the repository config YAML into a typed config object."""
     if path is None:
-        path = Path(__file__).resolve().parents[2] / "config.yml"
+        path = os.environ.get("SEGEDGE_CONFIG") or (
+            Path(__file__).resolve().parents[2] / "config.yml"
+        )
     cfg_path = Path(path)
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     root = _require_mapping(raw, "root")
@@ -1081,7 +1097,21 @@ def load_config(path: str | Path | None = None) -> Config:
         runtime=_load_runtime_config(_require_mapping(root["runtime"], "runtime")),
     )
     _validate_loaded_config(config)
+    global _ACTIVE_CONFIG_PATH
+    _ACTIVE_CONFIG_PATH = str(cfg_path)
     return config
+
+
+def get_loaded_config_path() -> str:
+    """Return the config file path active for the current process.
+
+    Examples:
+        >>> isinstance(get_loaded_config_path(), str)
+        True
+    """
+    if _ACTIVE_CONFIG_PATH is None:
+        raise RuntimeError("config path is not initialized")
+    return _ACTIVE_CONFIG_PATH
 
 
 cfg = load_config()

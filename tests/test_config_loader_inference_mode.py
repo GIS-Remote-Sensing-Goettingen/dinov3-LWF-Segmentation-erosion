@@ -56,6 +56,7 @@ def test_inference_group_defaults_are_applied(tmp_path):
     loaded = load_config(cfg_path)
     assert loaded.io.training is True
     assert loaded.io.inference.model_bundle_dir is None
+    assert loaded.io.inference.tiles_file is None
     assert loaded.io.inference.tile_glob == "*.tif"
     assert loaded.io.inference.tiles == []
     assert loaded.io.inference.plot_every == 1
@@ -175,6 +176,23 @@ def test_inference_plot_toggles_parse_from_config(tmp_path):
     assert loaded.io.inference.plots.proposal_overlay is True
 
 
+def test_inference_tiles_file_parses_from_config(tmp_path):
+    """io.inference.tiles_file should parse when explicitly configured.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["io"].setdefault("inference", {})
+    raw["io"]["inference"]["tiles_file"] = "/tmp/shards/tiles_shard_000.txt"
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.io.inference.tiles_file == "/tmp/shards/tiles_shard_000.txt"
+
+
 def test_runtime_cache_phase_toggles_parse_from_config(tmp_path):
     """Runtime cache booleans should parse explicitly for train/infer phases.
 
@@ -191,6 +209,22 @@ def test_runtime_cache_phase_toggles_parse_from_config(tmp_path):
 
     assert loaded.runtime.cache_training_features is False
     assert loaded.runtime.cache_inference_features is True
+
+
+def test_runtime_run_dir_parses_from_config(tmp_path):
+    """runtime.run_dir should parse when explicitly configured.
+
+    Examples:
+        >>> True
+        True
+    """
+    raw = _load_repo_config()
+    raw["runtime"]["run_dir"] = "/tmp/fixed_run_dir"
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    loaded = load_config(cfg_path)
+
+    assert loaded.runtime.run_dir == "/tmp/fixed_run_dir"
 
 
 def test_legacy_runtime_feature_cache_mode_maps_to_phase_toggles(tmp_path):

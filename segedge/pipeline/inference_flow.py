@@ -14,8 +14,24 @@ from .common import filter_tiles_by_source_label_presence
 from .runtime_utils import _update_phase_metrics, infer_on_holdout
 
 
+def _load_inference_tiles_file(path: str) -> list[str]:
+    """Load one tile path per line from a shard or explicit tiles file.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.NamedTemporaryFile("w+", delete=False) as fh:
+        ...     _ = fh.write("a.tif\\n\\n b.tif \\n")
+        ...     file_path = fh.name
+        >>> _load_inference_tiles_file(file_path)
+        ['a.tif', 'b.tif']
+    """
+    with open(path, encoding="utf-8") as fh:
+        return [line.strip() for line in fh if line.strip()]
+
+
 def resolve_inference_tiles(
     *,
+    infer_tiles_file: str | None,
     infer_tiles_dir: str | None,
     infer_tile_glob: str | None,
     infer_tiles: list[str],
@@ -30,6 +46,17 @@ def resolve_inference_tiles(
         >>> callable(resolve_inference_tiles)
         True
     """
+    if infer_tiles_file:
+        if not os.path.isfile(infer_tiles_file):
+            raise ValueError(f"inference tiles_file not found: {infer_tiles_file}")
+        tiles = _load_inference_tiles_file(infer_tiles_file)
+        logger.info(
+            "inference tiles file: %s -> %s tiles",
+            infer_tiles_file,
+            len(tiles),
+        )
+        return tiles, None, str(infer_tile_glob or legacy_inference_glob or "*.tif")
+
     tiles_dir = infer_tiles_dir or legacy_inference_dir
     tile_glob = str(infer_tile_glob or legacy_inference_glob or "*.tif")
     explicit_tiles = list(infer_tiles or [])

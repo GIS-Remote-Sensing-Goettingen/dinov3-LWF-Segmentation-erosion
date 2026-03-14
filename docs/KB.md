@@ -21,6 +21,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - Uses `io.inference.model_bundle_dir` when set.
 - If `io.inference.model_bundle_dir` is `null`, the pipeline resolves the newest valid previous `output/run_*/model_bundle`.
 - Resolves inference tiles from `io.inference.*` or legacy inference config.
+- `io.inference.tiles_file` can override the folder/list inputs with an exact one-tile-per-line shard list.
 - Skips training and goes directly to holdout inference.
 
 ### Manual training
@@ -55,6 +56,8 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - Inference no longer writes per-image proposal shapefiles or proposal CSVs; accepted proposals are folded into the rolling `shadow_with_proposals` union instead.
 - The unified inference plot labels the source-label panel as `Administrative buffered labels` and no longer includes separate RGB or GT panels.
 - Each `output/run_*/` directory now contains a copy of the active `config.yml`.
+- For multi-job folder inference, the safe pattern is one run directory per shard plus a later merge of the shard union shapefiles; do not point multiple jobs at the same run/output directory.
+- `runtime.run_dir` can pin a run to one fixed directory; the Slurm shard orchestrator uses this together with resume mode so retries continue the same shard instead of creating a new `run_*`.
 - `search.crf.trimap_band_pixels_values` controls how far XGB CRF is allowed to expand/shrink the coarse XGB mask boundary when filling holes against RGB edges.
 - `postprocess.fill_holes_xgb` fills enclosed holes in the thresholded XGB mask before XGB trimap CRF builds its boundary band.
 - Outside-buffer novel proposals can now grant extra allowed width to strongly elongated shapes through `postprocess.novel_proposals.width_bonus_per_pca`, while `hard_width_cap_m` still blocks very wide blobs.
@@ -66,6 +69,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - Time-budget state is persisted in the rolling checkpoint and can trigger cutover behavior.
 - `runtime.cache_training_features` and `runtime.cache_inference_features` control disk persistence separately for training/validation vs final inference.
 - `performance.jsonl` now records cache-cost metadata for feature prefetch, including cached vs computed tile counts and approximate feature/manifest bytes read and written.
+- `performance.jsonl` now also breaks `infer_on_holdout::load_context` into child spans and records roads-mask cache/query/rasterization details plus source-label/SH-buffer coverage metadata, so slow tiles can be traced to one concrete preprocessing stage instead of one opaque bucket.
 
 ## Major Functions to know
 - `segedge.pipeline.run.main`: dispatcher and bootstrap.
@@ -97,3 +101,7 @@ For workflow and function-level behavior, read `docs/Implementation.md`.
 - `scripts/check_function_length.py`: function-size guard that ignores leading docstrings and doctests by excluding the full docstring block from the count
 - `python scripts/analyze_performance_log.py performance.jsonl --top 10 --tile-limit 5`: summarize inference-only stage/substage timings and the hottest traced tiles from a structured performance log; mixed train+infer logs default to `phase=holdout_inference` and exclude `tile=null` rows
 - `python scripts/analyze_performance_log.py performance.jsonl --phase all --include-tile-null --top 10`: inspect the full mixed log, including training/setup spans and tile-null records
+- `python scripts/analyze_performance_log.py performance.jsonl --focus load_context --top 10 --tile-limit 5`: isolate one stage family such as `load_context` or `roads_mask` when debugging a localized bottleneck cluster
+- `python deployment/build_inference_shards.py --shards 4 --job-name folder1_4way`: resolve the configured inference tiles once, apply the source-label filter once, and write deterministic round-robin shard files under `output/shards/`
+- `python deployment/merge_shard_unions.py --output-dir output/shards/folder1_4way_merged output/run_101 output/run_102 output/run_103 output/run_104`: merge the 4 union families from completed shard runs into one final union output
+- `python deployment/orchestrate_sharded_inference.py --job-name folder1_4way --shards 4 --template silver_set.sh`: build shard files/configs, render Slurm worker/watchdog/verify scripts from the template, submit the worker array, retry incomplete shards, and only merge after all shard runs verify as complete

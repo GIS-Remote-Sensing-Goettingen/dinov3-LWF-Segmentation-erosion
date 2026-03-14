@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Inference, tuning, and runtime stability
+- Description: Clip road geometries to the current tile bounds before building rasterization shapes for the roads-mask penalty path.
+- Files touched: `segedge/pipeline/runtime/roads.py`, `tests/test_performance_logging.py`, `docs/CHANGELOG.md`
+- Reason: Performance profiling showed a few cold-cache tiles spending several minutes rasterizing a single intersecting road geometry because the code was still burning the full geometry instead of the tile-local fragment.
+- Problems fixed: Roads-mask rasterization now uses tile-clipped geometries, which preserves the tile mask output while avoiding pathological full-geometry rasterization cost, and a regression test now pins that tile-local behavior.
+
+- Description: Add a simpler Slurm batch launcher that submits one ordinary job per fixed-size tile batch and uses a lightweight controller for retries and final merge.
+- Files touched: `deployment/launch_batched_inference.py`, `tests/test_launch_batched_inference.py`, `deployment/README.md`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`
+- Reason: The array-based shard launcher works, but a simpler one-job-per-batch workflow is easier to operate and debug on the cluster while preserving resumable fixed run directories and automatic retry/merge behavior.
+- Problems fixed: Large folder inference can now be launched as one worker script per 100-tile batch without Slurm arrays, retries still resume the same batch run directories, and the new controller job merges unions automatically once all batches complete.
+
 ### Documentation and repository health
 - Description: Move human-maintained repository docs under `docs/`, remove `journal.md`, expand workflow/function documentation, and add a function-length guard that excludes leading docstrings and doctests from its count.
 - Files touched: `AGENTS.md`, `docs/README.md`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`, `.pre-commit-config.yaml`, `scripts/check_function_length.py`, `tests/test_function_length.py`, `segedge/core/config_loader.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/workflows/loo_training.py`
@@ -15,6 +26,51 @@
 - Problems fixed: `run.py` is now a bootstrap/dispatch layer, runtime helpers are grouped by concern, feature operations are split into dedicated modules, and a dispatch test now pins the workflow selection behavior.
 
 ### Inference, tuning, and runtime stability
+- Description: Add shard-friendly inference inputs plus shard build/merge scripts for running one folder as multiple isolated inference jobs.
+- Files touched: `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/run.py`, `deployment/build_inference_shards.py`, `deployment/merge_shard_unions.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_inference_flow.py`, `tests/test_shard_scripts.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Large folder inference should be parallelized as independent shard runs instead of multiple writers racing on one run directory, one `processed_tiles.jsonl`, and the same rolling union shapefiles.
+- Problems fixed: `io.inference.tiles_file` can now feed an exact one-tile-per-line shard list into inference without re-running the folder filter, `build_inference_shards.py` writes deterministic round-robin shard files after applying the source-label filter once, and `merge_shard_unions.py` combines the 4 stage unions (`raw`, `crf`, `shadow`, `shadow_with_proposals`) from multiple shard runs into one final union family.
+
+- Description: Add a Slurm shard orchestrator that renders worker/watchdog/verify scripts from `silver_set.sh`, submits shard arrays, retries incomplete shards, and verifies completion before merging unions.
+- Files touched: `main.py`, `config.yml`, `segedge/core/config_loader.py`, `segedge/pipeline/run.py`, `deployment/build_inference_shards.py`, `deployment/merge_shard_unions.py`, `deployment/orchestrate_sharded_inference.py`, `tests/test_config_loader_inference_mode.py`, `tests/test_orchestrate_sharded_inference.py`, `tests/test_shard_scripts.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: The shard/merge model was in place, but operators still had to submit and monitor Slurm jobs manually and had no built-in retry or completion verification flow.
+- Problems fixed: `main.py` now supports explicit config-path execution for generated shard configs, `runtime.run_dir` can pin a shard to a fixed resumable run directory, the new deployment orchestrator submits one worker array plus watchdog/verify stages without modifying `silver_set.sh`, incomplete shards are resubmitted against the same run directories, and final union merge only happens after all shard tile counts verify cleanly.
+
+- Description: Add `deployment/README.md` documenting the shard deployment workflow, retry model, verification semantics, and generated outputs.
+- Files touched: `deployment/README.md`, `docs/CHANGELOG.md`
+- Reason: The deployment folder now contains the operational entrypoints for large Slurm-backed inference campaigns and needs a local README that explains how to use them without digging through implementation code.
+- Problems fixed: `deployment/` now documents the purpose of each deployment script, the fixed shard run directory model, the watchdog retry flow, the verification/merge behavior, and the exact orchestration directory layout written under `output/shards/<job_name>/`.
+
+- Description: Make deployment entrypoints runnable directly with `python deployment/...` by bootstrapping the repo root onto `sys.path` before importing `segedge`.
+- Files touched: `deployment/build_inference_shards.py`, `deployment/orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
+- Reason: Direct deployment-script execution on the cluster failed with `ModuleNotFoundError: No module named 'segedge'` when the repo root was not already on `PYTHONPATH`.
+- Problems fixed: `deployment/build_inference_shards.py` and `deployment/orchestrate_sharded_inference.py` now work as direct script entrypoints from the repository checkout without requiring manual `PYTHONPATH` setup first.
+
+- Description: Decouple shard planning from the full inference runtime so deployment scripts do not import Fiona- or transformers-dependent runtime modules just to resolve shard tile lists.
+- Files touched: `deployment/build_inference_shards.py`, `segedge/pipeline/common.py`, `tests/test_shard_scripts.py`, `docs/CHANGELOG.md`
+- Reason: Cluster-side shard planning failed before any work was submitted because importing `deployment/orchestrate_sharded_inference.py` pulled in `inference_flow.py`, `runtime_utils.py`, and heavyweight pipeline modules even though shard building only needs lightweight tile resolution and source-label filtering.
+- Problems fixed: `build_inference_shards.py` now resolves and source-label-filters tiles with a local lightweight helper instead of importing the full inference/runtime stack, `segedge/pipeline/common.py` no longer imports Fiona at module load time, `orchestrate_sharded_inference.py` loads the shard builder and merge helper lazily instead of importing them at startup, and deployment planning can proceed in environments where the full Fiona/GDAL/transformers runtime is not yet usable.
+
+- Description: Add explicit progress logging to shard planning and orchestration startup.
+- Files touched: `deployment/build_inference_shards.py`, `deployment/orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
+- Reason: Large folder runs spent noticeable time in tile discovery and source-label filtering with no visible progress, which made the launcher look hung even when it was working normally.
+- Problems fixed: Deployment startup now logs shard-build phases, periodic source-label filter progress, shard file creation, and Slurm submission/watchdog/verify stages so operators can see where time is going during orchestration.
+
+- Description: Harden shard worker launch scripts against stale checkout paths and persist per-shard failure hints in orchestration status files.
+- Files touched: `deployment/orchestrate_sharded_inference.py`, `deployment/README.md`, `silver_set.sh`, `tests/test_orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
+- Reason: A cluster shard campaign failed with zero completed tiles because generated worker scripts inherited a stale hard-coded repo `cd` from the Slurm template, and the watchdog only reported `done=0` without enough context to identify the startup failure quickly.
+- Problems fixed: Generated worker/watchdog/verify scripts now pin themselves to the current repo root instead of trusting template-specific checkout paths, the shared `silver_set.sh` template no longer hard-codes `/user/...`, `status.json` / `final_status.json` now record the latest worker stdout/stderr paths plus a concise last-known failure reason for incomplete shards, and exhausted retries fail with enough artifact metadata to debug the next issue without hunting across multiple logs.
+
+- Description: Add readability-first timing helpers, guide-comment standards, and first-wave cleanup for perf-heavy runtime modules.
+- Files touched: `segedge/core/timing_utils.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `tests/test_performance_logging.py`, `docs/STYLE.MD`, `docs/CHANGELOG.md`
+- Reason: Structured performance logging was useful but had started to drown core inference logic in inline span plumbing, making hot-path modules harder to read and maintain.
+- Problems fixed: `perf_call()` and `perf_metadata()` now let timing code wrap values and metadata without cluttering control flow, `infer_on_holdout()` and `_get_roads_mask()` are organized as guided stage pipelines instead of walls of instrumentation, the holdout path now computes the streaming-XGB mode once and reuses it across setup instead of re-deriving it inline, and `docs/STYLE.MD` now requires short guide comments for complex modules/functions while explicitly preferring helper-wrapped instrumentation over scattered inline timing blocks.
+
+- Description: Deepen holdout-performance diagnostics by splitting `load_context` into child spans, instrumenting the roads-mask path, and adding analyzer `--focus` filtering for targeted bottleneck inspection.
+- Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `segedge/pipeline/runtime/tile_context.py`, `scripts/analyze_performance_log.py`, `tests/test_performance_logging.py`, `tests/test_analyze_performance_log.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
+- Reason: Recent performance logs still had pathological `load_context` outliers, but the old logging could not attribute them to roads-mask work, tile-context work, or other wrapper overhead precisely enough to guide the next optimization pass.
+- Problems fixed: `performance.jsonl` now breaks holdout context loading into child stages (`load_holdout_tile_context`, `resolve_runtime_toggles`, `load_roads_mask`, `finalize_context`), roads-mask lookup/rasterization now records cache-hit state plus geometry counts, tile-context spans emit richer label/buffer metadata, and the analyzer can now focus on one stage family at a time with `--focus`.
+
 - Description: Simplify holdout shapefile artifacts to 4 rolling union outputs and remove per-image proposal shapefile/CSV exports.
 - Files touched: `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `segedge/pipeline/inference_flow.py`, `segedge/pipeline/runtime/holdout_inference.py`, `tests/test_inference_flow.py`, `tests/test_run_dispatch.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`
 - Reason: The old per-image proposal shapefile/CSV output produced too many artifacts and made the useful final geometry harder to navigate.

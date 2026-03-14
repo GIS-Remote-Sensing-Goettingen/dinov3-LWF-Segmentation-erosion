@@ -36,6 +36,17 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
         labels_sh = reproject_labels_to_image(
             img_path, cfg.io.paths.source_label_raster, downsample_factor=ds
         )
+    with perf_span(
+        "load_b_tile_context",
+        substage="source_label_metadata",
+        extra={
+            "image_shape": list(img_b.shape[:2]),
+            "downsample_factor": ds,
+            "positive_pixels": int((labels_sh > 0).sum()),
+            "coverage_ratio": float((labels_sh > 0).mean()) if labels_sh.size else 0.0,
+        },
+    ):
+        _ = 0
     gt_mask = None
     if gt_vector_paths:
         with perf_span("load_b_tile_context", substage="rasterize_gt_vectors"):
@@ -44,6 +55,15 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
                 img_path,
                 downsample_factor=ds,
             )
+        with perf_span(
+            "load_b_tile_context",
+            substage="gt_vector_metadata",
+            extra={
+                "gt_vector_count": int(len(gt_vector_paths)),
+                "gt_positive_pixels": int(gt_mask.sum()) if gt_mask is not None else 0,
+            },
+        ):
+            _ = 0
     time_end("data_loading_and_reprojection", t0_data)
     target_shape = img_b.shape[:2]
     if labels_sh.shape != target_shape:
@@ -95,6 +115,18 @@ def load_b_tile_context(img_path: str, gt_vector_paths: list[str] | None):
 
     with perf_span("load_b_tile_context", substage="build_sh_buffer_mask"):
         sh_buffer_mask = build_sh_buffer_mask(labels_sh, buffer_pixels)
+    with perf_span(
+        "load_b_tile_context",
+        substage="buffer_mask_metadata",
+        extra={
+            "buffer_pixels": int(buffer_pixels),
+            "buffer_positive_pixels": int(sh_buffer_mask.sum()),
+            "buffer_coverage_ratio": (
+                float(sh_buffer_mask.mean()) if sh_buffer_mask.size else 0.0
+            ),
+        },
+    ):
+        _ = 0
     if gt_mask is not None and cfg.model.priors.clip_gt_to_buffer:
         gt_mask_eval = np.logical_and(gt_mask, sh_buffer_mask)
         logger.info(

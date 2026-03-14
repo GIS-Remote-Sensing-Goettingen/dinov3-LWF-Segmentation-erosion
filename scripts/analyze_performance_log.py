@@ -113,6 +113,7 @@ def filter_records(
     kinds: set[str],
     phase: str | None,
     include_tile_null: bool = True,
+    focus: str | None = None,
 ) -> list[PerformanceRecord]:
     """Filter out summary rows and keep only the requested kinds.
 
@@ -129,12 +130,25 @@ def filter_records(
             continue
         if not include_tile_null and not record.tile:
             continue
+        if focus:
+            token = f"{record.stage or ''}::{record.substage or ''}".lower()
+            focus_lower = focus.lower()
+            if (
+                focus_lower not in token
+                and focus_lower not in (record.stage or "").lower()
+            ):
+                continue
         out.append(record)
     return out
 
 
 def _nearest_rank(values: list[float], percentile: float) -> float:
-    """Return a nearest-rank percentile from a list of numeric values."""
+    """Return a nearest-rank percentile from a list of numeric values.
+
+    Examples:
+        >>> _nearest_rank([1.0, 2.0, 3.0], 0.9)
+        3.0
+    """
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -245,7 +259,26 @@ def build_tile_summary(
 
 
 def overview(records: list[PerformanceRecord]) -> dict[str, object]:
-    """Return high-level dataset counts for reporting."""
+    """Return high-level dataset counts for reporting.
+
+    Examples:
+        >>> rows = [
+        ...     PerformanceRecord(
+        ...         1.0,
+        ...         {},
+        ...         "run_1",
+        ...         "span",
+        ...         "holdout_inference",
+        ...         "img",
+        ...         "x",
+        ...         "sub",
+        ...         "tile",
+        ...         None,
+        ...     )
+        ... ]
+        >>> overview(rows)["tile_count"]
+        1
+    """
     kinds = Counter(record.kind for record in records)
     phases = Counter(record.phase or "<none>" for record in records)
     tiles = {record.tile for record in records if record.tile}
@@ -268,7 +301,20 @@ def build_exclusion_summary(
     selected_phase: str | None,
     include_tile_null: bool,
 ) -> dict[str, int]:
-    """Summarize how many rows were excluded by the active filters."""
+    """Summarize how many rows were excluded by the active filters.
+
+    Examples:
+        >>> rec = PerformanceRecord(
+        ...     1.0, {}, None, "span", "holdout_inference", None, "x", None, "tile", None
+        ... )
+        >>> build_exclusion_summary(
+        ...     [rec],
+        ...     [rec],
+        ...     selected_phase="holdout_inference",
+        ...     include_tile_null=False,
+        ... )["selected_rows"]
+        1
+    """
     selected_ids = {id(record) for record in selected}
     excluded = [record for record in records if id(record) not in selected_ids]
     selected_kinds = Counter(record.kind for record in selected)
@@ -305,7 +351,24 @@ def build_outlier_rows(
     stage: str,
     substage: str,
 ) -> list[dict[str, object]]:
-    """Return rows for tiles with the largest cumulative duration for a stage/substage."""
+    """Return rows for tiles with the largest cumulative duration for a stage/substage.
+
+    Examples:
+        >>> rec = PerformanceRecord(
+        ...     2.0,
+        ...     {},
+        ...     None,
+        ...     "span",
+        ...     "holdout_inference",
+        ...     None,
+        ...     "roads_mask",
+        ...     "tree_query",
+        ...     "tile_a",
+        ...     None,
+        ... )
+        >>> build_outlier_rows([rec], stage="roads_mask", substage="tree_query")[0]["tile"]
+        'tile_a'
+    """
     grouped: dict[str, list[float]] = defaultdict(list)
     for record in records:
         if not record.tile:
@@ -470,6 +533,14 @@ def main() -> int:
         default=None,
         help="Optional directory for CSV outputs.",
     )
+    parser.add_argument(
+        "--focus",
+        default=None,
+        help=(
+            "Optional substring filter over stage/substage names, e.g. "
+            "'load_context' or 'roads_mask'."
+        ),
+    )
     args = parser.parse_args()
 
     records = load_performance_records(args.log_path)
@@ -480,6 +551,7 @@ def main() -> int:
         kinds=kinds,
         phase=phase_filter,
         include_tile_null=args.include_tile_null,
+        focus=args.focus,
     )
     stage_rows = build_stage_summary(filtered)
     substage_rows = build_substage_summary(filtered)
@@ -518,6 +590,8 @@ def main() -> int:
     print(f"selected_kind_counts: {filtered_meta['kind_counts']}")
     print(f"phase_counts: {meta['phase_counts']}")
     print(f"tile_count: {filtered_meta['tile_count']}")
+    if args.focus:
+        print(f"focus: {args.focus}")
     if phase_filter == "holdout_inference" and not args.include_tile_null:
         print("selection: inference-only spans (phase=holdout_inference, tile!=null)")
     print()

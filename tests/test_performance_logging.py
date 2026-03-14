@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 
 import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from shapely.geometry import box
 
 from segedge.core.config_loader import cfg
 from segedge.core.feature_ops.cache import (
@@ -20,6 +23,8 @@ from segedge.core.feature_ops.spec import hybrid_feature_spec_hash
 from segedge.core.timing_utils import (
     configure_performance_logging,
     emit_performance_summary,
+    perf_call,
+    perf_metadata,
     perf_span,
     performance_context,
 )
@@ -30,7 +35,11 @@ from segedge.core.xdboost import (
     xgb_score_image_b_legacy,
     xgb_score_image_b_streaming,
 )
-from segedge.pipeline.runtime.holdout_inference import infer_on_holdout
+from segedge.pipeline.runtime import roads as roads_module
+from segedge.pipeline.runtime.holdout_inference import (
+    _load_holdout_tile_context,
+    infer_on_holdout,
+)
 
 
 def test_performance_log_writes_contextual_jsonl(tmp_path):
@@ -67,6 +76,48 @@ def test_performance_log_writes_contextual_jsonl(tmp_path):
     assert span_record["run_id"] == "run_999"
     assert summary_record["kind"] == "summary"
     assert summary_record["reason"] == "unit_test"
+
+
+def test_perf_helpers_record_values_and_metadata(tmp_path):
+    """Timing helpers should support wrapped calls and metadata-only records.
+
+    Examples:
+        >>> True
+        True
+    """
+    perf_path = tmp_path / "performance.jsonl"
+    configure_performance_logging(str(perf_path), run_id="run_999")
+
+    with performance_context(
+        phase="holdout_inference",
+        tile="tile_b.tif",
+        image_id="tile_b",
+    ):
+        result = perf_call(
+            lambda x, y: x + y,
+            2,
+            3,
+            stage="demo_stage",
+            substage="wrapped_call",
+        )
+        perf_metadata(
+            "demo_stage",
+            substage="metadata_only",
+            extra={"count": 5},
+        )
+
+    assert result == 5
+    rows = [
+        json.loads(line)
+        for line in perf_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    wrapped = next(row for row in rows if row["substage"] == "wrapped_call")
+    metadata = next(row for row in rows if row["substage"] == "metadata_only")
+    assert wrapped["duration_s"] >= 0.0
+    assert wrapped["stage"] == "demo_stage"
+    assert metadata["duration_s"] == 0.0
+    assert metadata["extra"] == {"count": 5}
 
 
 def test_prefetch_features_can_keep_cached_tiles_lazy(tmp_path):
@@ -522,6 +573,229 @@ def test_prefetch_features_logs_cache_summary_metadata(tmp_path):
     assert extra["feature_bytes_read"] > 0
 
 
+def test_load_holdout_tile_context_logs_child_spans_and_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    """Holdout context loading should expose child spans and workload metadata.
+
+    Examples:
+        >>> True
+        True
+    """
+    perf_path = tmp_path / "performance.jsonl"
+    configure_performance_logging(str(perf_path), run_id="run_999")
+
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference.load_b_tile_context",
+        lambda *args, **kwargs: (
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            np.array(
+                [
+                    [1, 0, 0, 0],
+                    [0, 1, 0, 0],
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 0],
+                ],
+                dtype=np.uint8,
+            ),
+            None,
+            np.ones((4, 4), dtype=bool),
+            np.array(
+                [
+                    [1, 1, 0, 0],
+                    [1, 1, 0, 0],
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 0],
+                ],
+                dtype=bool,
+            ),
+            5.0,
+            0.2,
+        ),
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._get_roads_mask",
+        lambda *args, **kwargs: np.array(
+            [
+                [1, 0, 0, 0],
+                [1, 0, 0, 0],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+            ],
+            dtype=bool,
+        ),
+    )
+
+    with performance_context(
+        phase="holdout_inference",
+        tile="tile_a.tif",
+        image_id="tile_a",
+    ):
+        ctx = _load_holdout_tile_context(
+            "tile_a.tif",
+            gt_vector_paths=[],
+            tuned={"roads_penalty": 0.7, "xgb_enabled": True, "knn_enabled": False},
+        )
+
+    assert ctx["roads_penalty"] == 0.7
+    rows = [
+        json.loads(line)
+        for line in perf_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    infer_rows = [
+        row
+        for row in rows
+        if row.get("kind") == "span" and row.get("stage") == "infer_on_holdout"
+    ]
+    substage_map = {row.get("substage"): row for row in infer_rows}
+    for substage in (
+        "load_holdout_tile_context",
+        "resolve_runtime_toggles",
+        "load_roads_mask",
+        "finalize_context",
+    ):
+        assert substage in substage_map
+
+    finalize_extra = substage_map["finalize_context"]["extra"]
+    assert finalize_extra["source_label_positive_pixels"] == 2
+    assert finalize_extra["buffer_positive_pixels"] == 4
+    assert finalize_extra["roads_positive_pixels"] == 2
+    assert finalize_extra["source_label_coverage_ratio"] > 0.0
+    assert finalize_extra["roads_coverage_ratio"] > 0.0
+
+
+def test_roads_mask_logs_cache_and_rasterization_spans(tmp_path, monkeypatch):
+    """Road-mask diagnostics should expose cache lookup and rasterization spans.
+
+    Examples:
+        >>> True
+        True
+    """
+    perf_path = tmp_path / "performance.jsonl"
+    configure_performance_logging(str(perf_path), run_id="run_999")
+    roads_module._ROADS_MASK_CACHE.clear()
+    roads_module._ROADS_INDEX_CACHE.clear()
+
+    tile_path = tmp_path / "tile.tif"
+    with rasterio.open(
+        tile_path,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=4,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32632",
+        transform=from_origin(0, 4, 1, 1),
+    ) as dst:
+        dst.write(np.zeros((1, 4, 4), dtype=np.uint8))
+
+    roads_path = tmp_path / "roads.shp"
+    roads_path.write_bytes(b"")
+    monkeypatch.setattr(cfg.io.paths, "roads_mask_path", str(roads_path))
+    monkeypatch.setattr(cfg.io.paths, "feature_dir", str(tmp_path / "feature_cache"))
+    monkeypatch.setattr(cfg.io.paths, "output_dir", str(tmp_path / "output"))
+
+    geom = box(0.0, 0.0, 2.0, 4.0)
+
+    class _Tree:
+        def query(self, query_geom):
+            assert query_geom is not None
+            return [0]
+
+    monkeypatch.setattr(
+        roads_module,
+        "_get_roads_index",
+        lambda tile_crs: (_Tree(), [geom]),
+    )
+
+    with performance_context(
+        phase="holdout_inference",
+        tile=str(tile_path),
+        image_id="tile",
+    ):
+        mask = roads_module._get_roads_mask(str(tile_path), 1, target_shape=(4, 4))
+
+    assert mask is not None
+    assert mask.shape == (4, 4)
+    rows = [
+        json.loads(line)
+        for line in perf_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    roads_rows = [
+        row
+        for row in rows
+        if row.get("kind") == "span" and row.get("stage") == "roads_mask"
+    ]
+    substages = {row.get("substage") for row in roads_rows}
+    for substage in (
+        "open_tile_metadata",
+        "disk_cache_lookup",
+        "index_lookup",
+        "tree_query",
+        "candidate_filter",
+        "rasterize",
+        "disk_cache_write",
+    ):
+        assert substage in substages
+    raster_row = next(row for row in roads_rows if row.get("substage") == "rasterize")
+    assert raster_row["extra"]["candidate_geometry_count"] == 1
+    assert raster_row["extra"]["intersecting_geometry_count"] == 1
+
+
+def test_roads_mask_clips_large_geometry_before_rasterization(tmp_path, monkeypatch):
+    """Road rasterization should use the tile-local clipped geometry.
+
+    Examples:
+        >>> True
+        True
+    """
+    roads_module._ROADS_MASK_CACHE.clear()
+    roads_module._ROADS_INDEX_CACHE.clear()
+
+    tile_path = tmp_path / "tile.tif"
+    with rasterio.open(
+        tile_path,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=4,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32632",
+        transform=from_origin(0, 4, 1, 1),
+    ) as dst:
+        dst.write(np.zeros((1, 4, 4), dtype=np.uint8))
+
+    roads_path = tmp_path / "roads.shp"
+    roads_path.write_bytes(b"")
+    monkeypatch.setattr(cfg.io.paths, "roads_mask_path", str(roads_path))
+    monkeypatch.setattr(cfg.io.paths, "feature_dir", str(tmp_path / "feature_cache"))
+    monkeypatch.setattr(cfg.io.paths, "output_dir", str(tmp_path / "output"))
+
+    class _Tree:
+        def query(self, query_geom):
+            assert query_geom is not None
+            return [0]
+
+    large_geom = box(-100.0, -100.0, 2.0, 6.0)
+    monkeypatch.setattr(
+        roads_module,
+        "_get_roads_index",
+        lambda tile_crs: (_Tree(), [large_geom]),
+    )
+
+    mask = roads_module._get_roads_mask(str(tile_path), 1, target_shape=(4, 4))
+
+    expected = np.zeros((4, 4), dtype=bool)
+    expected[:, :2] = True
+    assert mask is not None
+    np.testing.assert_array_equal(mask, expected)
+
+
 def test_xgb_tile_payloads_are_streamed_lazily(monkeypatch):
     """Payload preparation should be lazy instead of buffering the whole image.
 
@@ -667,6 +941,7 @@ def test_infer_on_holdout_logs_prefetch_features_separately(tmp_path, monkeypatc
     """
     perf_path = tmp_path / "performance.jsonl"
     configure_performance_logging(str(perf_path), run_id="run_999")
+    stream_flag_calls: list[tuple[bool, str | None]] = []
 
     monkeypatch.setattr(
         "segedge.pipeline.runtime.holdout_inference._load_holdout_tile_context",
@@ -687,6 +962,13 @@ def test_infer_on_holdout_logs_prefetch_features_separately(tmp_path, monkeypatc
             "xgb_enabled": True,
             "crf_enabled": True,
         },
+    )
+    monkeypatch.setattr(
+        "segedge.pipeline.runtime.holdout_inference._should_stream_xgb_features",
+        lambda context, feature_dir: stream_flag_calls.append(
+            (bool(context["xgb_enabled"]), feature_dir)
+        )
+        or False,
     )
     monkeypatch.setattr(
         "segedge.pipeline.runtime.holdout_inference._prefetch_holdout_features",
@@ -750,10 +1032,6 @@ def test_infer_on_holdout_logs_prefetch_features_separately(tmp_path, monkeypatc
         },
     )
     monkeypatch.setattr(
-        "segedge.pipeline.runtime.holdout_inference._export_proposal_artifacts",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
         "segedge.pipeline.runtime.holdout_inference._compute_probability_and_diagnostics",
         lambda *args, **kwargs: (
             np.full((2, 2), 0.8, dtype=np.float32),
@@ -806,3 +1084,8 @@ def test_infer_on_holdout_logs_prefetch_features_separately(tmp_path, monkeypatc
     substages = {row.get("substage") for row in infer_rows}
     assert "load_context" in substages
     assert "prefetch_features" in substages
+    assert stream_flag_calls == [(True, None)]
+    metadata_row = next(
+        row for row in infer_rows if row.get("substage") == "tile_workload_metadata"
+    )
+    assert metadata_row["extra"]["xgb_patch_rows"] == 0
