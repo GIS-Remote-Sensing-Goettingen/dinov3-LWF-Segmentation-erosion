@@ -6,7 +6,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 ## Repository Layout
 - `main.py`: thin CLI wrapper; imports and calls `segedge.pipeline.run.main()`.
 - `config.yml`: typed runtime configuration source.
-- `deployment/`: cluster-facing orchestration helpers such as shard-file generation, shard-union merge, and the Slurm shard launcher.
+- `deployment/`: cluster-facing orchestration helpers such as shard-file generation, shard-union merge, the Slurm shard launcher, and the simpler batch-per-job launcher.
 - `segedge/core/`: model-facing logic, feature construction, I/O, plotting, metrics, and config loading.
 - `segedge/core/feature_ops/`: feature extraction, tiling, cache I/O, and hybrid feature fusion.
 - `segedge/core/features.py`: compatibility export layer for `feature_ops`.
@@ -84,7 +84,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 5. The selected workflow builds or loads model state, writes settings/checkpoint metadata, and invokes holdout inference when tiles are available.
 6. Holdout inference updates union shapefiles and processed-tile logs tile by tile, so partial runs keep usable outputs.
 7. Disk feature caches are consolidated after successful workflows that need them.
-8. Large folder inference can be parallelized by building shard tile files once, launching isolated shard jobs, retrying incomplete shards against the same fixed run directories, and then merging the resulting per-shard union families after verification succeeds.
+8. Large folder inference can be parallelized either by building shard tile files once and launching one array task per shard, or by building fixed-size batch tile files and launching one ordinary Slurm job per batch; both models retry incomplete runs against the same fixed run directories and merge the resulting union families after verification succeeds.
 
 ## Outputs
 - `output/run_*/run.log`: main runtime log.
@@ -99,6 +99,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `output/run_*/inference_best_setting.yml` and `output/run_*/best_setting.yml`: exported run settings.
 - `output/run_*/model_bundle/`: optional inference bundle when bundle saving is enabled.
 - `output/shards/<job_name>/`: optional shard manifests, per-shard configs, rendered Slurm scripts, retry/verification status files, and merged unions created by the Slurm orchestration flow.
+- `output/batches/<job_name>/`: optional batch manifests, per-batch configs, one-worker-per-batch Slurm scripts, controller status files, and merged unions created by the simpler Slurm batching flow.
 
 ## Major Runtime Functions
 - `segedge.pipeline.run.main`: bootstrap, resolve runtime mode, dispatch workflow, and finalize cache consolidation.

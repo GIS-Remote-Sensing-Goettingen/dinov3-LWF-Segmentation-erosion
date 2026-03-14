@@ -9,6 +9,10 @@ The intended use case is:
 - verify completion
 - merge the final union shapefiles
 
+There are now two orchestration styles:
+- `orchestrate_sharded_inference.py`: array-based shard orchestration
+- `launch_batched_inference.py`: one ordinary Slurm job per fixed-size batch
+
 ## Scripts
 
 ### `orchestrate_sharded_inference.py`
@@ -45,6 +49,39 @@ Internal modes used by the generated Slurm jobs:
 - `--verify-merge`
 
 Do not run those manually unless you are debugging the orchestration state.
+
+### `launch_batched_inference.py`
+Use this when you want the simpler operational model of one plain Slurm job per
+batch and no array indexing.
+
+What it does:
+- resolves the inference tile set once
+- applies the source-label filter once
+- writes one `tiles_batch_XXX.txt` file per worker batch
+- writes one batch-specific config file per worker batch
+- renders one worker script per batch plus one controller script from `silver_set.sh`
+- pins generated Slurm scripts to the current repository checkout instead of trusting a hard-coded template `cd`
+- submits one ordinary `sbatch` worker job per batch
+- submits one dependent controller job that retries incomplete batches and merges unions when all batches finish
+
+Typical command:
+
+```bash
+python deployment/launch_batched_inference.py \
+  --job-name folder1_batches \
+  --batch-size 100 \
+  --template silver_set.sh
+```
+
+Useful options:
+- `--dry-run`: render all artifacts without calling `sbatch`
+- `--max-retries`: maximum retry waves for incomplete batches
+- `--output-root`: root directory for batch orchestration outputs
+
+Internal mode used by the generated controller job:
+- `--controller`
+
+Do not run it manually unless you are debugging the orchestration state.
 
 ### `build_inference_shards.py`
 Use this when you only want the shard files and manifest without submitting jobs.
@@ -158,3 +195,7 @@ python -u ./main.py --config <generated-config>
 This keeps the worker runs explicit, reproducible, and isolated.
 
 Generated worker scripts still inherit scheduler and environment setup from the template, but the orchestrator now renders the repository root explicitly before launching Python so a stale template checkout path cannot silently break every shard.
+
+The batch launcher writes the same kind of resumable run directories and
+diagnostic metadata, but under `output/batches/<job_name>/` with one worker
+script per batch instead of one array task per shard.

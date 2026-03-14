@@ -8,6 +8,11 @@
 - Reason: Performance profiling showed a few cold-cache tiles spending several minutes rasterizing a single intersecting road geometry because the code was still burning the full geometry instead of the tile-local fragment.
 - Problems fixed: Roads-mask rasterization now uses tile-clipped geometries, which preserves the tile mask output while avoiding pathological full-geometry rasterization cost, and a regression test now pins that tile-local behavior.
 
+- Description: Add a simpler Slurm batch launcher that submits one ordinary job per fixed-size tile batch and uses a lightweight controller for retries and final merge.
+- Files touched: `deployment/launch_batched_inference.py`, `tests/test_launch_batched_inference.py`, `deployment/README.md`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`
+- Reason: The array-based shard launcher works, but a simpler one-job-per-batch workflow is easier to operate and debug on the cluster while preserving resumable fixed run directories and automatic retry/merge behavior.
+- Problems fixed: Large folder inference can now be launched as one worker script per 100-tile batch without Slurm arrays, retries still resume the same batch run directories, and the new controller job merges unions automatically once all batches complete.
+
 ### Documentation and repository health
 - Description: Move human-maintained repository docs under `docs/`, remove `journal.md`, expand workflow/function documentation, and add a function-length guard that excludes leading docstrings and doctests from its count.
 - Files touched: `AGENTS.md`, `docs/README.md`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`, `.pre-commit-config.yaml`, `scripts/check_function_length.py`, `tests/test_function_length.py`, `segedge/core/config_loader.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/workflows/loo_training.py`
