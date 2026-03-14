@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Inference, tuning, and runtime stability
+- Description: Clip road geometries to the current tile bounds before building rasterization shapes for the roads-mask penalty path.
+- Files touched: `segedge/pipeline/runtime/roads.py`, `tests/test_performance_logging.py`, `docs/CHANGELOG.md`
+- Reason: Performance profiling showed a few cold-cache tiles spending several minutes rasterizing a single intersecting road geometry because the code was still burning the full geometry instead of the tile-local fragment.
+- Problems fixed: Roads-mask rasterization now uses tile-clipped geometries, which preserves the tile mask output while avoiding pathological full-geometry rasterization cost, and a regression test now pins that tile-local behavior.
+
 ### Documentation and repository health
 - Description: Move human-maintained repository docs under `docs/`, remove `journal.md`, expand workflow/function documentation, and add a function-length guard that excludes leading docstrings and doctests from its count.
 - Files touched: `AGENTS.md`, `docs/README.md`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`, `.pre-commit-config.yaml`, `scripts/check_function_length.py`, `tests/test_function_length.py`, `segedge/core/config_loader.py`, `segedge/pipeline/tuning.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/workflows/loo_training.py`
@@ -49,6 +55,11 @@
 - Files touched: `deployment/orchestrate_sharded_inference.py`, `deployment/README.md`, `silver_set.sh`, `tests/test_orchestrate_sharded_inference.py`, `docs/CHANGELOG.md`
 - Reason: A cluster shard campaign failed with zero completed tiles because generated worker scripts inherited a stale hard-coded repo `cd` from the Slurm template, and the watchdog only reported `done=0` without enough context to identify the startup failure quickly.
 - Problems fixed: Generated worker/watchdog/verify scripts now pin themselves to the current repo root instead of trusting template-specific checkout paths, the shared `silver_set.sh` template no longer hard-codes `/user/...`, `status.json` / `final_status.json` now record the latest worker stdout/stderr paths plus a concise last-known failure reason for incomplete shards, and exhausted retries fail with enough artifact metadata to debug the next issue without hunting across multiple logs.
+
+- Description: Add readability-first timing helpers, guide-comment standards, and first-wave cleanup for perf-heavy runtime modules.
+- Files touched: `segedge/core/timing_utils.py`, `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `tests/test_performance_logging.py`, `docs/STYLE.MD`, `docs/CHANGELOG.md`
+- Reason: Structured performance logging was useful but had started to drown core inference logic in inline span plumbing, making hot-path modules harder to read and maintain.
+- Problems fixed: `perf_call()` and `perf_metadata()` now let timing code wrap values and metadata without cluttering control flow, `infer_on_holdout()` and `_get_roads_mask()` are organized as guided stage pipelines instead of walls of instrumentation, the holdout path now computes the streaming-XGB mode once and reuses it across setup instead of re-deriving it inline, and `docs/STYLE.MD` now requires short guide comments for complex modules/functions while explicitly preferring helper-wrapped instrumentation over scattered inline timing blocks.
 
 - Description: Deepen holdout-performance diagnostics by splitting `load_context` into child spans, instrumenting the roads-mask path, and adding analyzer `--focus` filtering for targeted bottleneck inspection.
 - Files touched: `segedge/pipeline/runtime/holdout_inference.py`, `segedge/pipeline/runtime/roads.py`, `segedge/pipeline/runtime/tile_context.py`, `scripts/analyze_performance_log.py`, `tests/test_performance_logging.py`, `tests/test_analyze_performance_log.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `docs/CHANGELOG.md`

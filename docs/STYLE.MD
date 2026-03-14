@@ -68,6 +68,20 @@ Returns:
 
 Docstrings should explain *what* the function does — not *how* it does it. ([Chromium Git Repositories][5])
 
+### Guide Comments Are Mandatory In Complex Code
+
+For non-trivial repository modules, comments are not optional decoration. They are
+navigation aids for the next reader.
+
+Required:
+- A short module-level overview docstring for complex modules.
+- A short guide comment above each major stage block in long or multi-step functions.
+- A short note when a helper exists mainly to keep instrumentation or plumbing out of the core logic.
+
+Not allowed:
+- Line-by-line narration of obvious Python statements.
+- Repeating the same fact in both code and comments when the code is already clear.
+
 ---
 
 ## 5) Declarative & Pythonic Patterns
@@ -137,6 +151,16 @@ def calculate_average(scores: list[float]) -> float:
 ```
 
 Small, focused functions make code easier to understand and test.
+
+### Perf Instrumentation Should Not Dominate Control Flow
+
+If performance logging makes the business logic hard to read:
+- wrap repeated timing patterns in small helpers
+- move instrumentation-heavy blocks into clearly named stage helpers
+- keep top-level pipeline functions readable first, with timing attached second
+
+Use raw `perf_span(...)` inline only when a helper would be more confusing than the
+timed block itself.
 
 ---
 
