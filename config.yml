@@ -12,7 +12,7 @@ io:
     # Optional one-tile-per-line shard file. When set, it overrides tiles_dir and tiles.
     tiles_file: null
     # Optional inference tile directory for both modes.
-    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_1
+    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_2
     tile_glob: "*.tif"
     # Optional explicit tile list fallback when tiles_dir is null.
     tiles: []
