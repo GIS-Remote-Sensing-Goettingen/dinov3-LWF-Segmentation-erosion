@@ -12,7 +12,7 @@ io:
     # Optional one-tile-per-line shard file. When set, it overrides tiles_dir and tiles.
     tiles_file: null
     # Optional inference tile directory for both modes.
-    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_2
+    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_3
     tile_glob: "*.tif"
     # Optional explicit tile list fallback when tiles_dir is null.
     tiles: []
@@ -61,7 +61,7 @@ io:
       - data/tiles/dop20_596000_5977000_1km_20cm.tif
       - data/tiles/dop20_596000_5983000_1km_20cm.tif
     # Legacy manual inference source (fallback when io.inference.* is unset).
-    inference_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_2
+    inference_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_3
     inference_glob: "*.tif"
     # Legacy fallback when inference_dir is null.
     holdout_tiles: []
@@ -81,7 +81,7 @@ io:
     # true: directory-driven LOO; false: manual source/val/holdout lists.
     enabled: false
     # Input directory scanned for tiles.
-    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_2
+    tiles_dir: /mnt/ceph-hdd/projects/mthesis_davide_mattioli/patches_mt/folder_3
     tile_glob: "*.tif"
     # Kept for backward compatibility with non-LOO mode.
     val_split_fraction: 0.5
