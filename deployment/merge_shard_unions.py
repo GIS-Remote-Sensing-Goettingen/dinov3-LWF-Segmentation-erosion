@@ -1,4 +1,4 @@
-"""Merge shard union shapefiles into one final union family.
+"""Merge shard union rasters into one final union family.
 
 Examples:
     >>> sorted(UNION_VARIANTS)
@@ -8,32 +8,61 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 
-import fiona
+import numpy as np
+import rasterio
 
 UNION_VARIANTS = ("raw", "crf", "shadow", "shadow_with_proposals")
-SHAPEFILE_EXTS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
 
 
-def _remove_shapefile_set(path: Path) -> None:
-    """Delete a shapefile and its sidecars if they exist.
+def _transforms_match(left, right) -> bool:
+    """Return whether two affine transforms are numerically equivalent.
 
     Examples:
-        >>> import tempfile
-        >>> with tempfile.TemporaryDirectory() as d:
-        ...     shp = Path(d) / "demo.shp"
-        ...     _ = shp.write_text("", encoding="utf-8")
-        ...     _remove_shapefile_set(shp)
-        ...     shp.exists()
-        False
+        >>> _transforms_match((1, 0, 0, 0, -1, 0, 0, 0, 1), (1, 0, 0, 0, -1, 0, 0, 0, 1))
+        True
     """
-    base = path.with_suffix("")
-    for ext in SHAPEFILE_EXTS:
-        candidate = base.with_suffix(ext)
-        if candidate.exists():
-            candidate.unlink()
+    return all(
+        math.isclose(float(a), float(b), abs_tol=1e-9) for a, b in zip(left, right)
+    )
+
+
+def _validate_compatible_union_rasters(
+    source_paths: list[Path],
+) -> dict[str, object]:
+    """Return a shared profile after validating all union rasters match.
+
+    Examples:
+        >>> callable(_validate_compatible_union_rasters)
+        True
+    """
+    with rasterio.open(source_paths[0]) as src0:
+        profile = src0.profile.copy()
+        profile.update(compress="lzw")
+        first_transform = src0.transform
+        first_crs = src0.crs
+        first_width = src0.width
+        first_height = src0.height
+        first_dtype = src0.dtypes[0]
+        first_nodata = src0.nodata
+        first_count = src0.count
+
+    for source_path in source_paths[1:]:
+        with rasterio.open(source_path) as src:
+            if (
+                src.crs != first_crs
+                or src.width != first_width
+                or src.height != first_height
+                or src.count != first_count
+                or src.dtypes[0] != first_dtype
+                or src.nodata != first_nodata
+                or not _transforms_match(src.transform, first_transform)
+            ):
+                raise ValueError(f"incompatible union raster profile: {source_path}")
+    return profile
 
 
 def merge_union_variant(
@@ -49,32 +78,28 @@ def merge_union_variant(
         True
     """
     source_paths = [
-        Path(run_dir) / "shapes" / "unions" / variant / "union.shp"
+        Path(run_dir) / "shapes" / "unions" / variant / "union.tif"
         for run_dir in shard_run_dirs
     ]
     source_paths = [path for path in source_paths if path.exists()]
     if not source_paths:
         return None
 
-    out_path = Path(output_dir) / variant / "union.shp"
+    profile = _validate_compatible_union_rasters(source_paths)
+    out_path = Path(output_dir) / variant / "union.tif"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    _remove_shapefile_set(out_path)
 
-    with fiona.open(source_paths[0], "r") as src0:
-        schema = src0.schema.copy()
-        crs = src0.crs
-
-    with fiona.open(
-        out_path,
-        "w",
-        driver="ESRI Shapefile",
-        crs=crs,
-        schema=schema,
-    ) as dst:
-        for source_path in source_paths:
-            with fiona.open(source_path, "r") as src:
-                for feature in src:
-                    dst.write(feature)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        with rasterio.open(source_paths[0]) as src0:
+            for _, window in src0.block_windows(1):
+                merged = np.zeros(
+                    (int(window.height), int(window.width)),
+                    dtype=np.uint8,
+                )
+                for source_path in source_paths:
+                    with rasterio.open(source_path) as src:
+                        merged = np.maximum(merged, src.read(1, window=window))
+                dst.write(merged, 1, window=window)
     return out_path
 
 
@@ -102,12 +127,12 @@ def merge_shard_unions(
 
 
 def main() -> None:
-    """CLI entrypoint for merging shard union shapefiles."""
+    """CLI entrypoint for merging shard union rasters."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Directory where merged union shapefiles are written.",
+        help="Directory where merged union rasters are written.",
     )
     parser.add_argument(
         "shard_run_dirs",
@@ -119,7 +144,7 @@ def main() -> None:
         shard_run_dirs=[os.path.abspath(path) for path in args.shard_run_dirs],
         output_dir=args.output_dir,
     )
-    print(f"merged {len(merged_paths)} union shapefiles into {args.output_dir}")
+    print(f"merged {len(merged_paths)} union rasters into {args.output_dir}")
 
 
 if __name__ == "__main__":

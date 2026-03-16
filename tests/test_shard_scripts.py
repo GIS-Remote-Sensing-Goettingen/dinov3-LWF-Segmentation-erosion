@@ -7,8 +7,9 @@ import json
 import sys
 from pathlib import Path
 
-import fiona
-from shapely.geometry import box, mapping
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
 
 _BUILD_PATH = (
     Path(__file__).resolve().parents[1] / "deployment" / "build_inference_shards.py"
@@ -36,30 +37,28 @@ build_inference_shards = _BUILD_MODULE.build_inference_shards
 merge_shard_unions = _MERGE_MODULE.merge_shard_unions
 
 
-def _write_union_shapefile(path: Path, start_id: int) -> None:
-    """Write a tiny polygon shapefile for one union variant.
+def _write_union_raster(path: Path, pixels: np.ndarray) -> None:
+    """Write a tiny GeoTIFF union raster for one stage variant.
 
     Examples:
         >>> True
         True
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    schema = {"geometry": "Polygon", "properties": {"id": "int"}}
-    with fiona.open(
+    with rasterio.open(
         path,
         "w",
-        driver="ESRI Shapefile",
-        crs={"init": "epsg:4326"},
-        schema=schema,
+        driver="GTiff",
+        width=pixels.shape[1],
+        height=pixels.shape[0],
+        count=1,
+        dtype=np.uint8,
+        crs="EPSG:3857",
+        transform=from_origin(0.0, float(pixels.shape[0]), 1.0, 1.0),
+        nodata=0,
+        compress="lzw",
     ) as dst:
-        dst.write(
-            {
-                "geometry": mapping(
-                    box(float(start_id), 0.0, float(start_id + 1), 1.0)
-                ),
-                "properties": {"id": start_id},
-            }
-        )
+        dst.write(np.asarray(pixels, dtype=np.uint8), 1)
 
 
 def test_build_inference_shards_writes_manifest_and_round_robin_files(
@@ -115,7 +114,7 @@ def test_build_inference_shards_writes_manifest_and_round_robin_files(
 
 
 def test_merge_shard_unions_combines_stage_union_files(tmp_path):
-    """Union merge should combine all shard features for each variant.
+    """Union merge should OR all shard pixels for each stage variant.
 
     Examples:
         >>> True
@@ -124,13 +123,13 @@ def test_merge_shard_unions_combines_stage_union_files(tmp_path):
     shard_a = tmp_path / "run_a"
     shard_b = tmp_path / "run_b"
     for variant in ("raw", "shadow_with_proposals"):
-        _write_union_shapefile(
-            shard_a / "shapes" / "unions" / variant / "union.shp",
-            start_id=1,
+        _write_union_raster(
+            shard_a / "shapes" / "unions" / variant / "union.tif",
+            np.array([[1, 0]], dtype=np.uint8),
         )
-        _write_union_shapefile(
-            shard_b / "shapes" / "unions" / variant / "union.shp",
-            start_id=2,
+        _write_union_raster(
+            shard_b / "shapes" / "unions" / variant / "union.tif",
+            np.array([[0, 1]], dtype=np.uint8),
         )
 
     merged = merge_shard_unions(
@@ -141,7 +140,7 @@ def test_merge_shard_unions_combines_stage_union_files(tmp_path):
     merged_names = sorted(path.parent.name for path in merged)
     assert merged_names == ["raw", "shadow_with_proposals"]
 
-    raw_union = tmp_path / "merged" / "raw" / "union.shp"
-    with fiona.open(raw_union, "r") as src:
-        features = list(src)
-    assert len(features) == 2
+    raw_union = tmp_path / "merged" / "raw" / "union.tif"
+    with rasterio.open(raw_union) as src:
+        merged_pixels = src.read(1)
+    np.testing.assert_array_equal(merged_pixels, np.array([[1, 1]], dtype=np.uint8))

@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Inference, tuning, and runtime stability
+- Description: Replace rolling stage-union shapefiles with rolling stage-union GeoTIFF rasters and update shard/batch merge flow to combine `union.tif` outputs.
+- Files touched: `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `deployment/merge_shard_unions.py`, `tests/test_union_raster_io.py`, `tests/test_run_dispatch.py`, `tests/test_shard_scripts.py`, `tests/test_launch_batched_inference.py`, `tests/test_orchestrate_sharded_inference.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `deployment/README.md`, `docs/CHANGELOG.md`
+- Reason: The stage outputs should be immediately testable as rasters and easier to consume downstream without converting merged shapefile unions back onto a tile grid.
+- Problems fixed: Holdout inference now writes `raw`, `crf`, `shadow`, and `shadow_with_proposals` as rolling `union.tif` mosaics on the shared holdout tile grid, resume mode validates and reuses those rasters safely, and shard/batch verification now merges compatible union rasters by pixelwise OR.
+
+### Inference, tuning, and runtime stability
 - Description: Clip road geometries to the current tile bounds before building rasterization shapes for the roads-mask penalty path.
 - Files touched: `segedge/pipeline/runtime/roads.py`, `tests/test_performance_logging.py`, `docs/CHANGELOG.md`
 - Reason: Performance profiling showed a few cold-cache tiles spending several minutes rasterizing a single intersecting road geometry because the code was still burning the full geometry instead of the tile-local fragment.
@@ -12,6 +18,11 @@
 - Files touched: `deployment/launch_batched_inference.py`, `tests/test_launch_batched_inference.py`, `deployment/README.md`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`
 - Reason: The array-based shard launcher works, but a simpler one-job-per-batch workflow is easier to operate and debug on the cluster while preserving resumable fixed run directories and automatic retry/merge behavior.
 - Problems fixed: Large folder inference can now be launched as one worker script per 100-tile batch without Slurm arrays, retries still resume the same batch run directories, and the new controller job merges unions automatically once all batches complete.
+
+- Description: Remove the unused array-based shard orchestrator and its dedicated tests/docs so the repository documents one supported deployment path.
+- Files touched: `deployment/orchestrate_sharded_inference.py`, `tests/test_orchestrate_sharded_inference.py`, `deployment/README.md`, `docs/ARCHITECTURE.md`, `docs/KB.md`, `docs/Implementation.md`, `docs/CHANGELOG.md`
+- Reason: The batch-per-job launcher is now the active operational workflow, so keeping the old array/watchdog orchestrator only adds dead code and conflicting documentation.
+- Problems fixed: The repository now presents one supported Slurm orchestration model, obsolete array/watchdog references are removed, and the deployment surface is easier to navigate.
 
 ### Documentation and repository health
 - Description: Move human-maintained repository docs under `docs/`, remove `journal.md`, expand workflow/function documentation, and add a function-length guard that excludes leading docstrings and doctests from its count.

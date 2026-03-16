@@ -18,7 +18,7 @@ from rasterio.crs import CRS
 from rasterio.plot import reshape_as_image
 from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
-from rasterio.windows import from_bounds
+from rasterio.windows import Window, from_bounds
 from shapely.geometry import box, mapping, shape
 from shapely.ops import transform as shp_transform
 from shapely.strtree import STRtree
@@ -588,6 +588,320 @@ def build_roads_raster_from_vector(
         len(shapes),
     )
     return out_raster_path
+
+
+def _validate_union_tile_transform(
+    tile_transform,
+    *,
+    reference_transform,
+    tile_path: str,
+    reference_path: str,
+) -> None:
+    """Validate that a tile transform is compatible with a union raster grid.
+
+    Examples:
+        >>> callable(_validate_union_tile_transform)
+        True
+    """
+    if not _transforms_are_axis_aligned(tile_transform, reference_transform):
+        raise ValueError(f"union raster requires north-up aligned tiles: {tile_path}")
+    if not math.isclose(tile_transform.a, reference_transform.a, abs_tol=1e-9):
+        raise ValueError(
+            "union raster requires identical pixel width: "
+            f"{tile_path} vs {reference_path}"
+        )
+    if not math.isclose(tile_transform.e, reference_transform.e, abs_tol=1e-9):
+        raise ValueError(
+            "union raster requires identical pixel height: "
+            f"{tile_path} vs {reference_path}"
+        )
+    col_offset = (tile_transform.c - reference_transform.c) / reference_transform.a
+    row_offset = (tile_transform.f - reference_transform.f) / reference_transform.e
+    if not (_is_close_to_int(col_offset) and _is_close_to_int(row_offset)):
+        raise ValueError(
+            "union raster requires tiles on one shared pixel grid: "
+            f"{tile_path} vs {reference_path}"
+        )
+
+
+def _tiff_block_size(length: int) -> int | None:
+    """Return a GeoTIFF-compatible tile block size for one dimension.
+
+    Examples:
+        >>> _tiff_block_size(8) is None
+        True
+        >>> _tiff_block_size(64)
+        64
+    """
+    if length < 16:
+        return None
+    return max(16, min(512, length) // 16 * 16)
+
+
+def build_union_raster_profile(ref_raster_paths: list[str]) -> dict[str, object]:
+    """Build a shared GeoTIFF profile that mosaics the given reference tiles.
+
+    Args:
+        ref_raster_paths (list[str]): Tile raster paths used to define the union grid.
+
+    Returns:
+        dict[str, object]: Rasterio profile for the merged union GeoTIFF.
+
+    Examples:
+        >>> callable(build_union_raster_profile)
+        True
+    """
+    if not ref_raster_paths:
+        raise ValueError("ref_raster_paths must contain at least one tile")
+
+    first_path = os.path.abspath(ref_raster_paths[0])
+    with rasterio.open(first_path) as first_src:
+        if not _transforms_are_axis_aligned(first_src.transform, first_src.transform):
+            raise ValueError(
+                f"union raster requires north-up aligned tiles: {first_path}"
+            )
+        if first_src.transform.a <= 0 or first_src.transform.e >= 0:
+            raise ValueError(
+                f"union raster requires positive x and negative y resolution: {first_path}"
+            )
+        reference_crs = first_src.crs
+        reference_transform = first_src.transform
+        left = first_src.bounds.left
+        bottom = first_src.bounds.bottom
+        right = first_src.bounds.right
+        top = first_src.bounds.top
+
+    for tile_path in ref_raster_paths[1:]:
+        abs_path = os.path.abspath(tile_path)
+        with rasterio.open(abs_path) as src:
+            if src.crs != reference_crs:
+                raise ValueError(
+                    "union raster requires identical CRS: "
+                    f"{abs_path} vs {first_path}"
+                )
+            _validate_union_tile_transform(
+                src.transform,
+                reference_transform=reference_transform,
+                tile_path=abs_path,
+                reference_path=first_path,
+            )
+            left = min(left, src.bounds.left)
+            bottom = min(bottom, src.bounds.bottom)
+            right = max(right, src.bounds.right)
+            top = max(top, src.bounds.top)
+
+    pixel_width = reference_transform.a
+    pixel_height = abs(reference_transform.e)
+    width_float = (right - left) / pixel_width
+    height_float = (top - bottom) / pixel_height
+    if not (_is_close_to_int(width_float) and _is_close_to_int(height_float)):
+        raise ValueError("union raster bounds are not aligned to the shared tile grid")
+    union_width = int(round(width_float))
+    union_height = int(round(height_float))
+    union_transform = from_origin(left, top, pixel_width, pixel_height)
+    profile: dict[str, object] = {
+        "driver": "GTiff",
+        "height": union_height,
+        "width": union_width,
+        "count": 1,
+        "dtype": "uint8",
+        "crs": reference_crs,
+        "transform": union_transform,
+        "nodata": 0,
+        "compress": "lzw",
+    }
+    block_x = _tiff_block_size(union_width)
+    block_y = _tiff_block_size(union_height)
+    if block_x is not None and block_y is not None:
+        profile.update(tiled=True, blockxsize=block_x, blockysize=block_y)
+    return profile
+
+
+def initialize_union_raster(out_path: str, profile: dict[str, object]) -> str:
+    """Create an empty union GeoTIFF on the provided grid.
+
+    Args:
+        out_path (str): Output GeoTIFF path.
+        profile (dict[str, object]): Raster profile from build_union_raster_profile().
+
+    Returns:
+        str: Output path.
+
+    Examples:
+        >>> callable(initialize_union_raster)
+        True
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    profile_copy = dict(profile)
+    height = int(profile_copy["height"])
+    width = int(profile_copy["width"])
+    with rasterio.open(out_path, "w", **profile_copy) as dst:
+        if bool(profile_copy.get("tiled")):
+            for _, window in dst.block_windows(1):
+                dst.write(
+                    np.zeros((int(window.height), int(window.width)), dtype=np.uint8),
+                    1,
+                    window=window,
+                )
+        else:
+            dst.write(np.zeros((height, width), dtype=np.uint8), 1)
+    logger.info("union raster initialized: %s (shape=%sx%s)", out_path, height, width)
+    return out_path
+
+
+def validate_union_raster_compatibility(
+    union_path: str,
+    profile: dict[str, object],
+) -> None:
+    """Validate that an existing union GeoTIFF matches the expected grid.
+
+    Args:
+        union_path (str): Existing union GeoTIFF path.
+        profile (dict[str, object]): Expected raster profile.
+
+    Examples:
+        >>> callable(validate_union_raster_compatibility)
+        True
+    """
+    with rasterio.open(union_path) as src:
+        expected_transform = profile["transform"]
+        transform_matches = all(
+            math.isclose(
+                float(got),
+                float(expected),
+                abs_tol=1e-9,
+            )
+            for got, expected in zip(src.transform, expected_transform)
+        )
+        if (
+            src.count != int(profile["count"])
+            or src.width != int(profile["width"])
+            or src.height != int(profile["height"])
+            or src.crs != profile["crs"]
+            or src.dtypes[0] != str(profile["dtype"])
+            or src.nodata != profile["nodata"]
+            or not transform_matches
+        ):
+            raise ValueError(
+                f"existing union raster is incompatible with current tile grid: {union_path}"
+            )
+
+
+def _union_window_from_reference(
+    *,
+    ref_dataset: rasterio.io.DatasetReader,
+    union_dataset: rasterio.io.DatasetReader,
+    ref_raster_path: str,
+    union_path: str,
+) -> Window:
+    """Return the aligned write window for one tile inside the union raster.
+
+    Examples:
+        >>> callable(_union_window_from_reference)
+        True
+    """
+    if ref_dataset.crs != union_dataset.crs:
+        raise ValueError(
+            f"reference tile CRS does not match union raster: {ref_raster_path}"
+        )
+    _validate_union_tile_transform(
+        ref_dataset.transform,
+        reference_transform=union_dataset.transform,
+        tile_path=ref_raster_path,
+        reference_path=union_path,
+    )
+    col_offset = (ref_dataset.transform.c - union_dataset.transform.c) / (
+        union_dataset.transform.a
+    )
+    row_offset = (ref_dataset.transform.f - union_dataset.transform.f) / (
+        union_dataset.transform.e
+    )
+    col_off = int(round(col_offset))
+    row_off = int(round(row_offset))
+    if (
+        col_off < 0
+        or row_off < 0
+        or col_off + ref_dataset.width > union_dataset.width
+        or row_off + ref_dataset.height > union_dataset.height
+    ):
+        raise ValueError(
+            f"reference tile falls outside union raster bounds: {ref_raster_path}"
+        )
+    return Window(
+        col_off=col_off,
+        row_off=row_off,
+        width=ref_dataset.width,
+        height=ref_dataset.height,
+    )
+
+
+def append_mask_to_union_raster(
+    mask: np.ndarray,
+    ref_raster_path: str,
+    out_path: str,
+) -> None:
+    """Merge one tile mask into the rolling union GeoTIFF with pixelwise OR.
+
+    Args:
+        mask (np.ndarray): Binary mask for the reference tile.
+        ref_raster_path (str): Source tile path that defines the write window.
+        out_path (str): Union GeoTIFF path.
+
+    Examples:
+        >>> callable(append_mask_to_union_raster)
+        True
+    """
+    mask_uint8 = np.asarray(mask, dtype=np.uint8)
+    if mask_uint8.ndim != 2:
+        raise ValueError("mask must be a 2D array")
+    if not os.path.exists(out_path):
+        raise FileNotFoundError(f"union raster not found: {out_path}")
+    with (
+        rasterio.open(ref_raster_path) as ref_src,
+        rasterio.open(out_path, "r+") as dst,
+    ):
+        if mask_uint8.shape != (ref_src.height, ref_src.width):
+            raise ValueError(
+                "mask shape must match reference raster dimensions: "
+                f"{mask_uint8.shape} vs {(ref_src.height, ref_src.width)}"
+            )
+        window = _union_window_from_reference(
+            ref_dataset=ref_src,
+            union_dataset=dst,
+            ref_raster_path=ref_raster_path,
+            union_path=out_path,
+        )
+        existing = dst.read(1, window=window)
+        dst.write(np.maximum(existing, mask_uint8), 1, window=window)
+    logger.info("union raster appended: %s <- %s", out_path, ref_raster_path)
+
+
+def backup_union_raster(
+    out_path: str,
+    backup_dir: str,
+    step: int,
+    backup_name: str | None = None,
+) -> None:
+    """Copy a union GeoTIFF to a backup directory.
+
+    Args:
+        out_path (str): Union GeoTIFF path.
+        backup_dir (str): Directory for backups.
+        step (int): Step index for naming.
+        backup_name (str | None): Fixed backup basename when rotating one backup.
+
+    Examples:
+        >>> callable(backup_union_raster)
+        True
+    """
+    if not os.path.exists(out_path):
+        logger.warning("union raster missing; skipping backup")
+        return
+    os.makedirs(backup_dir, exist_ok=True)
+    base_name = backup_name or f"union_backup_{int(step):06d}"
+    backup_path = os.path.join(backup_dir, f"{base_name}.tif")
+    shutil.copy2(out_path, backup_path)
+    logger.info("union raster backup written: %s", backup_path)
 
 
 def build_sh_buffer_mask(labels_sh: np.ndarray, buffer_pixels: int) -> np.ndarray:

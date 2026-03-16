@@ -13,9 +13,11 @@ import yaml
 
 from ..core.config_loader import cfg, get_loaded_config_path
 from ..core.io_utils import (
-    append_mask_to_union_shapefile,
-    backup_union_shapefile,
-    count_shapefile_features,
+    append_mask_to_union_raster,
+    backup_union_raster,
+    build_union_raster_profile,
+    initialize_union_raster,
+    validate_union_raster_compatibility,
 )
 from ..core.logging_utils import setup_logging
 from ..core.timing_utils import (
@@ -362,32 +364,49 @@ def _log_run_configuration(budget_state: dict[str, object]) -> None:
 def _initialize_union_state(
     *,
     shape_dir: str,
+    holdout_tiles: list[str],
     resume_run: bool,
 ) -> tuple[dict[str, dict[str, str | int]], Callable[..., None]]:
-    """Create rolling union targets and return an append helper.
+    """Create rolling union GeoTIFF targets and return an append helper.
 
     Examples:
         >>> callable(_initialize_union_state)
         True
     """
+    if not holdout_tiles:
+        logger.info("no holdout tiles resolved; skipping union raster initialization")
+
+        def _missing_union(*_args, **_kwargs) -> None:
+            """Raise when union writes are requested without initialized rasters.
+
+            Examples:
+                >>> callable(_missing_union)
+                True
+            """
+            raise RuntimeError("union rasters are not initialized for this run")
+
+        return {}, _missing_union
+
     union_backup_every = int(cfg.runtime.union_backup_every or 0)
     union_root = os.path.join(shape_dir, "unions")
     union_variants = ["raw", "crf", "shadow", "shadow_with_proposals"]
+    union_profile = build_union_raster_profile(holdout_tiles)
     union_states: dict[str, dict[str, str | int]] = {}
     for variant in union_variants:
         union_dir = os.path.join(union_root, variant)
         os.makedirs(union_dir, exist_ok=True)
-        union_path = os.path.join(union_dir, "union.shp")
-        feature_id = count_shapefile_features(union_path) if resume_run else 0
+        union_path = os.path.join(union_dir, "union.tif")
+        if resume_run and os.path.exists(union_path):
+            validate_union_raster_compatibility(union_path, union_profile)
+            logger.info("resume union raster: %s path=%s", variant, union_path)
+        else:
+            initialize_union_raster(union_path, union_profile)
         union_states[variant] = {
             "path": union_path,
             "backup_dir": os.path.join(union_dir, "backup"),
-            "feature_id": feature_id,
         }
-        if resume_run and feature_id:
-            logger.info("resume union: %s features=%s", variant, feature_id)
     logger.info(
-        "rolling unions: root=%s backup_every=%s",
+        "rolling union rasters: root=%s backup_every=%s",
         union_root,
         union_backup_every,
     )
@@ -407,15 +426,9 @@ def _initialize_union_state(
         state = union_states[variant]
         union_path = str(state["path"])
         backup_dir = str(state["backup_dir"])
-        feature_id = int(state["feature_id"])
-        state["feature_id"] = append_mask_to_union_shapefile(
-            mask,
-            ref_path,
-            union_path,
-            start_id=feature_id,
-        )
+        append_mask_to_union_raster(mask, ref_path, union_path)
         if union_backup_every > 0 and step % union_backup_every == 0:
-            backup_union_shapefile(
+            backup_union_raster(
                 union_path,
                 backup_dir,
                 step,
@@ -610,8 +623,19 @@ def main():
     )
     _log_run_configuration(budget_state)
 
+    training_enabled = bool(cfg.io.training)
+    source_label_raster = cfg.io.paths.source_label_raster
+    gt_vector_paths = cfg.io.paths.eval_gt_vectors
+    auto_split_tiles = bool(cfg.io.auto_split.enabled and training_enabled)
+
+    tile_sets = _resolve_tile_sets(
+        training_enabled=training_enabled,
+        auto_split_tiles=auto_split_tiles,
+        gt_vector_paths=gt_vector_paths,
+    )
     _, append_union = _initialize_union_state(
         shape_dir=run_paths["shape_dir"],
+        holdout_tiles=list(tile_sets["holdout_tiles"]),
         resume_run=resume_run,
     )
 
@@ -622,17 +646,7 @@ def main():
     ps = cfg.model.backbone.patch_size
     tile_size = cfg.model.tiling.tile_size
     stride = cfg.model.tiling.stride
-    training_enabled = bool(cfg.io.training)
-    source_label_raster = cfg.io.paths.source_label_raster
-    gt_vector_paths = cfg.io.paths.eval_gt_vectors
     context_radius = int(cfg.model.banks.feat_context_radius or 0)
-    auto_split_tiles = bool(cfg.io.auto_split.enabled and training_enabled)
-
-    tile_sets = _resolve_tile_sets(
-        training_enabled=training_enabled,
-        auto_split_tiles=auto_split_tiles,
-        gt_vector_paths=gt_vector_paths,
-    )
     (
         training_feature_cache_mode,
         training_feature_dir,

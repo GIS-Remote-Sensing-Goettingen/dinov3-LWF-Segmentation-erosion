@@ -7,9 +7,10 @@ import json
 import sys
 from pathlib import Path
 
-import fiona
+import numpy as np
+import rasterio
 import yaml
-from shapely.geometry import box, mapping
+from rasterio.transform import from_origin
 
 _BATCH_PATH = (
     Path(__file__).resolve().parents[1] / "deployment" / "launch_batched_inference.py"
@@ -103,27 +104,28 @@ def _write_fake_batches(root: Path, batch_sizes: list[int]) -> tuple[Path, list[
 
 
 def _write_union(path: Path, fid: int) -> None:
-    """Write a one-feature union shapefile fixture.
+    """Write a one-stage union raster fixture.
 
     Examples:
         >>> True
         True
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    schema = {"geometry": "Polygon", "properties": {"id": "int"}}
-    with fiona.open(
+    pixels = np.array([[1, 0] if fid == 1 else [0, 1]], dtype=np.uint8)
+    with rasterio.open(
         path,
         "w",
-        driver="ESRI Shapefile",
-        crs={"init": "epsg:4326"},
-        schema=schema,
+        driver="GTiff",
+        width=pixels.shape[1],
+        height=pixels.shape[0],
+        count=1,
+        dtype=np.uint8,
+        crs="EPSG:3857",
+        transform=from_origin(0.0, 1.0, 1.0, 1.0),
+        nodata=0,
+        compress="lzw",
     ) as dst:
-        dst.write(
-            {
-                "geometry": mapping(box(float(fid), 0.0, float(fid + 1), 1.0)),
-                "properties": {"id": fid},
-            }
-        )
+        dst.write(pixels, 1)
 
 
 def test_launch_batched_inference_dry_run_writes_configs_and_scripts(
@@ -325,8 +327,8 @@ def test_controller_merges_when_all_batches_are_complete(tmp_path):
         encoding="utf-8",
     )
     for variant in ("raw", "shadow_with_proposals"):
-        _write_union(run_a / "shapes" / "unions" / variant / "union.shp", 1)
-        _write_union(run_b / "shapes" / "unions" / variant / "union.shp", 2)
+        _write_union(run_a / "shapes" / "unions" / variant / "union.tif", 1)
+        _write_union(run_b / "shapes" / "unions" / variant / "union.tif", 2)
     _BATCH_MODULE._write_json(
         root / "status.json",
         {
@@ -364,7 +366,7 @@ def test_controller_merges_when_all_batches_are_complete(tmp_path):
 
     final_status = json.loads((root / "final_status.json").read_text(encoding="utf-8"))
     assert final_status["status"] == "success"
-    assert (root / "merged" / "raw" / "union.shp").exists()
+    assert (root / "merged" / "raw" / "union.tif").exists()
 
 
 def test_controller_fails_when_retry_budget_is_exhausted(tmp_path):
