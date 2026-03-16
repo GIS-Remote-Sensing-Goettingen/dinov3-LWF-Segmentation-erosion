@@ -9,7 +9,6 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from itertools import repeat
 
-import fiona
 import numpy as np
 import torch
 from pyproj import Transformer
@@ -173,6 +172,8 @@ def _load_gt_geometries(
         >>> callable(_load_gt_geometries)
         True
     """
+    import fiona
+
     geoms = []
     target_crs_dict = target_crs.to_dict() if target_crs is not None else None
     for vp in gt_vector_paths:

@@ -225,6 +225,62 @@ def perf_span(
         )
 
 
+def perf_call(
+    func,
+    /,
+    *args,
+    stage: str,
+    substage: str | None = None,
+    phase: str | None = None,
+    tile: str | None = None,
+    image_id: str | None = None,
+    extra: dict[str, object] | None = None,
+    **kwargs,
+):
+    """Run a callable inside a structured performance span and return its value.
+
+    Examples:
+        >>> configure_performance_logging(None)
+        >>> perf_call(lambda x: x + 1, 1, stage="demo", substage="call")
+        2
+    """
+    with perf_span(
+        stage,
+        substage=substage,
+        phase=phase,
+        tile=tile,
+        image_id=image_id,
+        extra=extra,
+    ):
+        return func(*args, **kwargs)
+
+
+def perf_metadata(
+    stage: str,
+    *,
+    substage: str | None = None,
+    phase: str | None = None,
+    tile: str | None = None,
+    image_id: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    """Write a zero-duration structured span for derived metadata.
+
+    Examples:
+        >>> configure_performance_logging(None)
+        >>> perf_metadata("demo", substage="metadata", extra={"count": 1})
+    """
+    record_performance(
+        stage,
+        0.0,
+        substage=substage,
+        phase=phase,
+        tile=tile,
+        image_id=image_id,
+        extra=extra,
+    )
+
+
 def emit_performance_summary(
     reason: str,
     *,

@@ -4,7 +4,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+
 import segedge.pipeline.run as run
+
+
+def _write_test_tile(path: Path, *, left: float, top: float) -> None:
+    """Write a small north-up GeoTIFF tile for union-raster tests.
+
+    Examples:
+        >>> True
+        True
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=2,
+        height=2,
+        count=1,
+        dtype=np.uint8,
+        crs="EPSG:3857",
+        transform=from_origin(left, top, 1.0, 1.0),
+        nodata=0,
+    ) as dst:
+        dst.write(np.zeros((2, 2), dtype=np.uint8), 1)
 
 
 def test_create_run_directories_copies_config_snapshot(tmp_path, monkeypatch):
@@ -191,7 +218,7 @@ def test_initialize_union_state_uses_stage_unions_and_rotating_backups(
     tmp_path,
     monkeypatch,
 ):
-    """Union state should create 4 stage targets with one rotating backup each.
+    """Union state should create 4 stage rasters with one rotating backup each.
 
     Examples:
         >>> True
@@ -199,23 +226,19 @@ def test_initialize_union_state_uses_stage_unions_and_rotating_backups(
     """
     monkeypatch.setattr(run.cfg.runtime, "union_backup_every", 2)
     recorded_backups = []
-
-    monkeypatch.setattr(run, "count_shapefile_features", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(
         run,
-        "append_mask_to_union_shapefile",
-        lambda mask, ref_path, out_path, start_id=0: start_id + 1,
-    )
-    monkeypatch.setattr(
-        run,
-        "backup_union_shapefile",
+        "backup_union_raster",
         lambda out_path, backup_dir, step, backup_name=None: recorded_backups.append(
             (Path(out_path).parent.name, Path(backup_dir).name, step, backup_name)
         ),
     )
+    tile_path = tmp_path / "tile.tif"
+    _write_test_tile(tile_path, left=0.0, top=2.0)
 
     union_states, append_union = run._initialize_union_state(
         shape_dir=str(tmp_path / "shapes"),
+        holdout_tiles=[str(tile_path)],
         resume_run=False,
     )
 
@@ -225,13 +248,22 @@ def test_initialize_union_state_uses_stage_unions_and_rotating_backups(
         "shadow",
         "shadow_with_proposals",
     ]
+    assert (tmp_path / "shapes" / "unions" / "raw" / "union.tif").exists()
 
-    append_union("shadow_with_proposals", mask=[[1]], ref_path="tile.tif", step=1)
-    append_union("shadow_with_proposals", mask=[[1]], ref_path="tile.tif", step=2)
+    append_union(
+        "shadow_with_proposals",
+        mask=np.array([[1, 0], [0, 0]], dtype=np.uint8),
+        ref_path=str(tile_path),
+        step=1,
+    )
+    append_union(
+        "shadow_with_proposals",
+        mask=np.array([[1, 0], [0, 0]], dtype=np.uint8),
+        ref_path=str(tile_path),
+        step=2,
+    )
 
-    assert recorded_backups == [
-        ("shadow_with_proposals", "backup", 2, "union_backup")
-    ]
+    assert recorded_backups == [("shadow_with_proposals", "backup", 2, "union_backup")]
 
 
 def test_resolve_inference_model_bundle_dir_uses_latest_valid_previous_run(tmp_path):
