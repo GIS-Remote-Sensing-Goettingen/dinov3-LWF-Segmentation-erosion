@@ -18,6 +18,7 @@ from rasterio.transform import from_origin
 from rasterio.windows import Window
 
 UNION_VARIANTS = ("raw", "crf", "shadow", "shadow_with_proposals")
+MERGE_WINDOW_SIZE = 1024
 
 
 def _transforms_match(left, right) -> bool:
@@ -190,6 +191,29 @@ def _window_in_destination(
     )
 
 
+def _iter_chunk_windows(*, width: int, height: int) -> list[Window]:
+    """Return fixed-size windows that cover a raster without full-array reads.
+
+    Examples:
+        >>> len(_iter_chunk_windows(width=2, height=1))
+        1
+    """
+    windows: list[Window] = []
+    for row_off in range(0, height, MERGE_WINDOW_SIZE):
+        window_height = min(MERGE_WINDOW_SIZE, height - row_off)
+        for col_off in range(0, width, MERGE_WINDOW_SIZE):
+            window_width = min(MERGE_WINDOW_SIZE, width - col_off)
+            windows.append(
+                Window(
+                    col_off=col_off,
+                    row_off=row_off,
+                    width=window_width,
+                    height=window_height,
+                )
+            )
+    return windows
+
+
 def merge_union_variant(
     *,
     variant: str,
@@ -197,7 +221,6 @@ def merge_union_variant(
     output_dir: str,
 ) -> Path | None:
     """Merge one union variant from multiple shard run directories.
-
     Examples:
         >>> merge_union_variant(variant="raw", shard_run_dirs=[], output_dir="/tmp") is None
         True
@@ -215,10 +238,15 @@ def merge_union_variant(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(
-            np.zeros((int(profile["height"]), int(profile["width"])), dtype=np.uint8),
-            1,
-        )
+        for window in _iter_chunk_windows(
+            width=int(profile["width"]),
+            height=int(profile["height"]),
+        ):
+            dst.write(
+                np.zeros((int(window.height), int(window.width)), dtype=np.uint8),
+                1,
+                window=window,
+            )
     with rasterio.open(out_path, "r+") as dst:
         for source_path in source_paths:
             with rasterio.open(source_path) as src:
@@ -227,9 +255,23 @@ def merge_union_variant(
                     destination_dataset=dst,
                     source_path=source_path,
                 )
-                source_pixels = src.read(1)
-                existing = dst.read(1, window=dst_window)
-                dst.write(np.maximum(existing, source_pixels), 1, window=dst_window)
+                for src_window in _iter_chunk_windows(
+                    width=src.width,
+                    height=src.height,
+                ):
+                    target_window = Window(
+                        col_off=float(dst_window.col_off) + float(src_window.col_off),
+                        row_off=float(dst_window.row_off) + float(src_window.row_off),
+                        width=src_window.width,
+                        height=src_window.height,
+                    )
+                    source_pixels = src.read(1, window=src_window)
+                    existing = dst.read(1, window=target_window)
+                    dst.write(
+                        np.maximum(existing, source_pixels),
+                        1,
+                        window=target_window,
+                    )
     return out_path
 
 
