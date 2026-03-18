@@ -37,7 +37,15 @@ build_inference_shards = _BUILD_MODULE.build_inference_shards
 merge_shard_unions = _MERGE_MODULE.merge_shard_unions
 
 
-def _write_union_raster(path: Path, pixels: np.ndarray) -> None:
+def _write_union_raster(
+    path: Path,
+    pixels: np.ndarray,
+    *,
+    x_origin: float = 0.0,
+    y_origin: float | None = None,
+    pixel_size: float = 1.0,
+    crs: str = "EPSG:3857",
+) -> None:
     """Write a tiny GeoTIFF union raster for one stage variant.
 
     Examples:
@@ -45,6 +53,7 @@ def _write_union_raster(path: Path, pixels: np.ndarray) -> None:
         True
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    top = float(pixels.shape[0]) if y_origin is None else float(y_origin)
     with rasterio.open(
         path,
         "w",
@@ -53,8 +62,8 @@ def _write_union_raster(path: Path, pixels: np.ndarray) -> None:
         height=pixels.shape[0],
         count=1,
         dtype=np.uint8,
-        crs="EPSG:3857",
-        transform=from_origin(0.0, float(pixels.shape[0]), 1.0, 1.0),
+        crs=crs,
+        transform=from_origin(float(x_origin), top, pixel_size, pixel_size),
         nodata=0,
         compress="lzw",
     ) as dst:
@@ -113,8 +122,8 @@ def test_build_inference_shards_writes_manifest_and_round_robin_files(
     assert manifest["tiles_file_paths"] == [str(path) for path in shard_files]
 
 
-def test_merge_shard_unions_combines_stage_union_files(tmp_path):
-    """Union merge should OR all shard pixels for each stage variant.
+def test_merge_shard_unions_mosaics_aligned_extents(tmp_path):
+    """Union merge should mosaic aligned rasters with different extents.
 
     Examples:
         >>> True
@@ -130,6 +139,7 @@ def test_merge_shard_unions_combines_stage_union_files(tmp_path):
         _write_union_raster(
             shard_b / "shapes" / "unions" / variant / "union.tif",
             np.array([[0, 1]], dtype=np.uint8),
+            x_origin=2.0,
         )
 
     merged = merge_shard_unions(
@@ -143,4 +153,69 @@ def test_merge_shard_unions_combines_stage_union_files(tmp_path):
     raw_union = tmp_path / "merged" / "raw" / "union.tif"
     with rasterio.open(raw_union) as src:
         merged_pixels = src.read(1)
-    np.testing.assert_array_equal(merged_pixels, np.array([[1, 1]], dtype=np.uint8))
+    np.testing.assert_array_equal(
+        merged_pixels,
+        np.array([[1, 0, 0, 1]], dtype=np.uint8),
+    )
+
+
+def test_merge_shard_unions_ors_overlapping_pixels(tmp_path):
+    """Union merge should OR aligned overlapping rasters on the mosaic grid.
+
+    Examples:
+        >>> True
+        True
+    """
+    shard_a = tmp_path / "run_a"
+    shard_b = tmp_path / "run_b"
+    _write_union_raster(
+        shard_a / "shapes" / "unions" / "raw" / "union.tif",
+        np.array([[1, 0]], dtype=np.uint8),
+    )
+    _write_union_raster(
+        shard_b / "shapes" / "unions" / "raw" / "union.tif",
+        np.array([[1, 1]], dtype=np.uint8),
+        x_origin=1.0,
+    )
+
+    merge_shard_unions(
+        shard_run_dirs=[str(shard_a), str(shard_b)],
+        output_dir=str(tmp_path / "merged"),
+    )
+
+    with rasterio.open(tmp_path / "merged" / "raw" / "union.tif") as src:
+        merged_pixels = src.read(1)
+    np.testing.assert_array_equal(
+        merged_pixels,
+        np.array([[1, 1, 1]], dtype=np.uint8),
+    )
+
+
+def test_merge_shard_unions_rejects_resolution_mismatch(tmp_path):
+    """Union merge should fail when source rasters use different resolutions.
+
+    Examples:
+        >>> True
+        True
+    """
+    shard_a = tmp_path / "run_a"
+    shard_b = tmp_path / "run_b"
+    _write_union_raster(
+        shard_a / "shapes" / "unions" / "raw" / "union.tif",
+        np.array([[1]], dtype=np.uint8),
+    )
+    _write_union_raster(
+        shard_b / "shapes" / "unions" / "raw" / "union.tif",
+        np.array([[1]], dtype=np.uint8),
+        pixel_size=2.0,
+    )
+
+    try:
+        merge_shard_unions(
+            shard_run_dirs=[str(shard_a), str(shard_b)],
+            output_dir=str(tmp_path / "merged"),
+        )
+    except ValueError as exc:
+        assert "resolution" in str(exc)
+    else:
+        raise AssertionError("expected incompatible resolution to fail")

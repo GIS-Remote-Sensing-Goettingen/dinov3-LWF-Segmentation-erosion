@@ -103,7 +103,7 @@ def _write_fake_batches(root: Path, batch_sizes: list[int]) -> tuple[Path, list[
     return root, batch_files
 
 
-def _write_union(path: Path, fid: int) -> None:
+def _write_union(path: Path, fid: int, *, x_origin: float = 0.0) -> None:
     """Write a one-stage union raster fixture.
 
     Examples:
@@ -121,7 +121,7 @@ def _write_union(path: Path, fid: int) -> None:
         count=1,
         dtype=np.uint8,
         crs="EPSG:3857",
-        transform=from_origin(0.0, 1.0, 1.0, 1.0),
+        transform=from_origin(float(x_origin), 1.0, 1.0, 1.0),
         nodata=0,
         compress="lzw",
     ) as dst:
@@ -328,7 +328,11 @@ def test_controller_merges_when_all_batches_are_complete(tmp_path):
     )
     for variant in ("raw", "shadow_with_proposals"):
         _write_union(run_a / "shapes" / "unions" / variant / "union.tif", 1)
-        _write_union(run_b / "shapes" / "unions" / variant / "union.tif", 2)
+        _write_union(
+            run_b / "shapes" / "unions" / variant / "union.tif",
+            2,
+            x_origin=2.0,
+        )
     _BATCH_MODULE._write_json(
         root / "status.json",
         {
@@ -367,6 +371,100 @@ def test_controller_merges_when_all_batches_are_complete(tmp_path):
     final_status = json.loads((root / "final_status.json").read_text(encoding="utf-8"))
     assert final_status["status"] == "success"
     assert (root / "merged" / "raw" / "union.tif").exists()
+    with rasterio.open(root / "merged" / "raw" / "union.tif") as src:
+        merged_pixels = src.read(1)
+    np.testing.assert_array_equal(
+        merged_pixels,
+        np.array([[1, 0, 0, 1]], dtype=np.uint8),
+    )
+
+
+def test_submit_controller_only_submits_existing_controller_script(
+    tmp_path,
+    monkeypatch,
+):
+    """Submit-controller mode should submit only the existing controller script.
+
+    Examples:
+        >>> True
+        True
+    """
+    root, _batch_files = _write_fake_batches(tmp_path / "orchestration", [2])
+    slurm_dir = root / "slurm"
+    slurm_dir.mkdir(parents=True, exist_ok=True)
+    controller = slurm_dir / "controller.sh"
+    controller.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    _BATCH_MODULE._write_json(
+        root / "manifest.json",
+        {"controller_script": str(controller)},
+    )
+    _BATCH_MODULE._write_json(
+        root / "status.json",
+        {
+            "batch_size": 100,
+            "batches": [],
+            "controller_job_ids": [],
+            "max_retries": 1,
+            "state": "submitted",
+            "worker_job_ids": [],
+        },
+    )
+    calls: list[dict] = []
+
+    def fake_submit(*, script_path: Path, extra_args, dry_run: bool):
+        calls.append(
+            {
+                "script_path": str(script_path),
+                "extra_args": extra_args,
+                "dry_run": dry_run,
+            }
+        )
+        return {
+            "job_id": "901",
+            "command": ["sbatch", str(script_path)],
+        }
+
+    monkeypatch.setattr(_BATCH_MODULE, "_submit_sbatch", fake_submit)
+
+    submission = _BATCH_MODULE.submit_controller_only(
+        orchestration_root=root,
+        dry_run=False,
+    )
+
+    assert submission["job_id"] == "901"
+    assert calls == [
+        {
+            "script_path": str(controller),
+            "extra_args": None,
+            "dry_run": False,
+        }
+    ]
+    status = json.loads((root / "status.json").read_text(encoding="utf-8"))
+    assert status["controller_job_ids"] == ["901"]
+    assert status["state"] == "controller_submitted"
+    submission_json = json.loads((root / "submission.json").read_text(encoding="utf-8"))
+    assert submission_json["manual_controller_submission"]["job_id"] == "901"
+
+
+def test_main_requires_orchestration_root_with_submit_controller(monkeypatch):
+    """CLI should require an orchestration root for submit-controller mode.
+
+    Examples:
+        >>> True
+        True
+    """
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["launch_batched_inference.py", "--submit-controller"],
+    )
+
+    try:
+        _BATCH_MODULE.main()
+    except ValueError as exc:
+        assert "--orchestration-root" in str(exc)
+    else:
+        raise AssertionError("expected missing orchestration root to fail")
 
 
 def test_controller_fails_when_retry_budget_is_exhausted(tmp_path):

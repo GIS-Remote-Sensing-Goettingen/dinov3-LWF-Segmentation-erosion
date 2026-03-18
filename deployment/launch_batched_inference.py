@@ -709,6 +709,28 @@ def _write_submission(orchestration_root: Path, payload: dict[str, Any]) -> None
     _write_json(orchestration_root / "submission.json", payload)
 
 
+def _load_existing_orchestration(
+    orchestration_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load manifest and status for an existing orchestration root.
+
+    Examples:
+        >>> callable(_load_existing_orchestration)
+        True
+    """
+    manifest = _load_json(orchestration_root / "manifest.json")
+    status = _load_json(orchestration_root / "status.json")
+    if not manifest:
+        raise ValueError(
+            f"missing manifest for existing orchestration root: {orchestration_root}"
+        )
+    if not status:
+        raise ValueError(
+            f"missing status for existing orchestration root: {orchestration_root}"
+        )
+    return manifest, status
+
+
 def _worker_script_command(config_path: Path) -> str:
     """Build one batch worker command snippet.
 
@@ -913,6 +935,44 @@ def launch_batched_inference(
     return orchestration_root
 
 
+def submit_controller_only(
+    *,
+    orchestration_root: Path,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Submit only the existing controller Slurm script for a batch run.
+
+    Examples:
+        >>> callable(submit_controller_only)
+        True
+    """
+    logger.info(
+        "submit controller only: root=%s dry_run=%s", orchestration_root, dry_run
+    )
+    manifest, status = _load_existing_orchestration(orchestration_root)
+    controller_script = manifest.get("controller_script")
+    if not controller_script:
+        raise ValueError(
+            f"missing controller_script in manifest: {orchestration_root / 'manifest.json'}"
+        )
+    submission = _submit_sbatch(
+        script_path=Path(controller_script),
+        extra_args=None,
+        dry_run=dry_run,
+    )
+    status.setdefault("controller_job_ids", []).append(submission["job_id"])
+    status["state"] = "controller_submitted"
+    _write_json(orchestration_root / "status.json", status)
+    _write_json(
+        orchestration_root / "submission.json",
+        {
+            **_load_json(orchestration_root / "submission.json"),
+            "manual_controller_submission": submission,
+        },
+    )
+    return submission
+
+
 def run_controller(*, orchestration_root: Path, dry_run: bool) -> None:
     """Retry incomplete batches or merge completed batch outputs.
 
@@ -1080,8 +1140,13 @@ def main() -> None:
         help="Internal mode: inspect batch progress, retry incomplete batches, and merge when complete.",
     )
     parser.add_argument(
+        "--submit-controller",
+        action="store_true",
+        help="Submit only the existing controller Slurm script for an orchestration root.",
+    )
+    parser.add_argument(
         "--orchestration-root",
-        help="Existing orchestration root for controller mode.",
+        help="Existing orchestration root for controller-oriented modes.",
     )
     args = parser.parse_args()
 
@@ -1089,6 +1154,17 @@ def main() -> None:
         if not args.orchestration_root:
             raise ValueError("--orchestration-root is required with --controller")
         run_controller(
+            orchestration_root=Path(args.orchestration_root),
+            dry_run=bool(args.dry_run),
+        )
+        return
+
+    if args.submit_controller:
+        if not args.orchestration_root:
+            raise ValueError(
+                "--orchestration-root is required with --submit-controller"
+            )
+        submit_controller_only(
             orchestration_root=Path(args.orchestration_root),
             dry_run=bool(args.dry_run),
         )

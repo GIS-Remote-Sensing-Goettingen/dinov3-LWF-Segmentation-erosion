@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Inference, tuning, and runtime stability
+- Description: Treat batch union merge as an aligned raster mosaic and add a CLI mode to submit only the existing controller Slurm step.
+- Files touched: `deployment/merge_shard_unions.py`, `deployment/launch_batched_inference.py`, `tests/test_shard_scripts.py`, `tests/test_launch_batched_inference.py`, `deployment/README.md`, `docs/ARCHITECTURE.md`, `docs/CHANGELOG.md`
+- Reason: Completed batch runs produce valid `union.tif` rasters over different geographic extents, so demanding identical raster profiles breaks final merge; operators also need a clean way to relaunch only the controller stage from Slurm.
+- Problems fixed: Final batch merge now mosaics aligned `union.tif` rasters onto one shared output grid instead of rejecting different extents, merge still fails loudly on CRS/resolution mismatches, and `launch_batched_inference.py --submit-controller --orchestration-root ...` now submits only the existing controller job.
+
 - Description: Replace rolling stage-union shapefiles with rolling stage-union GeoTIFF rasters and update shard/batch merge flow to combine `union.tif` outputs.
 - Files touched: `segedge/core/io_utils.py`, `segedge/pipeline/run.py`, `deployment/merge_shard_unions.py`, `tests/test_union_raster_io.py`, `tests/test_run_dispatch.py`, `tests/test_shard_scripts.py`, `tests/test_launch_batched_inference.py`, `tests/test_orchestrate_sharded_inference.py`, `docs/ARCHITECTURE.md`, `docs/Implementation.md`, `docs/KB.md`, `deployment/README.md`, `docs/CHANGELOG.md`
 - Reason: The stage outputs should be immediately testable as rasters and easier to consume downstream without converting merged shapefile unions back onto a tile grid.

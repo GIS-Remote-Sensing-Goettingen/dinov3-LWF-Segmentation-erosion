@@ -41,6 +41,7 @@ Useful options:
 - `--dry-run`: render all artifacts without calling `sbatch`
 - `--max-retries`: maximum retry waves for incomplete batches
 - `--output-root`: root directory for batch orchestration outputs
+- `--submit-controller --orchestration-root <root>`: submit only the existing controller Slurm script for a previously created batch orchestration root
 
 Internal mode used by the generated controller job:
 - `--controller`
@@ -83,6 +84,11 @@ python deployment/merge_shard_unions.py \
   output/batches/folder1_batches/runs/batch_002 \
   output/batches/folder1_batches/runs/batch_003
 ```
+
+Merge semantics:
+- source union rasters may cover different extents
+- the merge output is a GeoTIFF mosaic on the shared campaign grid
+- merge still fails if inputs disagree on CRS or pixel size
 
 ## Orchestration layout
 
@@ -137,7 +143,7 @@ Instead:
 2. the controller checks batch completion counts
 3. incomplete batches are retried up to `--max-retries`
 4. the final controller step checks that every batch completed all expected tiles
-5. only then are merged unions written
+5. only then are merged union mosaics written
 
 If any batch is still incomplete after the retry budget is exhausted:
 - the workflow stops

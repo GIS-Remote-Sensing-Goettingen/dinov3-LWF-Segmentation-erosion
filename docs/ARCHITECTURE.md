@@ -98,7 +98,7 @@ Document the current SegEdge runtime structure after the feature/runtime/workflo
 - `output/run_*/shapes/unions/.../union.tif`: rolling union GeoTIFF rasters for `raw`, `crf`, `shadow`, and `shadow_with_proposals`.
 - `output/run_*/inference_best_setting.yml` and `output/run_*/best_setting.yml`: exported run settings.
 - `output/run_*/model_bundle/`: optional inference bundle when bundle saving is enabled.
-- `output/batches/<job_name>/`: optional batch manifests, per-batch configs, one-worker-per-batch Slurm scripts, controller status files, and merged unions created by the simpler Slurm batching flow.
+- `output/batches/<job_name>/`: optional batch manifests, per-batch configs, one-worker-per-batch Slurm scripts, controller status files, and merged union mosaics created by the simpler Slurm batching flow.
 
 ## Major Runtime Functions
 - `segedge.pipeline.run.main`: bootstrap, resolve runtime mode, dispatch workflow, and finalize cache consolidation.
